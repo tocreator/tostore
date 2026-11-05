@@ -39,17 +39,17 @@
 - [为什么选择ToStore](#why-tostore) | [核心特性](#key-features) | [安装指南](#installation) | [KV模式](#quick-start-kv) | [表模式](#quick-start-table) | [内存模式](#quick-start-memory)
 - [表结构定义](#schema-definition) | [分布式架构](#distributed-architecture) | [级联外键](#foreign-keys) | [移动/桌面端](#mobile-integration) | [服务端/智能体](#server-integration) | [主键算法](#primary-key-examples)
 - [高级查询 (JOIN)](#query-advanced) | [聚合与统计](#aggregation-stats) | [复杂逻辑 (Condition)](#query-condition) | [响应式监听 (watch)](#reactive-query) | [流式查询](#streaming-query)
-- [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [恢复保障](#recovery-durability) | [混合检索（稠密 / 稀疏 / 文本）](#hybrid-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [内存探针与同步检索 (peek)](#query-peek) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
+- [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [恢复保障](#recovery-durability) | [混合检索（稠密 / 稀疏 / 文本）](#hybrid-advanced) | [表级 TTL](#ttl-config) | [容量淘汰](#capacity-eviction) | [高效分页](#query-pagination) | [内存探针与同步检索 (peek)](#query-peek) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
 - [管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [欢迎贡献](#contribute) | [AI 编程助手](#for-ai-coding-assistants)
 
 
 ## <a id="why-tostore"></a>为什么选择 ToStore？
 
-ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎。基于自寻径节点架构 (Self-Routing)，节点高自治、可弹性水平扩展，性能与数据规模逻辑解耦——边缘与云端单机均设计支撑百亿级以上数据量。
+ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎。基于自寻径节点架构 (Self-Routing)，节点高自治、可弹性水平扩展，性能与数据规模逻辑解耦——边缘与云端单机均设计支撑结构化表万亿级以上记录，向量与稀疏文本检索亦达百亿级以上规模。
 
 运行态建模与非阻塞执行路径，架构演进全程在线、业务完全无感——表结构声明式变更、密钥轮换、海量数据重构均可在线无感完成。支撑智能体与自动化运维的运行时建表、动态记忆演化及其自主演进与持续迭代，服务不中断。
 
-统一承载关系型结构化数据、稠密向量、神经稀疏向量与非结构化文本；内建词法文本检索、稠密向量检索、神经稀疏检索及多路召回融合。兼具 ACID 事务、复杂关系查询（JOIN、级联外键）、表级 TTL、聚合计算，以及分布式主键算法、原子性表达式、加密保护、多空间隔离与故障自愈等工业级能力。
+统一承载关系型结构化数据、稠密向量、神经稀疏向量与非结构化文本；内建词法文本检索、稠密向量检索、神经稀疏检索及多路召回融合。兼具 ACID 事务、复杂关系查询（JOIN、级联外键）、表级 TTL、容量淘汰（FIFO / LRU）、聚合计算，以及分布式主键算法、原子性表达式、加密保护、多空间隔离与故障自愈等工业级能力。
 
 随着计算重心持续向端侧边缘智能偏移，终端不再只是"内容展示器"，而是承担局部生成、环境感知、实时决策与数据协同的智能节点。ToStore 为边缘端提供海量数据与复杂 AI 局部生成所需的分布式能力，边云深度协同，为多模态交互、长期记忆、RAG 检索增强生成与本地知识库、混合检索、空间建模及边缘自主协同提供可靠数据基座。
 
@@ -65,7 +65,7 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
 - 🧠 **自寻径分布式架构**
   - 自寻径节点架构，物理寻址与数据规模解耦
   - 高自治节点互联协同，构建灵活的数据拓扑
-  - 弹性水平扩展；单机亦设计支撑百亿级以上数据量
+  - 弹性水平扩展；单机表万亿级、向量百亿级以上
 
 - 🌐 **统一的跨平台数据引擎**
   - 移动端、桌面端、Web 与服务端统一 API
@@ -73,7 +73,7 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
   - 从本地存储到边云协同的完整数据链路
 
 - 🔍 **结构化查询与混合检索**
-  - 复杂条件、JOIN、聚合与表级 TTL
+  - 复杂条件、JOIN、聚合、表级 TTL 与容量淘汰（FIFO / LRU）
   - 词法文本检索、稠密向量检索、神经稀疏检索同链组合
   - 多路召回融合排序，分数与通道诊断随结果返回
 
@@ -111,7 +111,7 @@ dependencies:
 > **如何选择存储方式？**
 > 1. [**键值对模式 (KV)**](#quick-start-kv)：适用于配置存取、零散状态管理或 JSON 数据存储，主打快速上手。
 > 2. [**结构化表 (Table)**](#quick-start-table)：适用于核心业务，需复杂查询、约束校验或海量数据治理。通过将完整性逻辑下沉到引擎，可显著降低应用层开发与维护成本。
-> 3. [**内存模式 (Memory)**](#quick-start-memory)：适用于临时计算、单元测试或 **作为极速全局状态管理使用** —— 无需定义繁琐变量，通过全局查询与 watch 监听即可重塑应用交互。
+> 3. [**内存模式 (Memory)**](#quick-start-memory)：适用于临时计算、单元测试、有界内存缓存（支持 TTL 与 FIFO / LRU 容量淘汰等多种策略），或 **作为极速全局状态管理使用** —— 无需定义繁琐变量，通过全局查询与 watch 监听即可重塑应用交互。
 
 
 
@@ -234,6 +234,8 @@ StreamBuilder(
 
 对于数据缓存、临时计算或不需要持久化到磁盘等场景，可以使用 `ToStore.memory()` 初始化一个纯内存数据库。在该模式下，所有数据（包括表结构、索引和键值对）均仅保存在内存中，读写性能达到极致。
 
+内存模式同样支持多种淘汰策略：按时间的[表级 TTL](#ttl-config) / KV TTL，以及按数量或体积的[容量淘汰](#capacity-eviction)（**FIFO / LRU**），可单独或组合使用，让热数据按时过期或控住上限——尤其适合会话缓存、查询结果池等对内存敏感的场景。
+
 #### 💡 也可以作为全局状态管理
 无需定义繁杂的全局变量或引入笨重的状态管理框架。通过内存模式配合 `watchValue` 或 `watch()` 监听，您可以实现跨组件、跨页面的全自动 UI 刷新。它既保留了数据库的强大检索能力，又获得了超越普通变量的响应式体验，非常适合管理登录状态、实时配置或全局消息计数。
 
@@ -241,14 +243,21 @@ StreamBuilder(
 > **注意**：纯内存模式下产生的数据在应用关闭或重启后将完全丢失，请勿用于存储核心业务数据。
 
 ```dart
-// 使用纯内存模式初始化数据库
-final memDb = await ToStore.memory();
+// 纯内存库 — 按需启用 TTL 与/或 FIFO/LRU 容量淘汰
+final memDb = await ToStore.memory(
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+    ),
+  ),
+);
 
 // 设置一个全局状态（如：当前未读消息数）
-await memDb.setValue('unread_count', 5,isGlobal: true);
+await memDb.setValue('unread_count', 5, isGlobal: true);
 
 // 在 UI 任何地方直接监听，无需传参
-memDb.watchValue<int>('unread_count',isGlobal: true).listen((count) {
+memDb.watchValue<int>('unread_count', isGlobal: true).listen((count) {
   print('UI 自动感知消息变动: $count');
 });
 
@@ -317,6 +326,7 @@ const userSchema = TableSchema(
   foreignKeys: const [], // 外键约束列表，可选；完整示例见下文“外键与级联约束”
   isGlobal: false, // 是否为全局表；true 时可跨 Space 全局共享
   ttlConfig: null, // 表级 TTL，可选；完整示例见下文“表级 TTL”
+  capacityConfig: null, // 容量淘汰，可选；完整示例见下文“容量淘汰”
 );
 
 const appSchemas = [userSchema];
@@ -880,9 +890,9 @@ final ann = await db.vectorSearch(
 **链式检索参数**（各 `match*` / `orMatch*`，以及查询链上的 `limit`）：
 
 - 文本
-  - `TextQuery.text`：由引擎分词
-  - `TextQuery.terms` / `termsWeighted`：预分词，不再二次分词；拉丁词需与索引侧一致（一般为小写）
-  - `operator`：`or`（默认，词项并集排序）或 `and`（正权重词项均须命中后再排序）
+  - `TextQuery.text`：原始查询文本（由引擎分词）
+  - `TextQuery.terms` / `termsWeighted`：预分词，自行传入词项（可选权重）；拉丁词需与索引侧一致（一般为小写）
+  - `operator`：`or`（默认，命中任一词项）或 `and`（须命中全部词项后再排序）
   - 不支持短语匹配
 - 稀疏
   - `SparseVectorData` / `SparseVectorData.fromMap(...)`：稀疏查询向量
@@ -936,16 +946,75 @@ const TableSchema(
   ],
   ttlConfig: TableTtlConfig(
     ttlMs: 7 * 24 * 60 * 60 * 1000, // 保留 7 天
-    // sourceField 省略时，默认自动创建索引；
-    // 可选：自定义 sourceField 时必须：
-    // 1）字段类型为 DataType.datetime
-    // 2）字段不可为空（nullable: false）
-    // 3）字段 defaultValueType 必须为 DefaultValueType.currentTimestamp
-    // sourceField: 'created_at',
+    // 新建表 / 首次启用 TTL 时必填：
+    // 1）DataType.datetime
+    // 2）nullable: false
+    // 3）DefaultValueType.currentTimestamp
+    sourceField: 'created_at',
   ),
 );
 ```
 
+### <a id="capacity-eviction"></a>容量淘汰（FIFO / LRU）
+
+按条数和/或大致占用限制表内保留的数据量，可与表级 TTL 同时启用；超出上限后后台自动淘汰。
+
+```dart
+// FIFO（默认）：按主键从旧到新淘汰；不要设置 sourceField（主键类型为 PrimaryKeyType.none 时除外）
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  // maxBytes: 50 * 1024 * 1024, // 可选：按大致体积限制
+  policy: CapacityEvictionPolicy.fifo,
+),
+
+// LRU：必须指定 sourceField（datetime、非空、currentTimestamp）；
+// 记录被再次使用时应更新该字段
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  policy: CapacityEvictionPolicy.lru,
+  sourceField: 'last_active_at',
+),
+```
+
+- `maxEntries` / `maxBytes` 至少设置一个。
+- FIFO 且主键类型为 `PrimaryKeyType.none` 时，同样需要 `sourceField`（规则同上）。
+
+对已有表，也可在运行时启用、调整或关闭容量淘汰（无需重开数据库）：
+
+```dart
+// 启用 / 调整容量淘汰
+await db.updateSchema('recent_events').setCapacityConfig(
+  CapacityConfig(
+    maxEntries: 10000,
+    policy: CapacityEvictionPolicy.lru,
+    sourceField: 'last_active_at',
+  ),
+);
+
+// 关闭容量淘汰（保留现有数据，之后不再按容量删除）
+await db.updateSchema('recent_events').disableCapacity();
+```
+
+KV 的容量上限在打开数据库时通过 `DataStoreConfig` 配置（不是每次 `kv.set` 单独传参）：
+- `kvCapacityConfig`：限制**当前空间**的 KV 键数量 / 大致体积
+- `globalKvCapacityConfig`：限制**全局** KV
+- 参数形态与表级 `CapacityConfig` 相同，但不要设置 `sourceField`
+
+```dart
+final db = await ToStore.open(
+  dbPath: '...',
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+    ),
+    globalKvCapacityConfig: CapacityConfig(
+      maxEntries: 2000,
+      policy: CapacityEvictionPolicy.fifo,
+    ),
+  ),
+);
+```
 
 ### 智能存储 (Upsert)
 根据 data 中的主键或唯一字段判断：存在则更新，不存在则插入。不支持 where，冲突目标由 data 决定。
@@ -1881,6 +1950,8 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultRecoveryDurability`** | **`standard`** | **响应时恢复能力保障**。定义数据操作在返回响应结果时所具备的自愈恢复级别：<br>• **`standard`（默认）**：**返回响应结果前即具备防崩溃自愈能力**。能抵御应用闪退、未捕获异常及进程被系统强杀（OOM），兼顾极高吞吐与日常安全。<br>• **`durable`**：**返回响应结果前即具备防断电自愈能力**。数据强制物理落盘，即使突发断电、内核宕机亦可完整自愈恢复，适用于金融交易等核心场景。<br>• **`async`**：**极速吞吐**。内存入队后立即返回响应结果并在后台触发保存；**在返回响应结果后**，小数据量下多数仅存在**几毫秒极其短暂**的数据丢失窗口期。 |
 | **`persistRecoveryOnCommit`**| **true** | **强持久化保证**。为 true 时，事务提交后会强制 Sync 到物理磁盘；为 false 则后台异步 Flush（极大提速，但极端崩溃下可能丢失极少量数据）。 |
 | **`ttlCleanupIntervalMs`**| **300000** | **全局 TTL 轮询**。引擎后台会在非闲置时扫描过期数据的时间间隔（默认 5 分钟），调小后删除更及时，但开销稍大。 |
+| **`kvCapacityConfig`** | **null** | **空间 KV 容量**。对当前空间的 KV 做 FIFO/LRU 上限；不要设置 `sourceField`。详见[容量淘汰](#capacity-eviction)。 |
+| **`globalKvCapacityConfig`** | **null** | **全局 KV 容量**。形态与 `kvCapacityConfig` 相同。 |
 | **`maxConcurrency`**| (自动) | **并发算力控制**。设置密集型任务（如向量计算、加解密）的最大并行线程数。通常推荐保持自动（基于核心数）。 |
 
 ```dart

@@ -49,6 +49,8 @@ factory DataStoreConfig({
   Duration transactionTimeout = const Duration(minutes: 5),
   // ... cleanup TTLs ...
   int? ttlCleanupIntervalMs, // effective min 60000
+  KvCapacityConfig? kvCapacityConfig,        // space KV capacity eviction
+  KvCapacityConfig? globalKvCapacityConfig,  // global KV capacity eviction
   int? defaultQueryLimit,    // default 1000
   int? maxQueryOffset,       // default 10000
   int? yieldDurationMs,      // client ~8ms, server ~50ms
@@ -67,12 +69,28 @@ factory DataStoreConfig({
 | `defaultRecoveryDurability` | `standard` | Recovery-log durability before write ack: `async` (enqueue; brief crash loss until background drain to OS), `standard` (OS page cache, crash-safe), `durable` (physical fsync, power-safe). Override per CRUD/batch via `durability:` / `.durability(...)` |
 | `persistRecoveryOnCommit` | true | Strong durability; false = faster, tiny crash risk |
 | `ttlCleanupIntervalMs` | ≥60000 | Background TTL scan |
-| `cacheMemoryBudgetMB` | auto | LRU budget |
+| `kvCapacityConfig` | null | Space KV FIFO/LRU capacity; do not set `sourceField` |
+| `globalKvCapacityConfig` | null | Global KV capacity (same shape; no `sourceField`) |
+| `cacheMemoryBudgetMB` | auto | Memory cache budget (unrelated to table/KV `CapacityConfig`) |
 | `vectorCacheBudgetRatio` | 0.50 (adaptive) | Proportion of cache budget dedicated to vector index cache ceiling |
 | `maxConcurrency` | auto | Vector/crypto workers |
 | `isServerEnvironment` | auto-detected | Changes partition/concurrency defaults |
 
 `PersistenceMode.memory` is forced by `ToStore.memory()`.
+
+Memory cache example:
+
+```dart
+await ToStore.memory(
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+      evictRatio: 0.30,
+    ),
+  ),
+);
+```
 
 ## Encryption (at rest)
 

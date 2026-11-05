@@ -215,6 +215,7 @@ final class CacheManager {
     _dataStore.wmbpIndexManager?.clearAll();
     _dataStore.weightManager?.clearMemory();
     _dataStore.clearAllTtlPlanCache();
+    _dataStore.clearAllCapacityPlanCache();
 
     Logger.debug('Clear all cache');
   }

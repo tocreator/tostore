@@ -220,7 +220,7 @@ Larger depth typically raises both recall and latency. Prefer the anchors above;
 
 ## Text and neural sparse retrieval
 
-Text and sparse channels share one Top-K kernel. `TextMatchOperator.or` ranks the union of terms. `TextMatchOperator.and` keeps a document only when every positive-weight term has impact, then ranks with the same additive integer score. A missing term yields an empty text channel. Phrase matching is not supported. Sparse retrieval stays disjunctive.
+Text and sparse channels share one Top-K ranking path. `TextMatchOperator.or` keeps documents that match any query term. `TextMatchOperator.and` keeps documents that match every positive-weight term, then ranks by relevance. If a required term is missing from the index, the text channel is empty. Phrase matching is not supported. Sparse retrieval stays disjunctive (OR).
 
 | Channel | Chain | Index | Field type | Query value |
 | :--- | :--- | :--- | :--- | :--- |
@@ -271,6 +271,4 @@ final results = await db.query('documents')
   .limit(10);
 ```
 
-`TextQuery.text` is segmented by the engine. `TextQuery.terms(List<String>)` is pre-tokenized with weight 1 per term; repeated strings add weight. `TextQuery.termsWeighted(List<TextTerm>)` is pre-tokenized with an explicit weight on each `TextTerm` (`term`, `weight`); weights of the same term are summed, and non-positive weights are dropped. Pre-tokenized terms are matched exactly: the engine does not segment them, expand CJK bigrams, or change case. Built-in indexing lowercases Latin tokens, so a pre-tokenized query must use the same term strings that were indexed.
-
-For `TextQuery.text`, a CJK single-character match is treated as a weak signal (typically `score` below ~0.40), while CJK bigrams and Latin words keep the strong exact-term band (~0.71 for one strong hit). Longer Chinese `OR` queries therefore lean on bigrams rather than stacking many unigrams. `TextQuery.terms` / `termsWeighted` do not apply that automatic softening — caller weights are used as given. `matchText` / `matchSparse` / `matchVector` on the same chain is multi-way fusion (default `weightedScore`). Opt into rank-only fusion with `.fusionMethod(RetrievalFusionMethod.rrf)`. A structured `where*` on that chain is a filter over the recalled records. Text and sparse inserts are searchable before flush. `limit` is topK. Scores are in `retrieval.entries`, aligned with `data` (see scoring tables above).
+`TextQuery.text(String)` — raw query text; the engine tokenizes it. `TextQuery.terms(List<String>)` — caller-supplied terms, each weight 1; repeated strings add weight. `TextQuery.termsWeighted(List<TextTerm>)` — caller-supplied terms with explicit `weight` on each `TextTerm`; weights of the same term are summed; non-positive weights are dropped. Pre-tokenized Latin terms must match the indexed form (built-in indexing lowercases Latin, so `Kernel` does not match `kernel`). `matchText` / `matchSparse` / `matchVector` on the same chain is multi-way fusion (default `weightedScore`). Opt into rank-only fusion with `.fusionMethod(RetrievalFusionMethod.rrf)`. A structured `where*` on that chain is a filter over the recalled records. Text and sparse inserts are searchable before flush. `limit` is topK. Scores are in `retrieval.entries`, aligned with `data` (see scoring tables above).

@@ -33,12 +33,12 @@
 - [Por qué almacenar](#why-tostore) | [Características clave](#key-features) | [Guía de instalación](#installation) | [Modo KV](#quick-start-kv) | [Modo tabla](#quick-start-table) | [Modo de memoria](#quick-start-memory)
 - [Definición de esquema](#schema-definition) | [Arquitectura distribuida](#distributed-architecture) | [Claves externas en cascada](#foreign-keys) | [Móvil/Escritorio](#mobile-integration) | [Servidor/Agente](#server-integration) | [Algoritmos de clave primaria](#primary-key-examples)
 - [Consultas avanzadas (UNIRSE)](#query-advanced) | [Agregación y estadísticas](#aggregation-stats) | [Lógica compleja (Condición de consulta)](#query-condition) | [Consulta reactiva (ver)](#reactive-query) | [Consulta de transmisión](#streaming-query)
-- [KV avanzado](#kv-advanced) | [Operaciones por lotes](#bulk-operations) | [Garantía de recuperación](#recovery-durability) | [Recuperación híbrida (denso / disperso / texto)](#hybrid-advanced) | [TTL a nivel de tabla](#ttl-config) | [Paginación eficiente](#query-pagination) | [Sonda de memoria y recuperación sincrónica (peek)](#query-peek) | [Caché de consultas](#query-cache) | [Expresiones atómicas](#atomic-expressions) | [Transacciones](#transactions)
+- [KV avanzado](#kv-advanced) | [Operaciones por lotes](#bulk-operations) | [Garantía de recuperación](#recovery-durability) | [Recuperación híbrida (denso / disperso / texto)](#hybrid-advanced) | [TTL a nivel de tabla](#ttl-config) | [Evicción por capacidad](#capacity-eviction) | [Paginación eficiente](#query-pagination) | [Sonda de memoria y recuperación sincrónica (peek)](#query-peek) | [Caché de consultas](#query-cache) | [Expresiones atómicas](#atomic-expressions) | [Transacciones](#transactions)
 - [Administración](#database-maintenance) | [Configuración de seguridad](#security-config) | [Manejo de errores](#error-handling) | [Rendimiento y diagnóstico](#performance) | [Contribuir](#contribute) | [Asistentes de IA](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>¿Por qué elegir ToStore?
 
-ToStore es un motor de datos moderno diseñado para la era de la AGI y escenarios de inteligencia perimetral. Basado en una arquitectura de nodos de autorruta (Self-Routing), otorga a los nodos alta autonomía y escalabilidad horizontal elástica, desacoplando lógicamente el rendimiento de la escala de datos: tanto en borde como en nube, el despliegue mononodo está diseñado para soportar escalas de 10B+ registros.
+ToStore es un motor de datos moderno diseñado para la era de la AGI y escenarios de inteligencia perimetral. Basado en una arquitectura de nodos de autorruta (Self-Routing), otorga a los nodos alta autonomía y escalabilidad horizontal elástica, desacoplando lógicamente el rendimiento de la escala de datos: en borde y nube, el mononodo está diseñado para tablas estructuradas a escala de billones, y la recuperación vectorial / de texto disperso también apunta a 10B+.
 
 El modelado en tiempo de ejecución y las rutas de ejecución sin bloqueo mantienen la evolución de la arquitectura siempre en línea y totalmente transparente para las operaciones del negocio: los cambios declarativos de esquema, la rotación de claves de codificación de datos y la refactorización masiva de datos se realizan sin interrupciones. Soporta Agentes y O&M automatizado con creación de tablas en tiempo de ejecución, evolución dinámica de memoria y su evolución autónoma e iteración continua—sin interrumpir el servicio.
 
@@ -57,7 +57,7 @@ A medida que la computación continúa desplazándose hacia la inteligencia peri
 - 🧠 **Arquitectura distribuida de autorruta**
   - Arquitectura de nodos de autorruta que desacopla el direccionamiento físico de la escala de datos
   - Nodos altamente autónomos colaboran para construir una topología de datos flexible
-  - Escalabilidad horizontal elástica; despliegues mononodo diseñados para escalas de 10B+
+  - Escalabilidad horizontal elástica; mononodo: tablas a escala de billones, vectores 10B+
 
 - 🌐 **Motor de datos unificado multiplataforma**
   - API unificada en entornos móviles, de escritorio, web y servidor
@@ -65,7 +65,7 @@ A medida que la computación continúa desplazándose hacia la inteligencia peri
   - Canal de datos completo desde el almacenamiento local hasta la colaboración borde-nube
 
 - 🔍 **Consultas estructuradas y recuperación híbrida**
-  - Predicados complejos, JOINs, agregaciones y TTL a nivel de tabla
+  - Predicados complejos, JOINs, agregaciones, TTL a nivel de tabla y evicción por capacidad (FIFO / LRU)
   - Texto léxico, vectores densos y recuperación neuronal dispersa en la misma cadena de consulta
   - Ranking por fusión de recall multi-vía, con puntuaciones y diagnósticos de canal en el resultado
 
@@ -102,7 +102,7 @@ Al generar código cliente de ToStore con un asistente de IA, proporcione el cor
 > **¿Cómo elegir un modo de almacenamiento?**
 > 1. [**Modo clave-valor (KV)**](#quick-start-kv): Lo mejor para acceso a la configuración, administración de estados dispersos o almacenamiento de datos JSON. Es la forma más rápida de empezar.
 > 2. [**Modo de tabla estructurada**](#quick-start-table): Lo mejor para datos comerciales centrales que necesitan consultas complejas, validación de restricciones o gobernanza de datos a gran escala. Al introducir la lógica de integridad en el motor, puede reducir significativamente los costos de desarrollo y mantenimiento de la capa de aplicaciones.
-> 3. [**Modo de memoria**](#quick-start-memory): Ideal para cálculo temporal, pruebas unitarias o **administración de estado global ultrarrápida**. Con consultas globales y oyentes `watch`, puede remodelar la interacción de la aplicación sin mantener un montón de variables globales.
+> 3. [**Modo de memoria**](#quick-start-memory): Ideal para cálculo temporal, pruebas unitarias, cachés en memoria acotadas (TTL y evicción por capacidad FIFO / LRU) o **administración de estado global ultrarrápida**. Con consultas globales y oyentes `watch`, puede remodelar la interacción de la aplicación sin mantener un montón de variables globales.
 
 ### <a id="quick-start-kv"></a>Almacenamiento de valores clave (KV)
 Este modo es adecuado cuando no necesita tablas estructuradas predefinidas. Es simple, práctico y está respaldado por un motor de almacenamiento de alto rendimiento. **Su arquitectura de indexación eficiente mantiene el rendimiento de las consultas altamente estable y extremadamente receptivo incluso en dispositivos móviles comunes a escalas de datos muy grandes.** Los datos en diferentes espacios están naturalmente aislados, mientras que también se admite el intercambio global.
@@ -221,6 +221,8 @@ StreamBuilder(
 
 Para escenarios como almacenamiento en caché, cálculo temporal o cargas de trabajo que no necesitan persistencia en el disco, puede inicializar una base de datos pura en memoria a través de `ToStore.memory()`. En este modo, todos los datos, incluidos esquemas, índices y pares clave-valor, residen completamente en la memoria para lograr el máximo rendimiento de lectura/escritura.
 
+El modo memoria admite varias estrategias de evicción: [TTL a nivel de tabla](#ttl-config) / TTL de KV por tiempo, y [Evicción por capacidad](#capacity-eviction) (**FIFO / LRU**) por cantidad o tamaño—por separado o combinadas, para que los datos calientes caduquen a tiempo o queden acotados. Ideal para cachés de sesión, pools de resultados y rutas sensibles a la memoria.
+
 #### 💡 También funciona como Gestión del Estado Global
 No necesita un montón de variables globales ni un marco de gestión estatal pesado. Al combinar el modo de memoria con `watchValue` o `watch()`, puede lograr una actualización de la interfaz de usuario completamente automática en todos los widgets y páginas. Mantiene las poderosas capacidades de recuperación de una base de datos y al mismo tiempo le brinda una experiencia reactiva mucho más allá de las variables ordinarias, lo que lo hace ideal para el estado de inicio de sesión, la configuración en vivo o los contadores de mensajes globales.
 
@@ -228,8 +230,15 @@ No necesita un montón de variables globales ni un marco de gestión estatal pes
 > **Nota**: Los datos creados en el modo de memoria pura se pierden por completo después de cerrar o reiniciar la aplicación. No lo utilice para datos comerciales principales.
 
 ```dart
-// Initialize a pure in-memory database
-final memDb = await ToStore.memory();
+// Pure in-memory DB — TTL and/or FIFO/LRU capacity eviction as needed
+final memDb = await ToStore.memory(
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+    ),
+  ),
+);
 
 // Set a global state value (for example: unread message count)
 await memDb.setValue('unread_count', 5, isGlobal: true);
@@ -303,6 +312,7 @@ const userSchema = TableSchema(
   foreignKeys: const [], // Optional foreign-key constraints; see "Foreign Keys & Cascading"
   isGlobal: false, // Whether this is a global table; true means it can be shared across spaces
   ttlConfig: null, // Optional table-level TTL; see "Table-level TTL"
+  capacityConfig: null, // Optional capacity eviction; see "Capacity Eviction"
 );
 
 const appSchemas = [userSchema];
@@ -918,17 +928,76 @@ const TableSchema(
     ),
   ],
   ttlConfig: TableTtlConfig(
-    ttlMs: 7 * 24 * 60 * 60 * 1000, // Keep for 7 days
-    // When sourceField is omitted, the engine creates the needed index automatically.
-    // Optional custom sourceField requirements:
-    // 1) type must be DataType.datetime
-    // 2) nullable must be false
-    // 3) defaultValueType must be DefaultValueType.currentTimestamp
-    // sourceField: 'created_at',
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // Conservar 7 días
+    // Obligatorio en tablas nuevas / al activar TTL por primera vez:
+    // 1) DataType.datetime  2) nullable: false
+    // 3) DefaultValueType.currentTimestamp
+    sourceField: 'created_at',
   ),
 );
 ```
 
+### <a id="capacity-eviction"></a>Evicción por capacidad (FIFO / LRU)
+
+Limita cuántos registros conserva una tabla por cantidad y/o tamaño aproximado. Independiente del TTL—pueden combinarse. El excedente se elimina automáticamente en segundo plano.
+
+```dart
+// FIFO (predeterminado): expulsar los más antiguos por clave primaria.
+// No establezca sourceField (salvo PrimaryKeyType.none).
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  // maxBytes: 50 * 1024 * 1024, // límite de tamaño opcional
+  policy: CapacityEvictionPolicy.fifo,
+),
+
+// LRU: sourceField obligatorio (datetime, non-null, currentTimestamp).
+// Actualícelo cuando el registro deba contar como usado recientemente.
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  policy: CapacityEvictionPolicy.lru,
+  sourceField: 'last_active_at',
+),
+```
+
+- Configure al menos uno de `maxEntries` / `maxBytes`.
+- FIFO + `PrimaryKeyType.none` también requiere `sourceField` (mismas reglas datetime).
+
+También puede activar, cambiar o desactivar la evicción por capacidad en una tabla existente en tiempo de ejecución (sin reabrir la base):
+
+```dart
+// Activar / actualizar
+await db.updateSchema('recent_events').setCapacityConfig(
+  CapacityConfig(
+    maxEntries: 10000,
+    policy: CapacityEvictionPolicy.lru,
+    sourceField: 'last_active_at',
+  ),
+);
+
+// Desactivar (conserva las filas; deja de borrar por capacidad)
+await db.updateSchema('recent_events').disableCapacity();
+```
+
+La capacidad KV se configura al abrir la base con `DataStoreConfig` (no en cada `kv.set`):
+- `kvCapacityConfig`: límite de claves del **espacio actual**
+- `globalKvCapacityConfig`: límite de KV **global**
+- Misma forma que el `CapacityConfig` de tabla, pero sin `sourceField`
+
+```dart
+final db = await ToStore.open(
+  dbPath: '...',
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+    ),
+    globalKvCapacityConfig: CapacityConfig(
+      maxEntries: 2000,
+      policy: CapacityEvictionPolicy.fifo,
+    ),
+  ),
+);
+```
 
 ### Almacenamiento inteligente (Upsert)
 ToStore decide si actualizar o insertar en función de la clave primaria o el campo único incluido en `data`. `where` no se admite aquí; el objetivo del conflicto se determina por los propios datos.
@@ -1848,6 +1917,8 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultRecoveryDurability`** | **`standard`** | **Garantía de recuperación en respuesta.** Define el nivel de autorreparación antes de que las operaciones de escritura retornen el resultado:<br>• **`standard` (Predeterminado)**: **A prueba de fallos antes de responder.** Protege contra bloqueos de app, excepciones no detectadas y terminación OOM.<br>• **`durable`**: **A prueba de cortes de energía antes de responder.** Persistencia física forzada antes del retorno; recuperación completa ante cortes de energía.<br>• **`async`**: **Rendimiento máximo.** Retorna inmediatamente y guarda en segundo plano; tras responder, en datos pequeños suele existir una ventana de solo unos pocos milisegundos. |
 | **`persistRecoveryOnCommit`** | **verdadero** | **Sólida garantía de durabilidad.** Cuando es cierto, las transacciones confirmadas se sincronizan con el almacenamiento físico. Cuando es falso, el vaciado se realiza de forma asíncrona en segundo plano para mejorar la velocidad, con un pequeño riesgo de perder una pequeña cantidad de datos en caso de fallos extremos. |
 | **`ttlCleanupIntervalMs`** | **300000** | **Encuesta TTL global.** El intervalo en segundo plano para escanear datos caducados cuando el motor no está inactivo. Los valores más bajos eliminan los datos caducados antes pero cuestan más gastos generales. |
+| **`kvCapacityConfig`** | **null** | **Capacidad KV del espacio.** Límite FIFO/LRU para claves del espacio; no configure `sourceField`. Véase [Evicción por capacidad](#capacity-eviction). |
+| **`globalKvCapacityConfig`** | **null** | **Capacidad KV global.** Misma forma que `kvCapacityConfig`. |
 | **`maxConcurrency`** | (automático) | **Control de simultaneidad de cálculo.** Establece el recuento máximo de trabajadores paralelos para tareas intensivas como el cálculo de vectores y el cifrado/descifrado. Generalmente es mejor mantenerlo automático. |
 
 ```dart

@@ -158,7 +158,7 @@
 
 ### 4.3 SchemaValidationStatus (Валидация схемы таблицы и несовместимая миграция)
 
-- **Диапазон категорий**: `code` внутри `[30000, 39999]` — `30000–30013` статическая проверка схемы, `31001–31006` защиты миграции.
+- **Диапазон категорий**: `code` внутри `[30000, 39999]` — `30000–30014` статическая проверка схемы, `31001–31006` защиты миграции.
 - **Определение выделенного поля**:
 
   | Поле | Тип | Детали |
@@ -185,6 +185,7 @@
   | `30011`<br>`devSchemaTableExists` | Таблица уже существует | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
   | `30012`<br>`devSchemaFieldExists` | Обновление схемы: добавление поля, которое уже существует | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Конфликтующее имя поля</li><li>`wrongValue`: `null`</li></ul> |
   | `30013`<br>`devSchemaIndexExists` | Обновление схемы: добавление индекса, который уже существует | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя индекса</li><li>`wrongValue`: `null`</li></ul> |
+  | `30014`<br>`devInvalidSchemaCapacityConfig` | Ошибка проверки конфигурации вытеснения по ёмкости | <ul><li>`tableName`: Имя таблицы (может быть пустым для меток конфигурации KV)</li><li>`field`: `null`</li><li>`wrongValue`: Недопустимая Map конфигурации ёмкости, напр. `{ "maxEntries": null, "maxBytes": null }`</li></ul> |
   | `31001`<br>`devMigrationNotAllowedWithData` | Миграция требует изменения данных и не была явно разрешена | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `null`</li><li>`wrongValue`: Карта различий обновления миграции</li></ul> |
   | `31002`<br>`devMigrationUnsafeTypeConversion` | Физическая миграция: неподдерживаемое преобразование типов для поля | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя поля</li><li>`wrongValue`: Карта конфликтующих типов, например `{ "from": "text", "to": "integer" }`</li></ul> |
   | `31003`<br>`devMigrationCannotAddNonNullField` | Невозможно добавить поле non-nullable без значения по умолчанию в непустую таблицу | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Нарушающее правила имя поля</li><li>`wrongValue`: Параметры миграции, например `{ "nullable": false, "defaultValue": null }`</li></ul> |
@@ -515,6 +516,7 @@ try {
 | **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Ошибка разработчика | Таблица уже существует |
 | **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Ошибка разработчика | Поле уже существует |
 | **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Ошибка разработчика | Индекс уже существует |
+| **30014** | `DEV_INVALID_SCHEMA_CAPACITY_CONFIG` | `ResultType.devInvalidSchemaCapacityConfig` | Ошибка разработчика | Ошибка проверки конфигурации вытеснения по ёмкости |
 | **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Ошибка разработчика | Миграция требует изменения данных и не была явно разрешена |
 | **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Ошибка разработчика | Неподдерживаемое изменение типа данных для поля |
 | **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Ошибка разработчика | Добавление non-nullable поля без значения по умолчанию не допускается |

@@ -11,7 +11,16 @@ class WmbpQueryTerm {
   final int termId;
   final int weightMilli;
 
-  const WmbpQueryTerm({required this.termId, required this.weightMilli});
+  /// Terms that share a positive [groupId] must all hit to contribute (AND
+  /// within the group). `0` means ungrouped. Across groups / ungrouped terms,
+  /// [TextMatchOperator] still applies.
+  final int groupId;
+
+  const WmbpQueryTerm({
+    required this.termId,
+    required this.weightMilli,
+    this.groupId = 0,
+  });
 }
 
 /// One ranked hit. [score] is normalized against the best raw score in the set.
@@ -363,7 +372,7 @@ List<WmbpHit> wmbpSearchTopK({
   final ctx = _WmbpSearchContextPool.acquire();
   try {
     ctx.prepare(topK);
-    final compiled = ctx.compiled;
+    var compiled = ctx.compiled;
     for (final term in terms) {
       if (term.weightMilli <= 0) continue;
       final int df = source.dfOf(term.termId);
@@ -372,12 +381,19 @@ List<WmbpHit> wmbpSearchTopK({
           useIdf ? WmbpScore.idfMilli(df, source.activeDocCount) : 1;
       final int unit = idf * term.weightMilli;
       if (unit <= 0) continue;
-      compiled.add(_CompiledTerm(term.termId, unit, compiled.length));
+      compiled.add(
+        _CompiledTerm(term.termId, unit, compiled.length, term.groupId),
+      );
     }
+    compiled = _dropIncompleteGroups(terms, compiled);
     if (compiled.isEmpty) return const <WmbpHit>[];
     if (conjunctive && !_compiledCovers(terms, compiled.length)) {
       return const <WmbpHit>[];
     }
+    final groupMeta = _groupMeta(compiled);
+    final groupFailed = groupMeta.hasGroups
+        ? Uint8List(groupMeta.maxGroupId + 1)
+        : Uint8List(0);
 
     final heap = ctx.heap;
     var stamp = ctx.nextStamp();
@@ -407,18 +423,14 @@ List<WmbpHit> wmbpSearchTopK({
       if (heap.length == topK) theta = heap.worstScore;
     }
 
-    int scoreDoc(int docId) {
-      var sum = 0;
-      for (final term in compiled) {
-        final int q = source.impactOf(docId, term.termId);
-        if (q <= 0) {
-          if (conjunctive) return 0;
-          continue;
-        }
-        sum += term.unit * q;
-      }
-      return sum;
-    }
+    int scoreDoc(int docId) => _scoreDocGrouped(
+          source: source,
+          compiled: compiled,
+          docId: docId,
+          conjunctive: conjunctive,
+          hasGroups: groupMeta.hasGroups,
+          groupFailed: groupFailed,
+        );
 
     // Champion Prefix: exact lower-bound warm without requiring window bodies.
     for (final term in compiled) {
@@ -439,9 +451,10 @@ List<WmbpHit> wmbpSearchTopK({
             _scoreWindowsReady(source, compiled, windowId);
         if (fullReady) {
           consider(posting.docId, scoreDoc(posting.docId));
-        } else if (partial > 0) {
+        } else if (partial > 0 && term.groupId == 0) {
           // Soft raise θ with a proven lower bound; do not pin [considered]
           // so a later full multi-term score can still replace it.
+          // Grouped terms skip soft raise — a single member is not a bound.
           heap.upsert(posting.docId, partial);
           if (heap.length == topK) theta = heap.worstScore;
         }
@@ -606,7 +619,7 @@ Future<List<WmbpHit>> wmbpSearchTopKPaged({
   final ctx = _WmbpSearchContextPool.acquire();
   try {
     ctx.prepare(topK);
-    final compiled = ctx.compiled;
+    var compiled = ctx.compiled;
     for (final term in terms) {
       if (term.weightMilli <= 0) continue;
       final int df = source.dfOf(term.termId);
@@ -615,12 +628,19 @@ Future<List<WmbpHit>> wmbpSearchTopKPaged({
           useIdf ? WmbpScore.idfMilli(df, source.activeDocCount) : 1;
       final int unit = idf * term.weightMilli;
       if (unit <= 0) continue;
-      compiled.add(_CompiledTerm(term.termId, unit, compiled.length));
+      compiled.add(
+        _CompiledTerm(term.termId, unit, compiled.length, term.groupId),
+      );
     }
+    compiled = _dropIncompleteGroups(terms, compiled);
     if (compiled.isEmpty) return const <WmbpHit>[];
     if (conjunctive && !_compiledCovers(terms, compiled.length)) {
       return const <WmbpHit>[];
     }
+    final groupMeta = _groupMeta(compiled);
+    final groupFailed = groupMeta.hasGroups
+        ? Uint8List(groupMeta.maxGroupId + 1)
+        : Uint8List(0);
 
     final heap = ctx.heap;
     var stamp = ctx.nextStamp();
@@ -649,18 +669,14 @@ Future<List<WmbpHit>> wmbpSearchTopKPaged({
       if (heap.length == topK) theta = heap.worstScore;
     }
 
-    int scoreDoc(int docId) {
-      var sum = 0;
-      for (final term in compiled) {
-        final int q = source.impactOf(docId, term.termId);
-        if (q <= 0) {
-          if (conjunctive) return 0;
-          continue;
-        }
-        sum += term.unit * q;
-      }
-      return sum;
-    }
+    int scoreDoc(int docId) => _scoreDocGrouped(
+          source: source,
+          compiled: compiled,
+          docId: docId,
+          conjunctive: conjunctive,
+          hasGroups: groupMeta.hasGroups,
+          groupFailed: groupFailed,
+        );
 
     for (final term in compiled) {
       for (final posting in source.championOf(term.termId)) {
@@ -676,7 +692,7 @@ Future<List<WmbpHit>> wmbpSearchTopKPaged({
             _scoreWindowsReady(source, compiled, windowId);
         if (fullReady) {
           consider(posting.docId, scoreDoc(posting.docId));
-        } else if (partial > 0) {
+        } else if (partial > 0 && term.groupId == 0) {
           heap.upsert(posting.docId, partial);
           if (heap.length == topK) theta = heap.worstScore;
         }
@@ -922,7 +938,106 @@ class _CompiledTerm {
 
   /// Index into the compiled list — avoids [List.indexOf] in the scan hot path.
   final int slotIndex;
-  const _CompiledTerm(this.termId, this.unit, this.slotIndex);
+
+  /// See [WmbpQueryTerm.groupId].
+  final int groupId;
+
+  const _CompiledTerm(this.termId, this.unit, this.slotIndex, this.groupId);
+}
+
+/// Scores one doc. Grouped terms contribute only when every member hits;
+/// ungrouped terms follow [conjunctive] / OR as before. Duplicate [termId]s
+/// across groups are counted once when active.
+int _scoreDocGrouped({
+  required WmbpPostingSource source,
+  required List<_CompiledTerm> compiled,
+  required int docId,
+  required bool conjunctive,
+  required bool hasGroups,
+  required Uint8List groupFailed,
+}) {
+  if (!hasGroups) {
+    var sum = 0;
+    for (final term in compiled) {
+      final int q = source.impactOf(docId, term.termId);
+      if (q <= 0) {
+        if (conjunctive) return 0;
+        continue;
+      }
+      sum += term.unit * q;
+    }
+    return sum;
+  }
+
+  groupFailed.fillRange(0, groupFailed.length, 0);
+  for (final term in compiled) {
+    if (term.groupId == 0) continue;
+    if (source.impactOf(docId, term.termId) <= 0) {
+      if (term.groupId < groupFailed.length) {
+        groupFailed[term.groupId] = 1;
+      }
+      if (conjunctive) return 0;
+    }
+  }
+
+  var sum = 0;
+  // termId → already added (avoid double-count when shared across groups).
+  // Compact stamp table sized by compiled length is enough via slot walk.
+  final counted = <int>{};
+  for (final term in compiled) {
+    if (term.groupId != 0 &&
+        term.groupId < groupFailed.length &&
+        groupFailed[term.groupId] != 0) {
+      continue;
+    }
+    if (!counted.add(term.termId)) continue;
+    final int q = source.impactOf(docId, term.termId);
+    if (q <= 0) {
+      if (conjunctive) return 0;
+      continue;
+    }
+    sum += term.unit * q;
+  }
+  return sum;
+}
+
+({int maxGroupId, bool hasGroups}) _groupMeta(List<_CompiledTerm> compiled) {
+  var maxGroupId = 0;
+  for (final term in compiled) {
+    if (term.groupId > maxGroupId) maxGroupId = term.groupId;
+  }
+  return (maxGroupId: maxGroupId, hasGroups: maxGroupId > 0);
+}
+
+/// Drops AND-groups that lost members to df==0 filters.
+List<_CompiledTerm> _dropIncompleteGroups(
+  List<WmbpQueryTerm> input,
+  List<_CompiledTerm> compiled,
+) {
+  final expected = <int, int>{};
+  for (final term in input) {
+    if (term.weightMilli <= 0 || term.groupId == 0) continue;
+    expected[term.groupId] = (expected[term.groupId] ?? 0) + 1;
+  }
+  if (expected.isEmpty) return compiled;
+  final got = <int, int>{};
+  for (final term in compiled) {
+    if (term.groupId == 0) continue;
+    got[term.groupId] = (got[term.groupId] ?? 0) + 1;
+  }
+  final dead = <int>{};
+  for (final entry in expected.entries) {
+    if ((got[entry.key] ?? 0) != entry.value) dead.add(entry.key);
+  }
+  if (dead.isEmpty) return compiled;
+  final kept = <_CompiledTerm>[
+    for (final term in compiled)
+      if (term.groupId == 0 || !dead.contains(term.groupId)) term,
+  ];
+  return [
+    for (int i = 0; i < kept.length; i++)
+      _CompiledTerm(kept[i].termId, kept[i].unit, i, kept[i].groupId),
+  ];
 }
 
 int _windowBound(
@@ -1182,6 +1297,13 @@ void _scanWindow({
 }) {
   final seen = ctx.seen;
   final int numTerms = compiled.length;
+  var hasGroups = false;
+  for (final term in compiled) {
+    if (term.groupId != 0) {
+      hasGroups = true;
+      break;
+    }
+  }
   final List<WmbpEncodedWindow?> localWindows =
       numTerms <= ctx.localWindows.length
           ? ctx.localWindows
@@ -1269,6 +1391,10 @@ void _scanWindow({
             consider(docId, compiled[0].unit * qSelf);
             continue;
           }
+          if (hasGroups) {
+            consider(docId, scoreDoc(docId));
+            continue;
+          }
 
           var sum = compiled[termIndex].unit * qSelf;
           bool zeroScore = false;
@@ -1331,6 +1457,10 @@ void _scanWindow({
                 consider(docId, compiled[0].unit * qSelf);
                 continue;
               }
+              if (hasGroups) {
+                consider(docId, scoreDoc(docId));
+                continue;
+              }
 
               var sum = compiled[termIndex].unit * qSelf;
               bool zeroScore = false;
@@ -1361,6 +1491,10 @@ void _scanWindow({
         final int docId = windowId * WmbpConstants.windowSize + docOffset;
         if (numTerms == 1) {
           if (qSelf > 0) consider(docId, compiled[0].unit * qSelf);
+          return;
+        }
+        if (hasGroups) {
+          consider(docId, scoreDoc(docId));
           return;
         }
         var sum = compiled[termIndex].unit * qSelf;

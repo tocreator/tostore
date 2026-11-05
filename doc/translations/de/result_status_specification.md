@@ -158,7 +158,7 @@ Abhängig vom Bereich von `code` / `codeKey` und der spezifischen Unterklasse vo
 
 ### 4.3 SchemaValidationStatus (Tabellenschema-Validierung & inkompatible Migration)
 
-- **Kategoriebereich**: `code` innerhalb von `[30000, 39999]` — `30000–30013` statische Schema-Validierung, `31001–31006` Migrationsschutz.
+- **Kategoriebereich**: `code` innerhalb von `[30000, 39999]` — `30000–30014` statische Schema-Validierung, `31001–31006` Migrationsschutz.
 - **Dedizierte Felddefinition**:
 
   | Feld | Typ | Details |
@@ -185,6 +185,7 @@ Abhängig vom Bereich von `code` / `codeKey` und der spezifischen Unterklasse vo
   | `30011`<br>`devSchemaTableExists` | Tabelle existiert bereits | <ul><li>`tableName`: Tabellenname</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
   | `30012`<br>`devSchemaFieldExists` | Schema-Upgrade: Hinzufügen eines bereits vorhandenen Feldes | <ul><li>`tableName`: Tabellenname</li><li>`field`: Konfliktverursachender Feldname</li><li>`wrongValue`: `null`</li></ul> |
   | `30013`<br>`devSchemaIndexExists` | Schema-Upgrade: Hinzufügen eines bereits vorhandenen Index | <ul><li>`tableName`: Tabellenname</li><li>`field`: Indexname</li><li>`wrongValue`: `null`</li></ul> |
+  | `30014`<br>`devInvalidSchemaCapacityConfig` | Validierung der Kapazitätsbereinigungskonfiguration fehlgeschlagen | <ul><li>`tableName`: Tabellenname (kann bei KV-Konfigurationslabels leer sein)</li><li>`field`: `null`</li><li>`wrongValue`: Ungültige Kapazitätskonfigurations-Map, z. B. `{ "maxEntries": null, "maxBytes": null }`</li></ul> |
   | `31001`<br>`devMigrationNotAllowedWithData` | Migration erfordert Datenänderung und wurde nicht explizit erlaubt | <ul><li>`tableName`: Tabellenname</li><li>`field`: `null`</li><li>`wrongValue`: Migration-Upgrade-Diffs-Map</li></ul> |
   | `31002`<br>`devMigrationUnsafeTypeConversion` | Physische Migration: Nicht unterstützte Typkonvertierung für Feld | <ul><li>`tableName`: Tabellenname</li><li>`field`: Feldname</li><li>`wrongValue`: Konfliktverursachende Typen-Map, z. B. `{ "from": "text", "to": "integer" }`</li></ul> |
   | `31003`<br>`devMigrationCannotAddNonNullField` | Nicht-Null-Feld ohne Standardwert kann nicht zu einer nicht-leeren Tabelle hinzugefügt werden | <ul><li>`tableName`: Tabellenname</li><li>`field`: Fehlerhafter Feldname</li><li>`wrongValue`: Migrationsparameter, z. B. `{ "nullable": false, "defaultValue": null }`</li></ul> |
@@ -515,6 +516,7 @@ Die genaue Zuordnung der Status-Routings und -Parsings entnehmen Sie bitte der f
 | **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Entwicklerfehler | Tabelle existiert bereits |
 | **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Entwicklerfehler | Feld existiert bereits |
 | **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Entwicklerfehler | Index existiert bereits |
+| **30014** | `DEV_INVALID_SCHEMA_CAPACITY_CONFIG` | `ResultType.devInvalidSchemaCapacityConfig` | Entwicklerfehler | Validierung der Kapazitätsbereinigungskonfiguration fehlgeschlagen |
 | **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Entwicklerfehler | Migration erfordert Datenänderung und wurde nicht explizit erlaubt |
 | **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Entwicklerfehler | Nicht unterstützte Datentypänderung für Feld |
 | **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Entwicklerfehler | Hinzufügen eines Nicht-Null-Feldes ohne Standardwert ist nicht erlaubt |

@@ -267,6 +267,24 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
     return this;
   }
 
+  /// Set table-level capacity eviction config (FIFO/LRU)
+  SchemaBuilder setCapacityConfig(TableCapacityConfig config) {
+    _operations.add(MigrationOperation(
+      type: MigrationType.setTableCapacityConfig,
+      capacityConfig: config,
+    ));
+    return this;
+  }
+
+  /// Disable table-level capacity eviction config
+  SchemaBuilder disableCapacity() {
+    _operations.add(const MigrationOperation(
+      type: MigrationType.setTableCapacityConfig,
+      capacityConfig: null,
+    ));
+    return this;
+  }
+
   /// Add foreign key to table
   SchemaBuilder addForeignKey({
     String? name,

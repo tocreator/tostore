@@ -4,10 +4,10 @@ import 'result_type.dart';
 
 /// How query terms combine in a text retrieval.
 enum TextMatchOperator {
-  /// Union of query terms, ranked by additive exact score.
+  /// Match any query term; results are ranked by relevance.
   or,
 
-  /// A document must carry every query term. Rank uses the same additive score.
+  /// Require every query term; results are ranked by relevance.
   and,
 }
 
@@ -16,7 +16,7 @@ enum TextMatchOperator {
 /// [weight] is a multiplier. The default is 1. Non-positive weights are dropped
 /// when the query is built.
 class TextTerm {
-  /// Term string. Matched exactly against indexed terms.
+  /// Query term string.
   final String term;
 
   /// Per-term multiplier.
@@ -27,31 +27,29 @@ class TextTerm {
 
 /// Query input for [IndexType.text] retrieval.
 ///
-/// [TextQuery.text] is tokenized by the engine.
-/// [TextQuery.terms] and [TextQuery.termsWeighted] are already tokenized.
-/// The engine does not segment, expand, or change the case of those terms.
-/// Indexed Latin terms from the built-in segmenter are lowercase, so a
-/// pre-tokenized `Kernel` does not match an indexed `kernel`.
+/// Use [TextQuery.text] for raw text (the engine tokenizes it).
+/// Use [TextQuery.terms] or [TextQuery.termsWeighted] when terms are already
+/// split. Pre-tokenized terms are matched as given — built-in indexing stores
+/// Latin tokens in lowercase, so `Kernel` does not match `kernel`.
 class TextQuery {
   /// Raw text. Null when [weightedTerms] is set.
   final String? text;
 
-  /// Normalized pre-tokenized term weights. Null when [text] is set.
+  /// Pre-tokenized term weights. Null when [text] is set.
   ///
-  /// Duplicate terms are summed. This is the form the retrieval kernel reads.
+  /// Duplicate terms are summed.
   final Map<String, double>? weightedTerms;
   final int _hashCode;
 
   TextQuery._(this.text, this.weightedTerms)
       : _hashCode = _computeHashCode(text, weightedTerms);
 
-  /// Tokenize [text] with the built-in Unicode / CJK segmenter.
+  /// Raw query text; tokenized by the engine.
   factory TextQuery.text(String text) => TextQuery._(text, null);
 
   /// Pre-tokenized terms, each with weight 1.
   ///
-  /// Repeated strings add weight, matching the built-in segmenter's term counts.
-  /// The engine does not segment these strings again.
+  /// Repeated strings add weight.
   factory TextQuery.terms(List<String> terms) => TextQuery._(
         null,
         _normalize(terms.map((term) => TextTerm(term))),
@@ -59,8 +57,7 @@ class TextQuery {
 
   /// Pre-tokenized terms with explicit weights.
   ///
-  /// Weights of the same [TextTerm.term] are summed. The engine does not
-  /// segment these strings again.
+  /// Weights of the same [TextTerm.term] are summed.
   factory TextQuery.termsWeighted(List<TextTerm> terms) =>
       TextQuery._(null, _normalize(terms));
 
@@ -81,6 +78,16 @@ class TextQuery {
         ]);
       }
       if (item.weight <= 0) continue;
+      if (!item.weight.isFinite) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message: 'Text term weight must be finite.',
+            parameterName: 'weight',
+            passedValue: item.weight,
+          ),
+        ]);
+      }
       weights[item.term] = (weights[item.term] ?? 0) + item.weight;
     }
     return Map<String, double>.unmodifiable(weights);

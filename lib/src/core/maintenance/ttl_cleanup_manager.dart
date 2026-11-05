@@ -4,7 +4,6 @@ import 'dart:typed_data';
 
 import '../../handler/logger.dart';
 import '../../handler/memcomparable.dart';
-import '../../model/data_block_entry.dart';
 import '../../model/index_search.dart';
 import '../../model/system_table.dart';
 import '../../model/table_context.dart';
@@ -54,9 +53,6 @@ class TtlCleanupManager {
   /// Timer for startup one-shot trigger
   Timer? _startupTimer;
 
-  /// Timer for fast retry after yielding to foreground writes
-  Timer? _retryTimer;
-
   TtlCleanupManager(this._dataStore);
 
   void registerCleanupTask() {
@@ -77,8 +73,6 @@ class TtlCleanupManager {
   void unregisterCleanupTask() {
     _startupTimer?.cancel();
     _startupTimer = null;
-    _retryTimer?.cancel();
-    _retryTimer = null;
 
     if (_cleanupRegistered) {
       try {
@@ -89,16 +83,7 @@ class TtlCleanupManager {
     }
     _cleanupRunning = false;
     _lastCleanupMs = 0;
-  }
-
-  void _scheduleRetryAfterYield() {
-    _retryTimer?.cancel();
-    if (_dataStore.isClosing) return;
-    _retryTimer = Timer(const Duration(seconds: 10), () {
-      _retryTimer = null;
-      if (_dataStore.isClosing) return;
-      _onScheduleTick();
-    });
+    CrontabManager.releaseBackgroundWorkLease(_backgroundLeaseId);
   }
 
   void invalidatePlanCache() {
@@ -286,55 +271,36 @@ class TtlCleanupManager {
 
         final deletedCount = r.successCount;
 
-        // Best-effort cleanup of TTL index entries for internal source.
-        // We rely on IndexSearchResult.indexKeys being aligned with primaryKeys.
+        // Virtual ingest keys cannot be encoded from the row on DELETE.
+        // Tombstone only known keyBytes from this search — under table write
+        // lock via IndexManager (must not race flush). Real sourceField TTL
+        // below uses deleteInternal alone (no side channel).
         if (deletedCount > 0 &&
             entries != null &&
-            entries.length == pks.length) {
-          IndexSchema? ttlIndex;
-          for (final idx in schema.getAllIndexes()) {
-            if (idx.fields.contains(TableSchema.internalTtlIngestTsMsField)) {
-              ttlIndex = idx;
-              break;
+            entries.isNotEmpty &&
+            ttlIndexUid.isNotEmpty) {
+          try {
+            final keysByPk = <String, List<Uint8List>>{};
+            for (final e in entries) {
+              if (e.keyBytes.isEmpty) continue;
+              (keysByPk[e.primaryKey] ??= <Uint8List>[]).add(e.keyBytes);
             }
-          }
-          if (ttlIndex != null && ttlIndex.indexUid.isNotEmpty) {
-            try {
-              final meta = await _dataStore.indexManager
-                  ?.getIndexMeta(table.tableUid, ttlIndex.indexUid);
-              if (meta != null) {
-                // Build pk -> index positions map to align deleted PKs with index keys.
-                final Map<String, List<Uint8List>> keysByPk = {};
-                for (final e in entries) {
-                  (keysByPk[e.primaryKey] ??= <Uint8List>[]).add(e.keyBytes);
-                }
-
-                Uint8List encodeDeleteValue() =>
-                    Uint8List.fromList(const <int>[1]);
-
-                final deltas = <DataBlockEntry>[];
-                for (final pk in r.successKeys) {
-                  final keyList = keysByPk[pk];
-                  if (keyList == null || keyList.isEmpty) continue;
-                  for (final keyBytes in keyList) {
-                    if (keyBytes.isEmpty) continue;
-                    deltas.add(DataBlockEntry(keyBytes, encodeDeleteValue()));
-                  }
-                }
-
-                if (deltas.isNotEmpty) {
-                  await _dataStore.indexTreePartitionManager?.writeChanges(
-                    table: table,
-                    indexUid: ttlIndex.indexUid,
-                    indexMeta: meta,
-                    deltas: deltas,
-                  );
-                }
-              }
-            } catch (e) {
-              Logger.warn('TTL index cleanup failed on $tableName',
-                  rawError: e);
+            final tombstoneKeys = <Uint8List>[];
+            for (final pk in r.successKeys) {
+              final keyList = keysByPk[pk];
+              if (keyList == null) continue;
+              tombstoneKeys.addAll(keyList);
             }
+            if (tombstoneKeys.isNotEmpty) {
+              await _dataStore.indexManager?.removeIndexEntriesByRawKeys(
+                table,
+                ttlIndexUid,
+                tombstoneKeys,
+              );
+            }
+          } catch (e) {
+            Logger.warn('TTL ingest index cleanup failed on $tableName',
+                rawError: e);
           }
         }
 
@@ -399,15 +365,6 @@ class TtlCleanupManager {
     }
   }
 
-  Future<void> _removeKvExpiryIndexEntry(
-    TableContext table,
-    Uint8List keyBytes,
-  ) async {
-    if (keyBytes.isEmpty) return;
-    await _dataStore.indexManager
-        ?.removeInternalKvExpiryIndexEntryByRawKey(table, keyBytes);
-  }
-
   Future<_TtlBatchResult> _runKvCleanupBatch(
     TableContext table,
     DateTime cycleNow, {
@@ -430,6 +387,14 @@ class TtlCleanupManager {
       }
 
       int deletedCount = 0;
+      // Verify/delete must stay per-row (stale keys / renewed expiry), but
+      // tombstones flush once — same batch writeChanges path as table TTL.
+      final tombstoneKeys = <Uint8List>[];
+      void queueTombstone(Uint8List keyBytes) {
+        if (keyBytes.isEmpty) return;
+        tombstoneKeys.add(keyBytes);
+      }
+
       final yieldController =
           YieldController('TtlCleanupManager._runKvCleanupBatch');
       for (final entry in entries) {
@@ -444,7 +409,7 @@ class TtlCleanupManager {
         ))
             .records;
         if (records.isEmpty) {
-          await _removeKvExpiryIndexEntry(table, entry.keyBytes);
+          queueTombstone(entry.keyBytes);
           continue;
         }
 
@@ -452,13 +417,13 @@ class TtlCleanupManager {
         final currentExpiresAtIso =
             _normalizeDateTimeIso(row[SystemTable.keyValueExpiresAtField]);
         if (currentExpiresAtIso == null) {
-          await _removeKvExpiryIndexEntry(table, entry.keyBytes);
+          queueTombstone(entry.keyBytes);
           continue;
         }
 
         final currentExpiresAt = DateTime.tryParse(currentExpiresAtIso);
         if (currentExpiresAt == null || currentExpiresAt.isAfter(cycleNow)) {
-          await _removeKvExpiryIndexEntry(table, entry.keyBytes);
+          queueTombstone(entry.keyBytes);
           continue;
         }
 
@@ -480,6 +445,14 @@ class TtlCleanupManager {
           Logger.warn(
             'KV TTL cleanup delete failed on $tableName pk=${entry.primaryKey}: ${deleteResult.message}',
           );
+          // Still flush tombstones collected so far (orphan GC progress).
+          if (tombstoneKeys.isNotEmpty) {
+            await _dataStore.indexManager
+                ?.removeInternalKvExpiryIndexEntriesByRawKeys(
+              table,
+              tombstoneKeys,
+            );
+          }
           return const _TtlBatchResult(deleted: 0, ok: false);
         }
 
@@ -487,7 +460,7 @@ class TtlCleanupManager {
           deletedCount += deleteResult.successCount;
         }
 
-        await _removeKvExpiryIndexEntry(table, entry.keyBytes);
+        queueTombstone(entry.keyBytes);
 
         if (deleteResult.successCount > 0) {
           final currentKeyBytes =
@@ -499,15 +472,23 @@ class TtlCleanupManager {
           if (currentKeyBytes != null &&
               currentKeyBytes.isNotEmpty &&
               MemComparableKey.compare(currentKeyBytes, entry.keyBytes) != 0) {
-            await _removeKvExpiryIndexEntry(table, currentKeyBytes);
+            queueTombstone(currentKeyBytes);
           }
         } else {
           final candidateExpiresAtIso = _decodeKvExpiryIso(entry.keyBytes);
           if (candidateExpiresAtIso != null &&
               candidateExpiresAtIso != currentExpiresAtIso) {
-            await _removeKvExpiryIndexEntry(table, entry.keyBytes);
+            queueTombstone(entry.keyBytes);
           }
         }
+      }
+
+      if (tombstoneKeys.isNotEmpty) {
+        await _dataStore.indexManager
+            ?.removeInternalKvExpiryIndexEntriesByRawKeys(
+          table,
+          tombstoneKeys,
+        );
       }
 
       return _TtlBatchResult(deleted: deletedCount, ok: true);
@@ -522,7 +503,9 @@ class TtlCleanupManager {
 
   Future<void> _runCleanupCycle() async {
     if (_dataStore.isClosing) return;
-    bool cycleHasBacklog = false;
+    // Keep crontab awake only when we pause with unfinished work; resume on
+    // the next minutes1 tick (no separate retry timer).
+    var holdBackgroundLease = false;
     CrontabManager.acquireBackgroundWorkLease(_backgroundLeaseId);
     try {
       final plans = await _getCleanupPlans();
@@ -553,7 +536,10 @@ class TtlCleanupManager {
           label: 'ttl-cleanup-round-$round',
         );
 
-        if (lease == null) break;
+        if (lease == null) {
+          holdBackgroundLease = true;
+          break;
+        }
 
         try {
           int roundDeleted = 0;
@@ -569,7 +555,10 @@ class TtlCleanupManager {
           for (final plan in activePlans) {
             final y = yieldController.maybeYield();
             if (y != null) await y;
-            if (_dataStore.isClosing) break;
+            if (_dataStore.isClosing) {
+              nextPlans.add(plan);
+              break;
+            }
 
             // Preemptive backpressure: yield immediately if foreground writes are queueing
             if (foregroundBusyThreshold > 0 &&
@@ -589,14 +578,9 @@ class TtlCleanupManager {
             if (result.ok && result.deleted > 0) {
               roundDeleted += result.deleted;
               totalDeleted += result.deleted;
-              final resolvedName = await _dataStore.tableMetaManager
-                      ?.resolveTableNameFromField(plan.tableUid) ??
-                  TableName(plan.tableUid.value);
-              Logger.info(
-                'TTL cleanup deleted ${result.deleted} records from table $resolvedName',
-              );
             }
 
+            // Full batch ⇒ more expired rows likely remain; keep draining.
             if (result.deleted >= batchSize) {
               nextPlans.add(plan);
             }
@@ -607,6 +591,10 @@ class TtlCleanupManager {
             for (final table in activeKvTables) {
               final y = yieldController.maybeYield();
               if (y != null) await y;
+              if (_dataStore.isClosing) {
+                nextKvTables.add(table);
+                break;
+              }
 
               // Preemptive backpressure: yield immediately if foreground writes are queueing
               if (foregroundBusyThreshold > 0 &&
@@ -626,9 +614,6 @@ class TtlCleanupManager {
               if (result.ok && result.deleted > 0) {
                 roundDeleted += result.deleted;
                 totalDeleted += result.deleted;
-                Logger.info(
-                  'KV TTL cleanup deleted ${result.deleted} records from table ${table.tableName}',
-                );
               }
 
               if (result.deleted >= batchSize) {
@@ -641,28 +626,22 @@ class TtlCleanupManager {
               nextPlans.isNotEmpty || nextKvTables.isNotEmpty;
 
           if (yieldedToForeground) {
-            // Write buffer is under pressure: yield to foreground writes,
-            // reset last cleanup time and schedule a 10s fast retry
+            // Write buffer busy — resume on next minutes1 crontab tick.
             activePlans = const <_TtlCleanupPlan>[];
             activeKvTables = const <TableContext>[];
-            _lastCleanupMs = 0;
-            _scheduleRetryAfterYield();
+            holdBackgroundLease = true;
           } else if (roundDeleted <= 0) {
+            // No deletes this round ⇒ no known expired backlog for these plans.
             activePlans = const <_TtlCleanupPlan>[];
             activeKvTables = const <TableContext>[];
           } else if (hasBacklog) {
-            // There is still TTL backlog and write buffer is clean:
-            // continue next gentle round and notify crontab activity
+            // Idle: keep draining in this while-loop.
             activePlans = nextPlans;
             activeKvTables = nextKvTables;
             CrontabManager.notifyActivity();
           } else {
             activePlans = const <_TtlCleanupPlan>[];
             activeKvTables = const <TableContext>[];
-          }
-
-          if (hasBacklog) {
-            cycleHasBacklog = true;
           }
 
           if (activePlans.isEmpty && activeKvTables.isEmpty) break;
@@ -684,7 +663,7 @@ class TtlCleanupManager {
         Logger.warn('TTL cleanup cycle failed', rawError: e);
       }
     } finally {
-      if (!cycleHasBacklog) {
+      if (!holdBackgroundLease) {
         CrontabManager.releaseBackgroundWorkLease(_backgroundLeaseId);
       }
     }

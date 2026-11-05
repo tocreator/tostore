@@ -1702,6 +1702,7 @@ class TableMetaManager {
         _cacheTableMeta(saved);
         dirSlotCommitted = true;
         _dataStore.upsertTtlPlanForSchema(saved.schema);
+        _dataStore.upsertCapacityPlanForSchema(saved.schema);
         return saved;
       }
 
@@ -1716,6 +1717,7 @@ class TableMetaManager {
       dirSlotCommitted = true;
 
       _dataStore.upsertTtlPlanForSchema(saved.schema);
+      _dataStore.upsertCapacityPlanForSchema(saved.schema);
       return saved;
     } catch (e) {
       // Roll back dir slot reserved by allocateDirIndex / caller when create
@@ -1934,6 +1936,7 @@ class TableMetaManager {
       removeCachedTableSchema(tableUid);
 
       _dataStore.removeTtlPlanForTable(ctx);
+      _dataStore.removeCapacityPlanForTable(ctx);
       return true;
     } catch (e) {
       final logTable = _peekNameByUid(tableUid)?.value ?? tableUid.value;

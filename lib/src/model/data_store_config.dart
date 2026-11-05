@@ -4,6 +4,7 @@ import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
 import 'encoder_config.dart';
 import 'migration_config.dart';
+import 'table_schema.dart';
 
 /// data store config
 class DataStoreConfig {
@@ -149,8 +150,17 @@ class DataStoreConfig {
 
   /// Unified database-level TTL cleanup polling interval in milliseconds.
   ///
-  /// To avoid excessive polling pressure, values lower than 5 minutes are clamped to 300000.
+  /// To avoid excessive polling pressure, values lower than 1 minutes are clamped to 60000.
   final int ttlCleanupIntervalMs;
+
+  /// Capacity eviction for space-scoped KV (`isGlobal: false`).
+  ///
+  /// null = disabled.
+  /// capacity is an instance-level policy applied after writes.
+  final KvCapacityConfig? kvCapacityConfig;
+
+  /// Capacity eviction for global KV (`isGlobal: true`).
+  final KvCapacityConfig? globalKvCapacityConfig;
 
   /// The budgeted duration in milliseconds to yield execution for UI thread responsiveness during intensive tasks.
   /// Defaults to 8ms for client (UI) platforms, 50ms for server.
@@ -190,6 +200,8 @@ class DataStoreConfig {
     required this.transactionCleanupIntervalMs,
     required this.transactionMetaTtlMs,
     required this.ttlCleanupIntervalMs,
+    this.kvCapacityConfig,
+    this.globalKvCapacityConfig,
     required this.defaultQueryLimit,
     required this.maxQueryOffset,
     required this.yieldDurationMs,
@@ -232,11 +244,17 @@ class DataStoreConfig {
     int? transactionCleanupIntervalMs,
     int? transactionMetaTtlMs,
     int? ttlCleanupIntervalMs,
+    KvCapacityConfig? kvCapacityConfig,
+    KvCapacityConfig? globalKvCapacityConfig,
     int? defaultQueryLimit,
     int? maxQueryOffset,
     int? yieldDurationMs,
     bool? isServerEnvironment,
   }) {
+    kvCapacityConfig?.checkKvCapacityConfig(label: 'kvCapacityConfig');
+    globalKvCapacityConfig?.checkKvCapacityConfig(
+        label: 'globalKvCapacityConfig');
+
     final resolvedServer =
         isServerEnvironment ?? PlatformHandler.isServerEnvironment;
     final resolvedMaxPartition =
@@ -286,6 +304,8 @@ class DataStoreConfig {
       transactionCleanupIntervalMs: transactionCleanupIntervalMs ?? 600000,
       transactionMetaTtlMs: transactionMetaTtlMs ?? 600000,
       ttlCleanupIntervalMs: max(ttlCleanupIntervalMs ?? 60000, 60000),
+      kvCapacityConfig: kvCapacityConfig,
+      globalKvCapacityConfig: globalKvCapacityConfig,
       defaultQueryLimit: defaultQueryLimit ?? 1000,
       maxQueryOffset: maxQueryOffset ?? 10000,
       yieldDurationMs:
@@ -634,6 +654,16 @@ class DataStoreConfig {
           json['transactionCleanupIntervalMs'] as int?,
       transactionMetaTtlMs: json['transactionMetaTtlMs'] as int?,
       ttlCleanupIntervalMs: json['ttlCleanupIntervalMs'] as int?,
+      kvCapacityConfig: json['kvCapacityConfig'] is Map
+          ? KvCapacityConfig.fromJson(
+              Map<String, dynamic>.from(json['kvCapacityConfig'] as Map),
+            )
+          : null,
+      globalKvCapacityConfig: json['globalKvCapacityConfig'] is Map
+          ? KvCapacityConfig.fromJson(
+              Map<String, dynamic>.from(json['globalKvCapacityConfig'] as Map),
+            )
+          : null,
       defaultQueryLimit: (json['defaultQueryLimit'] is int)
           ? json['defaultQueryLimit'] as int
           : int.tryParse('${json['defaultQueryLimit']}'),
@@ -683,6 +713,10 @@ class DataStoreConfig {
       'transactionCleanupIntervalMs': transactionCleanupIntervalMs,
       'transactionMetaTtlMs': transactionMetaTtlMs,
       'ttlCleanupIntervalMs': ttlCleanupIntervalMs,
+      if (kvCapacityConfig != null)
+        'kvCapacityConfig': kvCapacityConfig!.toJson(),
+      if (globalKvCapacityConfig != null)
+        'globalKvCapacityConfig': globalKvCapacityConfig!.toJson(),
       'defaultQueryLimit': defaultQueryLimit,
       'maxQueryOffset': maxQueryOffset,
       'yieldDurationMs': yieldDurationMs,
@@ -724,6 +758,8 @@ class DataStoreConfig {
     int? transactionCleanupIntervalMs,
     int? transactionMetaTtlMs,
     int? ttlCleanupIntervalMs,
+    KvCapacityConfig? kvCapacityConfig,
+    KvCapacityConfig? globalKvCapacityConfig,
     int? defaultQueryLimit,
     int? maxQueryOffset,
     int? yieldDurationMs,
@@ -771,6 +807,9 @@ class DataStoreConfig {
       transactionMetaTtlMs: transactionMetaTtlMs ?? this.transactionMetaTtlMs,
       ttlCleanupIntervalMs:
           max(ttlCleanupIntervalMs ?? this.ttlCleanupIntervalMs, 60000),
+      kvCapacityConfig: kvCapacityConfig ?? this.kvCapacityConfig,
+      globalKvCapacityConfig:
+          globalKvCapacityConfig ?? this.globalKvCapacityConfig,
       defaultQueryLimit: defaultQueryLimit ?? this.defaultQueryLimit,
       maxQueryOffset: maxQueryOffset ?? this.maxQueryOffset,
       yieldDurationMs: yieldDurationMs ?? this.yieldDurationMs,

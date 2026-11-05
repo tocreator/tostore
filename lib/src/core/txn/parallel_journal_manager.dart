@@ -1580,6 +1580,8 @@ class ParallelJournalManager {
                     flushedWalByPk: flushedWalByPk,
                     indexPathsByPk: indexPathsByPk,
                   );
+                  // Capacity: edge-wake after durable flush (not a resident poller).
+                  _dataStore.maybeWakeCapacityEviction(tableContext);
                 }
 
                 // Release unique key reservations for large update operations.

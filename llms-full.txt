@@ -30,7 +30,7 @@ ToStore is a distributed data engine for applications, servers, and Agents.
 
 - Online schema evolution (declarative schemas / runtime schema updates) without downtime or manual migration scripts
 - Hybrid retrieval on one query chain: lexical text (`matchText`), dense vector ANN (`matchVector`), neural sparse (`matchSparse`), plus structured predicates; multi-way fusion scores on query results
-- ACID transactions, JOINs, cascading foreign keys, table-level TTL, aggregations, atomic field expressions
+- ACID transactions, JOINs, cascading foreign keys, table-level TTL, FIFO/LRU capacity eviction, aggregations, atomic field expressions
 - Multi-space isolation (optional global tables/KV), encryption, crash self-healing, structured status codes for automated handling
 
 
@@ -105,18 +105,21 @@ RFC 2119 keywords apply.
 
 12. `ttl` and `expiresAt` MUST NOT be passed together on the same set operation.
 13. Cross-space shared keys MUST set `isGlobal: true`.
+13a. KV capacity eviction is configured only via `DataStoreConfig.kvCapacityConfig` / `globalKvCapacityConfig` — MUST NOT invent per-`set` capacity parameters.
 
 ## Schema and keys
 
 14. Schema evolution SHOULD use declarative schemas and/or `updateSchema` chain; avoid inventing manual file migrations.
 15. `getVersion` / `setVersion` are user bookkeeping only; they MUST NOT be treated as engine migration drivers.
 16. `EncryptionConfig.encryptionKey` rotation uses `rotateEncryptionKey`. Data re-encryption uses `encodingKey` change (engine migrates). Agents MUST NOT confuse the two.
+16a. Table `ttlConfig` and `capacityConfig` MAY be combined. Agents MUST NOT confuse `cacheMemoryBudgetMB` (memory cache size) with `CapacityConfig` (max record/keys).
 
 ## Performance (application code)
 
 17. Agents SHOULD prefer indexed predicates, cursors/pagination, and `batch*` APIs for large writes.
 18. Agents SHOULD avoid loading unbounded result sets; use `limit` / `cursor` / streaming.
 19. For UI, prefer `watch` / `watchValue` over polling.
+
 
 ## Documentation discipline
 
@@ -293,6 +296,7 @@ const TableSchema({
   bool isGlobal = false,
   String? tableId,
   TableTtlConfig? ttlConfig,
+  TableCapacityConfig? capacityConfig,
 });
 ```
 
@@ -306,6 +310,7 @@ const TableSchema({
 | `foreignKeys` | Optional; see Spaces / TTL / FK module |
 | `isGlobal` | `true` = shared across spaces; data not space-isolated |
 | `ttlConfig` | `null` = TTL off; see TTL module |
+| `capacityConfig` | `null` = capacity eviction off; see Capacity module; MAY combine with `ttlConfig` |
 
 **MUST NOT** use the reserved prefix `_system_` for business table/field names (engine-reserved). Business may use `system_` without the leading underscore.
 
@@ -447,6 +452,7 @@ SchemaBuilder updateSchema(String tableName);
 | `setPrimaryKeyConfig(PrimaryKeyConfig)` | Change PK config |
 | `promoteFieldToPrimaryKey({sourceFieldName, targetPrimaryKeyName?})` | Promote unique non-null field to PK |
 | `setTtlConfig` / `disableTtl` | Table TTL |
+| `setCapacityConfig` / `disableCapacity` | Table capacity eviction (FIFO/LRU) |
 | `addForeignKey` / `removeForeignKey` / `modifyForeignKey` | FKs |
 | `allowAfterDataMigration()` | Allow ops that require post-data migration |
 
@@ -1010,6 +1016,7 @@ Stream<Map<String, dynamic>> watchValues(Iterable<String> keys, {
 - `durability`: optional recovery guarantee level (`standard` crash-safe before ack, `durable` power-loss safe before ack, `async` immediate response with brief few-ms window on small writes).
 - Missing / expired → `getValue` returns `null`.
 - `watchValue` / `watchValues` emit current snapshot on subscribe.
+- Capacity limits for KV are instance-level: set `DataStoreConfig.kvCapacityConfig` / `globalKvCapacityConfig` (not per-`set` args). Do not set `sourceField` on those configs.
 
 ## Preferred namespace: `db.kv`
 
@@ -1310,9 +1317,10 @@ Larger depth typically raises both recall and latency. Prefer the anchors above;
 2. Prefer chain `matchText` / `matchSparse` / `matchVector` + `limit` over inventing custom retrieval APIs.
 3. Read scores from `retrieval`, not by guessing record fields.
 
+
 ## Text and neural sparse retrieval
 
-Text and sparse channels share one Top-K kernel. `TextMatchOperator.or` ranks the union of terms. `TextMatchOperator.and` keeps a document only when every positive-weight term has impact, then ranks with the same additive integer score. A missing term yields an empty text channel. Phrase matching is not supported. Sparse retrieval stays disjunctive.
+Text and sparse channels share one Top-K ranking path. `TextMatchOperator.or` keeps documents that match any query term. `TextMatchOperator.and` keeps documents that match every positive-weight term, then ranks by relevance. If a required term is missing from the index, the text channel is empty. Phrase matching is not supported. Sparse retrieval stays disjunctive (OR).
 
 | Channel | Chain | Index | Field type | Query value |
 | :--- | :--- | :--- | :--- | :--- |
@@ -1363,9 +1371,7 @@ final results = await db.query('documents')
   .limit(10);
 ```
 
-`TextQuery.text` is segmented by the engine. `TextQuery.terms(List<String>)` is pre-tokenized with weight 1 per term; repeated strings add weight. `TextQuery.termsWeighted(List<TextTerm>)` is pre-tokenized with an explicit weight on each `TextTerm` (`term`, `weight`); weights of the same term are summed, and non-positive weights are dropped. Pre-tokenized terms are matched exactly: the engine does not segment them, expand CJK bigrams, or change case. Built-in indexing lowercases Latin tokens, so a pre-tokenized query must use the same term strings that were indexed.
-
-For `TextQuery.text`, a CJK single-character match is treated as a weak signal (typically `score` below ~0.40), while CJK bigrams and Latin words keep the strong exact-term band (~0.71 for one strong hit). Longer Chinese `OR` queries therefore lean on bigrams rather than stacking many unigrams. `TextQuery.terms` / `termsWeighted` do not apply that automatic softening — caller weights are used as given. `matchText` / `matchSparse` / `matchVector` on the same chain is multi-way fusion (default `weightedScore`). Opt into rank-only fusion with `.fusionMethod(RetrievalFusionMethod.rrf)`. A structured `where*` on that chain is a filter over the recalled records. Text and sparse inserts are searchable before flush. `limit` is topK. Scores are in `retrieval.entries`, aligned with `data` (see scoring tables above).
+`TextQuery.text(String)` — raw query text; the engine tokenizes it. `TextQuery.terms(List<String>)` — caller-supplied terms, each weight 1; repeated strings add weight. `TextQuery.termsWeighted(List<TextTerm>)` — caller-supplied terms with explicit `weight` on each `TextTerm`; weights of the same term are summed; non-positive weights are dropped. Pre-tokenized Latin terms must match the indexed form (built-in indexing lowercases Latin, so `Kernel` does not match `kernel`). `matchText` / `matchSparse` / `matchVector` on the same chain is multi-way fusion (default `weightedScore`). Opt into rank-only fusion with `.fusionMethod(RetrievalFusionMethod.rrf)`. A structured `where*` on that chain is a filter over the recalled records. Text and sparse inserts are searchable before flush. `limit` is topK. Scores are in `retrieval.entries`, aligned with `data` (see scoring tables above).
 
 ---
 
@@ -1373,7 +1379,7 @@ For `TextQuery.text`, a CJK single-character match is treated as a weak signal (
 
 ---
 id: tostore-ai-09-space-ttl-fk
-title: Spaces, Table TTL, and Foreign Keys
+title: Spaces, Table TTL, Capacity Eviction, and Foreign Keys
 audience: coding-agent
 source_apis:
   - ToStore.switchSpace
@@ -1381,13 +1387,16 @@ source_apis:
   - ToStore.deleteSpace
   - ToStore.getSpaceInfo
   - TableTtlConfig
+  - CapacityConfig
+  - CapacityEvictionPolicy
+  - TableCapacityConfig
   - ForeignKeySchema
   - ForeignKeyCascadeAction
 version: 3.x
 status: complete
 ---
 
-# Spaces, Table TTL, and Foreign Keys
+# Spaces, Table TTL, Capacity Eviction, and Foreign Keys
 
 ## Spaces
 
@@ -1426,11 +1435,19 @@ Background cleanup of expired records (logs, events, telemetry).
 ```dart
 TableTtlConfig({
   required int ttlMs, // MUST be > 0
-  String? sourceField, // null → internal _system_ingest_ts_ms
+  String? sourceField,
 });
 ```
 
-If `sourceField` is set, that field MUST be:
+### `sourceField` rules
+
+| Situation | `sourceField` |
+| :--- | :--- |
+| **New table** with TTL | **MUST** set |
+| **Existing table** enabling TTL for the first time | **MUST** set |
+| **Online grandfather**: table already persisted TTL with omitted `sourceField` (virtual `_system_ingest_ts_ms` index) | MAY keep omitting (no forced multi-million-row rebuild) |
+
+When set, `sourceField` MUST be:
 
 1. `DataType.datetime`
 2. `nullable: false`
@@ -1439,13 +1456,58 @@ If `sourceField` is set, that field MUST be:
 ```dart
 ttlConfig: TableTtlConfig(
   ttlMs: 7 * 24 * 60 * 60 * 1000,
-  // sourceField: 'created_at', // optional
+  sourceField: 'created_at', // required for new tables / newly enabling TTL
 ),
 ```
+
+Prefer an explicit field so deletes clear the TTL index via normal encode/decode. The virtual ingest index is INSERT-only and relies on search-result tombstones — kept only for online compatibility.
 
 Runtime: `updateSchema(t).setTtlConfig(...)` / `.disableTtl()`.
 
 Polling interval: `DataStoreConfig.ttlCleanupIntervalMs` (min 60000 ms).
+
+## Table-level capacity eviction (FIFO / LRU)
+
+Limit how many records (or how much storage) a table may keep. Independent of TTL: time expiry and capacity eviction MAY be enabled together.
+
+```dart
+CapacityConfig({
+  int? maxEntries, // max record count
+  int? maxBytes,   // approximate max storage size (bytes)
+  CapacityEvictionPolicy policy = CapacityEvictionPolicy.fifo,
+  double evictRatio = 0.30, // fraction to free when over limit (0.05–0.50)
+  String? sourceField, // see policy rules below
+});
+typedef TableCapacityConfig = CapacityConfig;
+```
+
+MUST set at least one of `maxEntries` / `maxBytes` to a value `> 0`.
+
+| Policy | Behavior |
+| :--- | :--- |
+| `fifo` (primary key type ≠ `none`) | Evict by primary key ascending. MUST NOT set `sourceField`. |
+| `fifo` + `PrimaryKeyType.none` | MUST set `sourceField`: insert-time `DataType.datetime`, non-null, `DefaultValueType.currentTimestamp`. Do not update that field after insert. |
+| `lru` | MUST set `sourceField` (same datetime rules). Update it when a record should count as recently used. |
+
+`sourceField` is required **only** for `lru`, or for `fifo` when the table uses `PrimaryKeyType.none`.
+
+Capacity does **not** use the virtual `_system_ingest_ts_ms` index (TTL-only grandfather path when `sourceField` was historically omitted). Deletes go through the normal write path so index entries are removed from record values.
+
+When over the limit, background cleanup frees about `evictRatio` of capacity (default 30%) across cycles so writes stay smooth.
+
+```dart
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  policy: CapacityEvictionPolicy.lru,
+  sourceField: 'last_active_at',
+),
+```
+
+Runtime: `updateSchema(t).setCapacityConfig(...)` / `.disableCapacity()`.
+
+KV capacity (`DataStoreConfig.kvCapacityConfig` / `globalKvCapacityConfig`) uses the same `CapacityConfig` shape but MUST NOT set `sourceField` — the engine manages KV ordering.
+
+Do not confuse with `cacheMemoryBudgetMB` — that tunes engine memory cache, not table record limits.
 
 ## Foreign keys
 
@@ -1742,6 +1804,8 @@ factory DataStoreConfig({
   Duration transactionTimeout = const Duration(minutes: 5),
   // ... cleanup TTLs ...
   int? ttlCleanupIntervalMs, // effective min 60000
+  KvCapacityConfig? kvCapacityConfig,        // space KV capacity eviction
+  KvCapacityConfig? globalKvCapacityConfig,  // global KV capacity eviction
   int? defaultQueryLimit,    // default 1000
   int? maxQueryOffset,       // default 10000
   int? yieldDurationMs,      // client ~8ms, server ~50ms
@@ -1760,12 +1824,28 @@ factory DataStoreConfig({
 | `defaultRecoveryDurability` | `standard` | Recovery-log durability before write ack: `async` (enqueue; brief crash loss until background drain to OS), `standard` (OS page cache, crash-safe), `durable` (physical fsync, power-safe). Override per CRUD/batch via `durability:` / `.durability(...)` |
 | `persistRecoveryOnCommit` | true | Strong durability; false = faster, tiny crash risk |
 | `ttlCleanupIntervalMs` | ≥60000 | Background TTL scan |
-| `cacheMemoryBudgetMB` | auto | LRU budget |
+| `kvCapacityConfig` | null | Space KV FIFO/LRU capacity; do not set `sourceField` |
+| `globalKvCapacityConfig` | null | Global KV capacity (same shape; no `sourceField`) |
+| `cacheMemoryBudgetMB` | auto | Memory cache budget (unrelated to table/KV `CapacityConfig`) |
 | `vectorCacheBudgetRatio` | 0.50 (adaptive) | Proportion of cache budget dedicated to vector index cache ceiling |
 | `maxConcurrency` | auto | Vector/crypto workers |
 | `isServerEnvironment` | auto-detected | Changes partition/concurrency defaults |
 
 `PersistenceMode.memory` is forced by `ToStore.memory()`.
+
+Memory cache example:
+
+```dart
+await ToStore.memory(
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+      evictRatio: 0.30,
+    ),
+  ),
+);
+```
 
 ## Encryption (at rest)
 
@@ -2070,7 +2150,7 @@ import 'package:tostore/tostore.dart';
 | `UpdateBuilder` | `update` | set*, compute, allow*, inherits ChainBuilder where* |
 | `DeleteBuilder` | `delete` | allowDeleteAll, allowLargeScaleOperation, where* |
 | `StreamQueryBuilder` | `streamQuery` | where*, select, stream/listen |
-| `SchemaBuilder` | `updateSchema` | add/remove/rename/modify field/index/FK/TTL/PK |
+| `SchemaBuilder` | `updateSchema` | add/remove/rename/modify field/index/FK/TTL/capacity/PK |
 | `KvQueryBuilder` | `kv.query` | prefix, orderBy*, limit, offset, cursor, peek |
 
 ### ChainBuilder predicate surface
@@ -2090,7 +2170,7 @@ Agents MAY import these via `package:tostore/tostore.dart`:
 | `status_provider.dart` | `DbStatus` |
 | `backup_scope.dart` | `BackupScope` |
 | `config_info.dart` | `ConfigInfo` |
-| `data_store_config.dart` | `DataStoreConfig`, `PersistenceMode`, `DistributedNodeConfig`, `TransactionIsolationLevel`, `RecoveryDurability`, `EncryptionType`, `EncryptionScope`, `EncryptionConfig` |
+| `data_store_config.dart` | `DataStoreConfig`, `PersistenceMode`, `DistributedNodeConfig`, `TransactionIsolationLevel`, `RecoveryDurability`, `EncryptionType`, `EncryptionScope`, `EncryptionConfig` (also `kvCapacityConfig` / `globalKvCapacityConfig`) |
 | `db_exception.dart` | `DbException`, `DbClosedException` |
 | `db_result.dart` | `DbResult` |
 | `db_startup_stage.dart` | `DbStartupStage`, `StartupProgressCallback` |
@@ -2106,7 +2186,7 @@ Agents MAY import these via `package:tostore/tostore.dart`:
 | `schema_update_result.dart` | `SchemaUpdateResult` |
 | `space_info.dart` | `SpaceInfo` |
 | `table_info.dart` | `TableInfo` |
-| `table_schema.dart` | `TableSchema`, `FieldSchema`, `IndexSchema`, `TableTtlConfig`, `DataType`, `IndexType`, `DefaultValueType`, `PrimaryKeyType`, `SequentialIdConfig`, `PrimaryKeyConfig`, `VectorData`, `VectorFieldConfig`, `VectorIndexType`, `VectorDistanceMetric`, `VectorIndexConfig`, `ForeignKeyCascadeAction`, `ForeignKeySchema`, … |
+| `table_schema.dart` | `TableSchema`, `FieldSchema`, `IndexSchema`, `TableTtlConfig`, `CapacityConfig`, `CapacityEvictionPolicy`, `TableCapacityConfig`, `KvCapacityConfig`, `DataType`, `IndexType`, `DefaultValueType`, `PrimaryKeyType`, `SequentialIdConfig`, `PrimaryKeyConfig`, `VectorData`, `VectorFieldConfig`, `VectorIndexType`, `VectorDistanceMetric`, `VectorIndexConfig`, `ForeignKeyCascadeAction`, `ForeignKeySchema`, … |
 | `text_query.dart` | `TextQuery`, `TextTerm`, `TextMatchOperator` |
 | `sparse_vector_data.dart` | `SparseVectorData` |
 | `transaction_result.dart` | `TransactionResult`, `TransactionStatus`, `TransactionErrorType`, `TransactionError` |
@@ -2168,6 +2248,12 @@ Common mistakes when generating ToStore client code. Prefer the ✅ form.
 
 - ❌ Expecting space-local key to be visible after `switchSpace` without `isGlobal: true`
 - ✅ Use `isGlobal: true` for cross-space values (e.g. login state)
+
+- ❌ Inventing per-`kv.set` capacity / maxEntries parameters
+- ✅ Configure `DataStoreConfig.kvCapacityConfig` / `globalKvCapacityConfig`
+
+- ❌ Confusing `cacheMemoryBudgetMB` with table/KV `CapacityConfig`
+- ✅ `cacheMemoryBudgetMB` = memory cache size; `CapacityConfig` = max records/keys to keep
 
 ## Queries
 

@@ -5960,7 +5960,28 @@ class DatabaseTester {
         );
       }
 
-      // Pre-tokenized CJK: no auto-soften — full weight, df=1 「漂」.
+      // Pre-tokenized long CJK expands to bigrams (index max=2).
+      final longTerms = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.terms(['数据库']))
+          .limit(5);
+      ok &= _expect(
+        'pre-tokenized CJK len>=3 expands and hits continuous doc',
+        longTerms.data.any((r) => r['id']?.toString() == pkCjk),
+        true,
+      );
+      if (longTerms.retrieval != null &&
+          longTerms.retrieval!.entries.isNotEmpty &&
+          uniScore != null) {
+        ok &= _expect(
+          'pre-tokenized long CJK score > softened unigram',
+          longTerms.retrieval!.entries.first.score > uniScore,
+          true,
+        );
+      }
+
+      // Pre-tokenized short CJK: no auto-soften — full weight, df=1 「漂」.
       final uniTerms = await db
           .query(table.name)
           .select(['id'])
@@ -5995,6 +6016,70 @@ class DatabaseTester {
           false,
         );
       }
+
+      // Group AND: long pre-token requires all expanded bigrams; OR across terms.
+      final sky = await db.insert(table.name, {
+        'headline': 'CJK sky phrase',
+        'content': '远处蓝天白云飘过',
+        'category': 'cjk',
+        'year': 2024,
+      });
+      final skyPartial = await db.insert(table.name, {
+        'headline': 'CJK sky partial',
+        'content': '只有蓝天可见',
+        'category': 'cjk',
+        'year': 2024,
+      });
+      final rainbow = await db.insert(table.name, {
+        'headline': 'CJK rainbow',
+        'content': '雨后出现彩虹',
+        'category': 'cjk',
+        'year': 2024,
+      });
+      ok &= _expect('sky phrase insert', !sky.hasErrors, true);
+      ok &= _expect('sky partial insert', !skyPartial.hasErrors, true);
+      ok &= _expect('rainbow insert', !rainbow.hasErrors, true);
+      await db.flush();
+      final pkSky = sky.firstPrimaryKey!;
+      final pkSkyPartial = skyPartial.firstPrimaryKey!;
+      final pkRainbow = rainbow.firstPrimaryKey!;
+
+      final skyOnly = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.terms(['蓝天白云']))
+          .limit(10);
+      ok &= _expect(
+        'pre-token phrase hits continuous sky doc',
+        skyOnly.data.any((r) => r['id']?.toString() == pkSky),
+        true,
+      );
+      ok &= _expect(
+        'pre-token phrase misses partial sky bigram-only doc',
+        skyOnly.data.any((r) => r['id']?.toString() == pkSkyPartial),
+        false,
+      );
+
+      final skyOrRainbow = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.terms(['蓝天白云', '彩虹']))
+          .limit(10);
+      ok &= _expect(
+        'pre-token OR still hits rainbow singleton',
+        skyOrRainbow.data.any((r) => r['id']?.toString() == pkRainbow),
+        true,
+      );
+      ok &= _expect(
+        'pre-token OR hits full sky phrase',
+        skyOrRainbow.data.any((r) => r['id']?.toString() == pkSky),
+        true,
+      );
+      ok &= _expect(
+        'pre-token OR still misses partial sky',
+        skyOrRainbow.data.any((r) => r['id']?.toString() == pkSkyPartial),
+        false,
+      );
 
       // Structured where + matchText.
       final filtered = await db

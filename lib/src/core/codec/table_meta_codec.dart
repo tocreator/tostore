@@ -23,6 +23,7 @@ abstract final class TableSchemaFieldId {
   static const int isSystemTable = 10;
   static const int ttlConfig = 11;
   static const int autoIndexes = 12;
+  static const int capacityConfig = 13;
 }
 
 abstract final class FieldSchemaFieldId {
@@ -80,6 +81,14 @@ abstract final class ForeignKeySchemaFieldId {
 abstract final class TableTtlConfigFieldId {
   static const int ttlMs = 1;
   static const int sourceField = 2;
+}
+
+abstract final class CapacityConfigFieldId {
+  static const int maxEntries = 1;
+  static const int maxBytes = 2;
+  static const int policy = 3;
+  static const int evictRatio = 4;
+  static const int sourceField = 5;
 }
 
 abstract final class VectorFieldConfigFieldId {
@@ -187,6 +196,11 @@ final class TableMetaCodec {
         _writeTtlConfig(sw, schema.ttlConfig!);
       });
     }
+    if (schema.capacityConfig != null) {
+      w.writeMessage(TableSchemaFieldId.capacityConfig, (sw) {
+        _writeCapacityConfig(sw, schema.capacityConfig!);
+      });
+    }
     if (schema.autoIndexes != null) {
       for (final i in schema.autoIndexes!) {
         w.writeMessage(TableSchemaFieldId.autoIndexes, (sw) {
@@ -208,6 +222,7 @@ final class TableMetaCodec {
     String? schemaVersion;
     bool isSystemTable = false;
     TableTtlConfig? ttlConfig;
+    TableCapacityConfig? capacityConfig;
     List<IndexSchema>? autoIndexes;
 
     while (!r.isEOF) {
@@ -256,6 +271,11 @@ final class TableMetaCodec {
             ttlConfig = _readTtlConfig(sr);
           });
           break;
+        case TableSchemaFieldId.capacityConfig:
+          r.readMessage((sr, _) {
+            capacityConfig = _readCapacityConfig(sr);
+          });
+          break;
         case TableSchemaFieldId.autoIndexes:
           autoIndexes ??= <IndexSchema>[];
           r.readMessage((sr, _) {
@@ -276,6 +296,7 @@ final class TableMetaCodec {
       isGlobal: isGlobal,
       tableId: tableId,
       ttlConfig: ttlConfig,
+      capacityConfig: capacityConfig,
     ).copyWith(
       tableUid: tableUid,
       schemaVersion: schemaVersion,
@@ -737,6 +758,66 @@ final class TableMetaCodec {
       }
     }
     return TableTtlConfig(ttlMs: ttlMs, sourceField: sourceField);
+  }
+
+  static void _writeCapacityConfig(BinaryWriter w, CapacityConfig c) {
+    if (c.maxEntries != null) {
+      w.writeFieldTag(CapacityConfigFieldId.maxEntries, WireType.varint);
+      w.writeVarint(c.maxEntries!);
+    }
+    if (c.maxBytes != null) {
+      w.writeFieldTag(CapacityConfigFieldId.maxBytes, WireType.varint);
+      w.writeVarint(c.maxBytes!);
+    }
+    w.writeFieldTag(CapacityConfigFieldId.policy, WireType.varint);
+    w.writeVarint(c.policy.index);
+    w.writeFieldTag(CapacityConfigFieldId.evictRatio, WireType.fixed64);
+    w.writeDouble(c.evictRatio);
+    if (c.sourceField != null && c.sourceField!.isNotEmpty) {
+      w.writeFieldTag(
+          CapacityConfigFieldId.sourceField, WireType.lengthDelimited);
+      w.writeString(c.sourceField!);
+    }
+  }
+
+  static CapacityConfig _readCapacityConfig(BinaryReader r) {
+    int? maxEntries;
+    int? maxBytes;
+    CapacityEvictionPolicy policy = CapacityEvictionPolicy.fifo;
+    double evictRatio = CapacityConfig.defaultEvictRatio;
+    String? sourceField;
+    while (!r.isEOF) {
+      final (fid, wireType) = r.readFieldTag();
+      switch (fid) {
+        case CapacityConfigFieldId.maxEntries:
+          maxEntries = r.readVarint();
+          break;
+        case CapacityConfigFieldId.maxBytes:
+          maxBytes = r.readVarint();
+          break;
+        case CapacityConfigFieldId.policy:
+          final idx = r.readVarint();
+          policy = (idx >= 0 && idx < CapacityEvictionPolicy.values.length)
+              ? CapacityEvictionPolicy.values[idx]
+              : CapacityEvictionPolicy.fifo;
+          break;
+        case CapacityConfigFieldId.evictRatio:
+          evictRatio = r.readDouble();
+          break;
+        case CapacityConfigFieldId.sourceField:
+          sourceField = r.readString();
+          break;
+        default:
+          r.skipField(wireType);
+      }
+    }
+    return CapacityConfig(
+      maxEntries: maxEntries,
+      maxBytes: maxBytes,
+      policy: policy,
+      evictRatio: evictRatio,
+      sourceField: sourceField,
+    );
   }
 
   static void _writeVectorFieldConfig(BinaryWriter w, VectorFieldConfig c) {

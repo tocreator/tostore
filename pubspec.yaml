@@ -1,5 +1,5 @@
 name: tostore
-description: Fast distributed AI vector database and persistent local storage engine. High-performance key-value store supporting SQL, NoSQL, offline cache and encrypted data.
+description: "Data engine: AI vector & SQL/NoSQL database. Key-value/KV, embeddings, BM25 full-text, hybrid & semantic search for RAG/LLM. Local storage, TTL/LRU cache, offline encrypted."
 version: 3.6.1
 homepage: https://github.com/tocreator/tostore
 repository: https://github.com/tocreator/tostore
@@ -8,9 +8,9 @@ documentation: https://github.com/tocreator/tostore/wiki
 topics:
   - database
   - storage
-  - vector-database
-  - sql
-  - key-value
+  - cache
+  - vector-search
+  - full-text-search
 
 environment:
   sdk: ^3.5.4

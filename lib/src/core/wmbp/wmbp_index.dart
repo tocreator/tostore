@@ -628,18 +628,23 @@ class WmbpCorpus implements WmbpPostingSource {
     final weights = <int, int>{};
     var missing = 0;
     if (query.weightedTerms != null) {
-      for (final entry in query.weightedTerms!.entries) {
-        final int milli = WmbpScore.weightMilli(entry.value);
-        if (milli <= 0) continue;
-        final String term = entry.key;
-        if (_missingTerms.contains(term)) {
-          missing++;
-          continue;
-        }
-        final int? id = _resolvedTermIdSync(term);
-        if (id == null) return null;
-        weights[id] = milli;
+      final slots = _preTokenizedSlots(query.weightedTerms!);
+      // Sync path: any cold name miss aborts (return null).
+      for (final slot in slots) {
+        if (_missingTerms.contains(slot.term)) continue;
+        if (_resolvedTermIdSync(slot.term) == null) return null;
       }
+      final resolved = _resolvePreTokenizedSlots(
+        slots,
+        _resolvedTermIdSync,
+        isKnownMissing: _missingTerms.contains,
+      );
+      final compiled = (
+        terms: resolved.terms,
+        missing: resolved.missingExtra,
+      );
+      _storeQueryPlan(query, compiled);
+      return compiled;
     } else {
       _countsBuffer.clear();
       WmbpTokenizer.tokenizeCounts(query.text ?? '', _countsBuffer);
@@ -807,21 +812,18 @@ class WmbpCorpus implements WmbpPostingSource {
     final weights = <int, int>{};
     var missing = 0;
     if (query.weightedTerms != null) {
-      for (final entry in query.weightedTerms!.entries) {
-        final int milli = WmbpScore.weightMilli(entry.value);
-        if (milli <= 0) continue;
-        final int? id = _resolvedTermIdSync(entry.key);
-        if (id == null) {
-          missing++;
-          continue;
-        }
-        weights[id] = milli;
-      }
+      final resolved = _resolvePreTokenizedSlots(
+        _preTokenizedSlots(query.weightedTerms!),
+        _resolvedTermIdSync,
+        isKnownMissing: (_) => false,
+      );
+      return (
+        terms: resolved.terms,
+        missing: missing + resolved.missingExtra,
+      );
     } else {
       final counts = <String, int>{};
-      for (final token in WmbpTokenizer.tokenize(query.text ?? '')) {
-        counts[token] = (counts[token] ?? 0) + 1;
-      }
+      WmbpTokenizer.tokenizeCounts(query.text ?? '', counts);
       final bool hasCjkBigram = _countsHaveCjkBigram(counts.keys);
       for (final entry in counts.entries) {
         final int milli = _engineTextTokenMilli(
@@ -857,6 +859,106 @@ class WmbpCorpus implements WmbpPostingSource {
       WmbpScore.weightMilli(tf),
       isCjkUnigram: WmbpTokenizer.isCjkUnigram(term),
       queryHasCjkBigram: hasCjkBigram,
+    );
+  }
+
+  /// Compiles pre-tokenized caller weights into (term, milli, groupId) slots.
+  ///
+  /// Pure CJK runs of length `>= 3` expand to overlapping bigrams only (no
+  /// automatic unigrams). Multiple bigrams from one caller term share a
+  /// positive [groupId] (AND within the group). Short CJK / Latin stay
+  /// ungrouped (`groupId == 0`).
+  static List<({String term, int milli, int groupId})> _preTokenizedSlots(
+    Map<String, double> weightedTerms,
+  ) {
+    final out = <({String term, int milli, int groupId})>[];
+    final local = <String, int>{};
+    var nextGroupId = 1;
+    for (final entry in weightedTerms.entries) {
+      final double weight = entry.value;
+      if (weight <= 0) continue;
+      final String term = entry.key;
+      if (WmbpTokenizer.isLongPureCjk(term)) {
+        local.clear();
+        WmbpTokenizer.addOverlappingCjkBigrams(term, local);
+        if (local.isEmpty) continue;
+        // Build members first, then assign groupId from survivors so a
+        // milli<=0 skip cannot shrink an AND-group unnoticed.
+        final members = <({String term, int milli})>[];
+        for (final gram in local.entries) {
+          final int milli = WmbpScore.weightMilli(weight * gram.value);
+          if (milli <= 0) continue;
+          members.add((term: gram.key, milli: milli));
+        }
+        if (members.isEmpty) continue;
+        final int groupId = members.length >= 2 ? nextGroupId++ : 0;
+        for (final m in members) {
+          out.add((term: m.term, milli: m.milli, groupId: groupId));
+        }
+      } else {
+        final int milli = WmbpScore.weightMilli(weight);
+        if (milli <= 0) continue;
+        out.add((term: term, milli: milli, groupId: 0));
+      }
+    }
+    return out;
+  }
+
+  /// Resolves pre-tokenized slots; incomplete AND-groups (missing members)
+  /// are dropped and counted in [missing] so AND queries can fail closed.
+  static ({List<WmbpQueryTerm> terms, int missingExtra})
+      _resolvePreTokenizedSlots(
+    List<({String term, int milli, int groupId})> slots,
+    int? Function(String term) resolveId, {
+    required bool Function(String term) isKnownMissing,
+  }) {
+    final expected = <int, int>{};
+    for (final slot in slots) {
+      if (slot.groupId != 0) {
+        expected[slot.groupId] = (expected[slot.groupId] ?? 0) + 1;
+      }
+    }
+    final resolved = <WmbpQueryTerm>[];
+    final got = <int, int>{};
+    var missingExtra = 0;
+    for (final slot in slots) {
+      if (isKnownMissing(slot.term)) {
+        missingExtra++;
+        continue;
+      }
+      final int? id = resolveId(slot.term);
+      if (id == null) {
+        missingExtra++;
+        continue;
+      }
+      resolved.add(WmbpQueryTerm(
+        termId: id,
+        weightMilli: slot.milli,
+        groupId: slot.groupId,
+      ));
+      if (slot.groupId != 0) {
+        got[slot.groupId] = (got[slot.groupId] ?? 0) + 1;
+      }
+    }
+    if (expected.isEmpty) {
+      return (terms: resolved, missingExtra: missingExtra);
+    }
+    final dead = <int>{};
+    for (final entry in expected.entries) {
+      if ((got[entry.key] ?? 0) != entry.value) {
+        dead.add(entry.key);
+        missingExtra++;
+      }
+    }
+    if (dead.isEmpty) {
+      return (terms: resolved, missingExtra: missingExtra);
+    }
+    return (
+      terms: [
+        for (final t in resolved)
+          if (t.groupId == 0 || !dead.contains(t.groupId)) t,
+      ],
+      missingExtra: missingExtra,
     );
   }
 
@@ -1171,23 +1273,29 @@ class WmbpCorpus implements WmbpPostingSource {
     final weights = <int, int>{};
     var missing = 0;
     if (query.weightedTerms != null) {
-      for (final entry in query.weightedTerms!.entries) {
-        final int milli = WmbpScore.weightMilli(entry.value);
-        if (milli <= 0) continue;
-        final String term = entry.key;
-        if (_missingTerms.contains(term)) {
-          missing++;
+      final slots = _preTokenizedSlots(query.weightedTerms!);
+      final idByTerm = <String, int?>{};
+      for (final slot in slots) {
+        if (idByTerm.containsKey(slot.term)) continue;
+        if (_missingTerms.contains(slot.term)) {
+          idByTerm[slot.term] = null;
           continue;
         }
         // Always go through [_resolveTerm] so a reminted pending/hot id cannot
         // hide the durable posting chain after a cold name-cache miss.
-        final int? id = await _resolveTerm(term, assign: false);
-        if (id == null) {
-          missing++;
-          continue;
-        }
-        weights[id] = milli;
+        idByTerm[slot.term] = await _resolveTerm(slot.term, assign: false);
       }
+      final resolved = _resolvePreTokenizedSlots(
+        slots,
+        (term) => idByTerm[term],
+        isKnownMissing: _missingTerms.contains,
+      );
+      final compiled = (
+        terms: resolved.terms,
+        missing: missing + resolved.missingExtra,
+      );
+      _storeQueryPlan(query, compiled);
+      return compiled;
     } else {
       _countsBuffer.clear();
       WmbpTokenizer.tokenizeCounts(query.text ?? '', _countsBuffer);

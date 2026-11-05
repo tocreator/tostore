@@ -509,6 +509,12 @@ class QueryExecutor {
     return result.count ?? result.records.length;
   }
 
+  /// Whether [cursor] is a keyset token for backward (prev) pagination.
+  bool isBackwardCursorToken(String? cursor) {
+    if (cursor == null || cursor.isEmpty) return false;
+    return _QueryCursorToken.tryDecode(cursor)?.isBackward == true;
+  }
+
   /// - Not supported:
   ///   - UNION/OR plans
   ///   - JOINs (cursor semantics become ambiguous due to row multiplication)
@@ -1733,6 +1739,10 @@ class QueryExecutor {
         results = results.reversed.toList();
         // If we came from a cursor, we know there's record forward.
         hasMore = hasToken || (effectiveOffset > 0);
+        if (results.isEmpty) {
+          hasPrev = false;
+          hasMore = false;
+        }
       } else {
         // Forward scan: was there more "below"?
         if (effectiveLimit != null) {

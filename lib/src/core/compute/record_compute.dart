@@ -313,6 +313,28 @@ String? validateRecordIdentifierPure({
       'unique index: ${uniqueIndexes.map((i) => i.fields.join(",")).join(" or ")}';
 }
 
+/// For table [CapacityEvictionPolicy.lru], bump [CapacityConfig.sourceField] on
+/// update when the caller omitted it (same idea as KV `updated_at` on set).
+///
+/// FIFO capacity must not touch [sourceField] (insert-time order). Callers that
+/// already set the field keep their value.
+void applyCapacityLruTouchOnUpdate(
+  TableSchema schema,
+  Map<String, dynamic> updatePayload, {
+  String? precomputedNowIso,
+  DateTime? now,
+}) {
+  final capacity = schema.capacityConfig;
+  if (capacity == null || capacity.policy != CapacityEvictionPolicy.lru) {
+    return;
+  }
+  final src = capacity.sourceField;
+  if (src == null || src.isEmpty) return;
+  if (updatePayload.containsKey(src)) return;
+  updatePayload[src] =
+      precomputedNowIso ?? (now ?? DateTime.now()).toIso8601String();
+}
+
 /// Pure update-field validation + conversion path that is safe to run in an isolate.
 ///
 /// Primary key, when present, is validated/converted with the same rules as insert
@@ -322,6 +344,9 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
   required TableName tableName,
   Map<String, FieldSchema>? fieldMap,
   bool ignoreUnknownFields = true,
+
+  /// Shared batch timestamp for LRU sourceField auto-touch.
+  String? precomputedNowIso,
 }) {
   try {
     final primaryKey = schema.primaryKey;
@@ -425,6 +450,12 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
         result[fieldName] = converted;
       }
     }
+
+    applyCapacityLruTouchOnUpdate(
+      schema,
+      result,
+      precomputedNowIso: precomputedNowIso,
+    );
 
     return result;
   } on DbException {

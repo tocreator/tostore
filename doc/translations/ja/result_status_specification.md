@@ -158,7 +158,7 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
 
 ### 4.3 SchemaValidationStatus（テーブルスキーマ検証および不互換移行状態）
 
-- **カテゴリ範囲**: `code`が`[30000, 39999]` — `30000–30013` 静的スキーマ検証、`31001–31006` 移行ガード。
+- **カテゴリ範囲**: `code`が`[30000, 39999]` — `30000–30014` 静的スキーマ検証、`31001–31006` 移行ガード。
 - **専用フィールド定義**:
 
   | フィールド | タイプ | 詳細 |
@@ -185,6 +185,7 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
   | `30011`<br>`devSchemaTableExists` | テーブルは既に存在します | <ul><li>`tableName`: テーブル名</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
   | `30012`<br>`devSchemaFieldExists` | スキーマアップグレード: 既に存在するフィールドを追加しようとしました | <ul><li>`tableName`: テーブル名</li><li>`field`: 競合するフィールド名</li><li>`wrongValue`: `null`</li></ul> |
   | `30013`<br>`devSchemaIndexExists` | スキーマアップグレード: 既に存在するインデックスを追加しようとしました | <ul><li>`tableName`: テーブル名</li><li>`field`: インデックス名</li><li>`wrongValue`: `null`</li></ul> |
+  | `30014`<br>`devInvalidSchemaCapacityConfig` | 容量エビクション設定の検証に失敗 | <ul><li>`tableName`: テーブル名（KV 設定ラベルでは空の場合あり）</li><li>`field`: `null`</li><li>`wrongValue`: 無効な容量設定 Map、例 `{ "maxEntries": null, "maxBytes": null }`</li></ul> |
   | `31001`<br>`devMigrationNotAllowedWithData` | 移行にはデータ変更が必要ですが、明示的に許可されていません | <ul><li>`tableName`: テーブル名</li><li>`field`: `null`</li><li>`wrongValue`: 移行アップグレードの差分マップ</li></ul> |
   | `31002`<br>`devMigrationUnsafeTypeConversion` | 物理移行: フィールドのサポートされていない型変換 | <ul><li>`tableName`: テーブル名</li><li>`field`: フィールド名</li><li>`wrongValue`: 競合する型のマップ、例 `{ "from": "text", "to": "integer" }`</li></ul> |
   | `31003`<br>`devMigrationCannotAddNonNullField` | データがあるテーブルにデフォルト値なしで非NULLフィールドを追加できません | <ul><li>`tableName`: テーブル名</li><li>`field`: 違反しているフィールド名</li><li>`wrongValue`: 移行パラメータ、例 `{ "nullable": false, "defaultValue": null }`</li></ul> |
@@ -515,6 +516,7 @@ try {
 | **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | 開発者エラー | テーブルは既に存在します |
 | **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | 開発者エラー | フィールドは既に存在します |
 | **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | 開発者エラー | インデックスは既に存在します |
+| **30014** | `DEV_INVALID_SCHEMA_CAPACITY_CONFIG` | `ResultType.devInvalidSchemaCapacityConfig` | 開発者エラー | 容量エビクション設定の検証に失敗 |
 | **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | 開発者エラー | 移行にはデータ変更が必要ですが、明示的に許可されていません |
 | **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | 開発者エラー | サポートされていない型変換 |
 | **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | 開発者エラー | データがあるテーブルにデフォルト値なしで非NULLフィールドを追加できません |

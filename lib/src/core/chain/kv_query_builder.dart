@@ -412,6 +412,12 @@ class KvQueryBuilder
         break;
       }
 
+      // Empty keyset-prev (e.g. capacity wiped earlier rows) → live first page.
+      // Covers both QueryResult.prev() and manual .cursor(prevToken).
+      if (data.isEmpty && _db.queryExecutor.isBackwardCursorToken(_cursor)) {
+        return await _clone().cursor(null).offset(0).future;
+      }
+
       Future<QueryResult<Map<String, dynamic>>> nextPageExecutor() async {
         final cloned = _clone();
         if (exec.nextCursor != null) {

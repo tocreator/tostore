@@ -151,6 +151,8 @@ enum ResultType {
       30012, 'DEV_SCHEMA_FIELD_EXISTS', 'Field already exists'),
   devSchemaIndexExists(
       30013, 'DEV_SCHEMA_INDEX_EXISTS', 'Index already exists'),
+  devInvalidSchemaCapacityConfig(30014, 'DEV_INVALID_SCHEMA_CAPACITY_CONFIG',
+      'Capacity eviction configuration validation failed'),
 
   // 310xx — Schema migration guards (runtime / physical)
   devMigrationNotAllowedWithData(31001, 'DEV_MIGRATION_NOT_ALLOWED_WITH_DATA',

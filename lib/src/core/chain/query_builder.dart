@@ -1011,6 +1011,13 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       return queryResult;
     }
 
+    // Manual .cursor(prevToken) and QueryResult.prev() both land here.
+    // Empty keyset-prev (e.g. capacity wiped earlier rows) → live first page.
+    if (result.records.isEmpty &&
+        _db.queryExecutor.isBackwardCursorToken(_cursor)) {
+      return await clone().cursor(null).offset(0).future;
+    }
+
     final queryResult = _buildQueryResult(result);
 
     // Trigger background pre-warm for next page if conditions are met (only on first execution).

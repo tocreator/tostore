@@ -33,16 +33,16 @@
 - [Why ToStore](#why-choose-tostore) | [Key Features](#key-features) | [Installation Guide](#installation) | [KV Mode](#key-value-storage-kv) | [Table Mode](#structured-table-mode) | [Memory Mode](#memory-mode)
 - [Schema Definition](#schema-definition) | [Distributed Architecture](#distributed-architecture) | [Cascading Foreign Keys](#foreign-keys-and-cascading) | [Mobile/Desktop](#mobile-and-desktop-integration) | [Server/Agent](#server-and-agent-integration) | [Primary Key Algorithms](#primary-key-examples)
 - [Advanced Queries (JOIN)](#advanced-queries) | [Aggregation & Statistics](#aggregation-grouping-and-statistics) | [Complex Logic (QueryCondition)](#complex-logic-with-querycondition) | [Reactive Query (watch)](#reactive-query) | [Streaming Query](#streaming-query)
-- [Advanced KV](#advanced-key-value-operations-dbkv) | [Bulk Operations](#bulk-operations) | [Recovery Durability](#recovery-durability-guarantee) | [Hybrid Retrieval (Dense / Sparse / Text)](#vector-text-and-hybrid-retrieval) | [Table-level TTL](#table-level-ttl) | [Efficient Pagination](#query-and-efficient-pagination) | [Memory Probe & Sync Retrieval (peek)](#memory-probe-and-sync-retrieval-peek) | [Query Cache](#manual-query-result-caching) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
+- [Advanced KV](#advanced-key-value-operations-dbkv) | [Bulk Operations](#bulk-operations) | [Recovery Durability](#recovery-durability-guarantee) | [Hybrid Retrieval (Dense / Sparse / Text)](#vector-text-and-hybrid-retrieval) | [Table-level TTL](#table-level-ttl) | [Capacity Eviction](#capacity-eviction) | [Efficient Pagination](#query-and-efficient-pagination) | [Memory Probe & Sync Retrieval (peek)](#memory-probe-and-sync-retrieval-peek) | [Query Cache](#manual-query-result-caching) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
 - [Administration](#administration-and-maintenance) | [Security Configuration](#security-configuration) | [Error Handling](#status-codes-and-error-handling) | [Performance & Diagnostics](#performance-and-experience) | [Contributing](#contributing) | [AI assistants](#for-ai-coding-assistants)
 
 ## Why Choose ToStore?
 
-ToStore is a modern data engine designed for the AGI era and edge intelligence scenarios. Built on a Self-Routing node architecture, it gives nodes high autonomy and elastic horizontal scalability while logically decoupling performance from data scale—edge and cloud single-node deployments are both designed to support 10B+ scale.
+ToStore is a modern data engine designed for the AGI era and edge intelligence scenarios. Built on a Self-Routing node architecture, it gives nodes high autonomy and elastic horizontal scalability while logically decoupling performance from data scale—edge and cloud single-node deployments are designed for trillion-scale structured tables, with vector and sparse-text retrieval also targeting 10B+ scale.
 
 Runtime modeling and non-blocking execution paths keep architecture evolution always online and fully transparent to business operations—declarative schema changes, data encoding key rotation, and massive data refactoring all happen seamlessly online. It supports Agents and automated O&M with runtime table creation, dynamic memory evolution, and their autonomous evolution and continuous iteration—without interrupting service.
 
-It unifies relational structured data, dense vectors, neural sparse vectors, and unstructured text in one engine, with built-in lexical text retrieval, dense vector retrieval, neural sparse retrieval, and multi-way recall fusion. Enterprise-grade capabilities include ACID transactions, complex relational queries (JOINs, cascading foreign keys), table-level TTL, aggregations, as well as distributed primary key algorithms, atomic expressions, encryption, multi-space isolation, and self-healing recovery.
+It unifies relational structured data, dense vectors, neural sparse vectors, and unstructured text in one engine, with built-in lexical text retrieval, dense vector retrieval, neural sparse retrieval, and multi-way recall fusion. Enterprise-grade capabilities include ACID transactions, complex relational queries (JOINs, cascading foreign keys), table-level TTL, capacity eviction (FIFO / LRU), aggregations, as well as distributed primary key algorithms, atomic expressions, encryption, multi-space isolation, and self-healing recovery.
 
 As computing continues shifting toward edge intelligence, devices are no longer just "content displays". They are intelligent nodes responsible for local generation, environmental awareness, real-time decision-making, and coordinated data flows. ToStore gives the edge distributed capabilities strong enough for massive datasets and complex local AI generation. Deep intelligent collaboration between edge and cloud nodes provides a reliable data foundation for multi-modal interaction, long-term memory, RAG and local knowledge bases, hybrid retrieval, spatial modeling, edge autonomous collaboration, and similar scenarios.
 
@@ -57,7 +57,7 @@ As computing continues shifting toward edge intelligence, devices are no longer 
 - 🧠 **Self-Routing Distributed Architecture**
   - Self-routing node architecture that decouples physical addressing from data scale
   - Highly autonomous nodes collaborate to build flexible data topology
-  - Elastic horizontal scaling; single-node deployments designed for 10B+ scale
+  - Elastic horizontal scaling; single-node trillion-scale tables, 10B+ vectors
 
 - 🌐 **Unified Cross-Platform Data Engine**
   - Unified API across mobile, desktop, web, and server environments
@@ -65,7 +65,7 @@ As computing continues shifting toward edge intelligence, devices are no longer 
   - Complete data pipeline from local storage to edge-cloud collaboration
 
 - 🔍 **Structured Queries & Hybrid Retrieval**
-  - Complex predicates, JOINs, aggregations, and table-level TTL
+  - Complex predicates, JOINs, aggregations, table-level TTL, and capacity eviction (FIFO / LRU)
   - Lexical text, dense vector, and neural sparse retrieval on one query chain
   - Multi-way recall fusion ranking, with scores and channel diagnostics on the result
 
@@ -104,7 +104,7 @@ When generating ToStore client code with an AI assistant, give it the single-fil
 > **How should you choose a storage mode?**
 > 1. [**Key-Value Mode (KV)**](#key-value-storage-kv): Best for configuration access, scattered state management, or JSON data storage. It is the fastest way to get started.
 > 2. [**Structured Table Mode**](#structured-table-mode): Best for core business data that needs complex queries, constraint validation, or large-scale data governance. By pushing integrity logic into the engine, you can significantly reduce application-layer development and maintenance costs.
-> 3. [**Memory Mode**](#memory-mode): Best for temporary computation, unit tests, or **ultra-fast global state management**. With global queries and `watch` listeners, you can reshape application interaction without maintaining a pile of global variables.
+> 3. [**Memory Mode**](#memory-mode): Best for temporary computation, unit tests, bounded in-memory caches (TTL and FIFO / LRU capacity eviction), or **ultra-fast global state management**. With global queries and `watch` listeners, you can reshape application interaction without maintaining a pile of global variables.
 
 ### Key-Value Storage (KV)
 This mode is suitable when you do not need predefined structured tables. It is simple, practical, and backed by a high-performance storage engine. **Its efficient indexing architecture keeps query performance highly stable and extremely responsive even on ordinary mobile devices at very large data scales.** Data in different Spaces is naturally isolated, while global sharing is also supported.
@@ -223,6 +223,8 @@ StreamBuilder(
 
 For scenarios such as caching, temporary computation, or workloads that do not need persistence to disk, you can initialize a pure in-memory database via `ToStore.memory()`. In this mode, all data, including schemas, indexes, and key-value pairs, lives entirely in memory for maximum read/write performance.
 
+Memory mode supports multiple eviction strategies: time-based [Table-level TTL](#ttl-config) / KV TTL, and count-or-size [Capacity Eviction](#capacity-eviction) (**FIFO / LRU**). Use either or both so hot data expires on schedule or stays bounded by usage—ideal for session caches, query result pools, and other memory-sensitive paths.
+
 #### 💡 Also Works as Global State Management
 You do not need a pile of global variables or a heavyweight state-management framework. By combining memory mode with `watchValue` or `watch()`, you can achieve fully automatic UI refresh across widgets and pages. It keeps the powerful retrieval abilities of a database while giving you a reactive experience far beyond ordinary variables, making it ideal for login state, live configuration, or global message counters.
 
@@ -230,8 +232,15 @@ You do not need a pile of global variables or a heavyweight state-management fra
 > **Note**: Data created in pure memory mode is completely lost after the app is closed or restarted. Do not use it for core business data.
 
 ```dart
-// Initialize a pure in-memory database
-final memDb = await ToStore.memory();
+// Pure in-memory DB — TTL and/or FIFO/LRU capacity eviction as needed
+final memDb = await ToStore.memory(
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+    ),
+  ),
+);
 
 // Set a global state value (for example: unread message count)
 await memDb.setValue('unread_count', 5, isGlobal: true);
@@ -305,6 +314,7 @@ const userSchema = TableSchema(
   foreignKeys: const [], // Optional foreign-key constraints; see "Foreign Keys & Cascading"
   isGlobal: false, // Whether this is a global table; true means it can be shared across spaces
   ttlConfig: null, // Optional table-level TTL; see "Table-level TTL"
+  capacityConfig: null, // Optional capacity eviction; see "Capacity Eviction"
 );
 
 const appSchemas = [userSchema];
@@ -864,9 +874,9 @@ final ann = await db.vectorSearch(
 **Chained retrieval parameters** (each `match*` / `orMatch*`, plus `limit` on the query chain):
 
 - Text
-  - `TextQuery.text`: tokenized by the engine
-  - `TextQuery.terms` / `termsWeighted`: pre-tokenized; no second pass; Latin terms must match the index side (usually lowercase)
-  - `operator`: `or` (default; union ranking) or `and` (every positive-weight term must hit, then rank)
+  - `TextQuery.text`: raw query text (tokenized by the engine)
+  - `TextQuery.terms` / `termsWeighted`: pre-tokenized; pass your own terms (optional weights); Latin terms must match the index side (usually lowercase)
+  - `operator`: `or` (default; any term) or `and` (every term must match, then rank)
   - Phrase matching is not supported
 - Sparse
   - `SparseVectorData` / `SparseVectorData.fromMap(...)`: sparse query vector
@@ -920,16 +930,75 @@ const TableSchema(
   ],
   ttlConfig: TableTtlConfig(
     ttlMs: 7 * 24 * 60 * 60 * 1000, // Keep for 7 days
-    // When sourceField is omitted, the engine creates the needed index automatically.
-    // Optional custom sourceField requirements:
-    // 1) type must be DataType.datetime
-    // 2) nullable must be false
-    // 3) defaultValueType must be DefaultValueType.currentTimestamp
-    // sourceField: 'created_at',
+    // Required for new tables / newly enabling TTL:
+    // 1) DataType.datetime  2) nullable: false
+    // 3) DefaultValueType.currentTimestamp
+    sourceField: 'created_at',
   ),
 );
 ```
 
+### Capacity Eviction
+
+Limit how many records a table keeps by count and/or approximate size. Independent of TTL—you may enable both. Surplus rows are cleaned up automatically in the background.
+
+```dart
+// FIFO (default): evict oldest by primary key. Do not set sourceField
+// (unless primary key type is PrimaryKeyType.none).
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  // maxBytes: 50 * 1024 * 1024, // optional size limit
+  policy: CapacityEvictionPolicy.fifo,
+),
+
+// LRU: sourceField is required (datetime, non-null, currentTimestamp).
+// Update that field when the record should count as recently used.
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  policy: CapacityEvictionPolicy.lru,
+  sourceField: 'last_active_at',
+),
+```
+
+- Set at least one of `maxEntries` / `maxBytes`.
+- FIFO + `PrimaryKeyType.none` also requires `sourceField` (same datetime rules as above).
+
+You can also enable, change, or disable capacity eviction on an existing table at runtime (no reopen required):
+
+```dart
+// Enable / update capacity eviction
+await db.updateSchema('recent_events').setCapacityConfig(
+  CapacityConfig(
+    maxEntries: 10000,
+    policy: CapacityEvictionPolicy.lru,
+    sourceField: 'last_active_at',
+  ),
+);
+
+// Turn it off (keeps existing rows; stops capacity-based deletes)
+await db.updateSchema('recent_events').disableCapacity();
+```
+
+KV capacity is set when opening the database via `DataStoreConfig` (not per `kv.set` call):
+- `kvCapacityConfig`: limits keys in the **current space**
+- `globalKvCapacityConfig`: limits **global** KV
+- Same shape as table `CapacityConfig`, but do not set `sourceField`
+
+```dart
+final db = await ToStore.open(
+  dbPath: '...',
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+    ),
+    globalKvCapacityConfig: CapacityConfig(
+      maxEntries: 2000,
+      policy: CapacityEvictionPolicy.fifo,
+    ),
+  ),
+);
+```
 
 ### Intelligent Storage (Upsert)
 ToStore decides whether to update or insert based on the primary key or unique field included in `data`. `where` is not supported here; the conflict target is determined by the data itself.
@@ -1853,6 +1922,8 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultRecoveryDurability`** | **`standard`** | **Recovery guarantee on write response.** Defines the self-healing recovery level before write operations return results:<br>• **`standard` (default)**: **Crash-safe before response.** Guarantees self-healing recovery against app crashes, uncaught exceptions, and process kills (OOM).<br>• **`durable`**: **Power-loss safe before response.** Forced to physical storage before returning; guarantees full self-healing recovery even under sudden power loss.<br>• **`async`**: **Maximum throughput.** Returns immediately and saves in background; after returning, on small writes, typically leaves a brief few-millisecond window before reaching persistent storage. |
 | **`persistRecoveryOnCommit`** | **true** | **Strong durability guarantee.** When true, committed transactions are synced to physical storage. When false, flushing is done asynchronously in the background for better speed, with a small risk of losing a tiny amount of data in extreme crashes. |
 | **`ttlCleanupIntervalMs`** | **300000** | **Global TTL polling.** The background interval for scanning expired data when the engine is not idle. Lower values delete expired data sooner but cost more overhead. |
+| **`kvCapacityConfig`** | **null** | **Space KV capacity.** FIFO/LRU limit for space-scoped keys; do not set `sourceField`. See [Capacity Eviction](#capacity-eviction). |
+| **`globalKvCapacityConfig`** | **null** | **Global KV capacity.** Same shape as `kvCapacityConfig`. |
 | **`maxConcurrency`** | (auto) | **Compute concurrency control.** Sets the maximum parallel worker count for intensive tasks such as vector computation and encryption/decryption. Keeping it automatic is usually best. |
 
 ```dart

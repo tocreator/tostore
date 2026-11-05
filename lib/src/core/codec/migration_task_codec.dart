@@ -73,6 +73,8 @@ abstract final class MigrationOperationFieldId {
   static const int oldForeignKey = 17;
   static const int sourceFieldId = 18;
   static const int discardOldPrimaryKey = 19;
+  static const int capacityConfig = 20;
+  static const int oldCapacityConfig = 21;
   // Reserved 30--39.
 }
 
@@ -557,6 +559,16 @@ final class MigrationTaskCodec {
         SchemaBinaryCodec.writeTableTtlConfig(sw, op.oldTtlConfig!);
       });
     }
+    if (op.capacityConfig != null) {
+      w.writeMessage(MigrationOperationFieldId.capacityConfig, (sw) {
+        SchemaBinaryCodec.writeCapacityConfig(sw, op.capacityConfig!);
+      });
+    }
+    if (op.oldCapacityConfig != null) {
+      w.writeMessage(MigrationOperationFieldId.oldCapacityConfig, (sw) {
+        SchemaBinaryCodec.writeCapacityConfig(sw, op.oldCapacityConfig!);
+      });
+    }
     if (op.foreignKey != null) {
       w.writeMessage(MigrationOperationFieldId.foreignKey, (sw) {
         SchemaBinaryCodec.writeForeignKeySchema(sw, op.foreignKey!);
@@ -600,6 +612,8 @@ final class MigrationTaskCodec {
     PrimaryKeyConfig? oldPrimaryKeyConfig;
     TableTtlConfig? ttlConfig;
     TableTtlConfig? oldTtlConfig;
+    TableCapacityConfig? capacityConfig;
+    TableCapacityConfig? oldCapacityConfig;
     ForeignKeySchema? foreignKey;
     String? foreignKeyName;
     ForeignKeySchema? oldForeignKey;
@@ -671,6 +685,16 @@ final class MigrationTaskCodec {
             oldTtlConfig = SchemaBinaryCodec.readTableTtlConfig(nr);
           });
           break;
+        case MigrationOperationFieldId.capacityConfig:
+          r.readMessage((nr, _) {
+            capacityConfig = SchemaBinaryCodec.readCapacityConfig(nr);
+          });
+          break;
+        case MigrationOperationFieldId.oldCapacityConfig:
+          r.readMessage((nr, _) {
+            oldCapacityConfig = SchemaBinaryCodec.readCapacityConfig(nr);
+          });
+          break;
         case MigrationOperationFieldId.foreignKey:
           r.readMessage((nr, _) {
             foreignKey = SchemaBinaryCodec.readForeignKeySchema(nr);
@@ -711,6 +735,8 @@ final class MigrationTaskCodec {
       oldPrimaryKeyConfig: oldPrimaryKeyConfig,
       ttlConfig: ttlConfig,
       oldTtlConfig: oldTtlConfig,
+      capacityConfig: capacityConfig,
+      oldCapacityConfig: oldCapacityConfig,
       foreignKey: foreignKey,
       foreignKeyName: foreignKeyName,
       oldForeignKey: oldForeignKey,

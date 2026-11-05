@@ -7,10 +7,12 @@ All notable changes to this project will be documented in this file.
 ### Added
 - Added lexical text indexes (`IndexType.text`, full-text / keyword retrieval via `matchText`) and neural sparse indexes (`IndexType.sparse`, `matchSparse`), with hybrid fusion; designed to scale beyond tens of billions of records.
 - Added optional `minScore` to `db.vectorSearch(...)` (same relevance floor as `matchVector`).
+- Added table/KV capacity eviction (`CapacityConfig`: `maxEntries` / `maxBytes`, `fifo` / `lru`) with online schema enable/disable.
 
 ### Changed
 - Improved the Normalized Relevance Score (`score`): relevance in `0.0 ~ 1.0` (higher = more relevant). Use `minScore` to keep strong matches; use `rawScore` / `distance` for the physical metric. The published score baseline is for typical embeddings (dimensions ≥ 128).
 - Multi-way hybrid fusion now defaults to `weightedScore` so fused `score` stays on the same relevance scale; use `.fusionMethod(RetrievalFusionMethod.rrf)` for rank-only fusion.
+- `TableTtlConfig.sourceField` is now **required** for new tables and when enabling TTL on a table that did not previously use TTL. Tables that already persist TTL with an omitted `sourceField` remain compatible and are not forced to rebuild.
 
 ## 3.6.0
 

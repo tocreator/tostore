@@ -1,6 +1,6 @@
 ---
 id: tostore-ai-09-space-ttl-fk
-title: Spaces, Table TTL, and Foreign Keys
+title: Spaces, Table TTL, Capacity Eviction, and Foreign Keys
 audience: coding-agent
 source_apis:
   - ToStore.switchSpace
@@ -8,13 +8,16 @@ source_apis:
   - ToStore.deleteSpace
   - ToStore.getSpaceInfo
   - TableTtlConfig
+  - CapacityConfig
+  - CapacityEvictionPolicy
+  - TableCapacityConfig
   - ForeignKeySchema
   - ForeignKeyCascadeAction
 version: 3.x
 status: complete
 ---
 
-# Spaces, Table TTL, and Foreign Keys
+# Spaces, Table TTL, Capacity Eviction, and Foreign Keys
 
 ## Spaces
 
@@ -53,11 +56,19 @@ Background cleanup of expired records (logs, events, telemetry).
 ```dart
 TableTtlConfig({
   required int ttlMs, // MUST be > 0
-  String? sourceField, // null → internal _system_ingest_ts_ms
+  String? sourceField,
 });
 ```
 
-If `sourceField` is set, that field MUST be:
+### `sourceField` rules
+
+| Situation | `sourceField` |
+| :--- | :--- |
+| **New table** with TTL | **MUST** set |
+| **Existing table** enabling TTL for the first time | **MUST** set |
+| **Online grandfather**: table already persisted TTL with omitted `sourceField` (virtual `_system_ingest_ts_ms` index) | MAY keep omitting (no forced multi-million-row rebuild) |
+
+When set, `sourceField` MUST be:
 
 1. `DataType.datetime`
 2. `nullable: false`
@@ -66,13 +77,58 @@ If `sourceField` is set, that field MUST be:
 ```dart
 ttlConfig: TableTtlConfig(
   ttlMs: 7 * 24 * 60 * 60 * 1000,
-  // sourceField: 'created_at', // optional
+  sourceField: 'created_at', // required for new tables / newly enabling TTL
 ),
 ```
+
+Prefer an explicit field so deletes clear the TTL index via normal encode/decode. The virtual ingest index is INSERT-only and relies on search-result tombstones — kept only for online compatibility.
 
 Runtime: `updateSchema(t).setTtlConfig(...)` / `.disableTtl()`.
 
 Polling interval: `DataStoreConfig.ttlCleanupIntervalMs` (min 60000 ms).
+
+## Table-level capacity eviction (FIFO / LRU)
+
+Limit how many records (or how much storage) a table may keep. Independent of TTL: time expiry and capacity eviction MAY be enabled together.
+
+```dart
+CapacityConfig({
+  int? maxEntries, // max record count
+  int? maxBytes,   // approximate max storage size (bytes)
+  CapacityEvictionPolicy policy = CapacityEvictionPolicy.fifo,
+  double evictRatio = 0.30, // fraction to free when over limit (0.05–0.50)
+  String? sourceField, // see policy rules below
+});
+typedef TableCapacityConfig = CapacityConfig;
+```
+
+MUST set at least one of `maxEntries` / `maxBytes` to a value `> 0`.
+
+| Policy | Behavior |
+| :--- | :--- |
+| `fifo` (primary key type ≠ `none`) | Evict by primary key ascending. MUST NOT set `sourceField`. |
+| `fifo` + `PrimaryKeyType.none` | MUST set `sourceField`: insert-time `DataType.datetime`, non-null, `DefaultValueType.currentTimestamp`. Do not update that field after insert. |
+| `lru` | MUST set `sourceField` (same datetime rules). Update it when a record should count as recently used. |
+
+`sourceField` is required **only** for `lru`, or for `fifo` when the table uses `PrimaryKeyType.none`.
+
+Capacity does **not** use the virtual `_system_ingest_ts_ms` index (TTL-only grandfather path when `sourceField` was historically omitted). Deletes go through the normal write path so index entries are removed from record values.
+
+When over the limit, background cleanup frees about `evictRatio` of capacity (default 30%) across cycles so writes stay smooth.
+
+```dart
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  policy: CapacityEvictionPolicy.lru,
+  sourceField: 'last_active_at',
+),
+```
+
+Runtime: `updateSchema(t).setCapacityConfig(...)` / `.disableCapacity()`.
+
+KV capacity (`DataStoreConfig.kvCapacityConfig` / `globalKvCapacityConfig`) uses the same `CapacityConfig` shape but MUST NOT set `sourceField` — the engine manages KV ordering.
+
+Do not confuse with `cacheMemoryBudgetMB` — that tunes engine memory cache, not table record limits.
 
 ## Foreign keys
 

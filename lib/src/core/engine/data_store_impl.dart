@@ -57,6 +57,7 @@ import '../compute/yield_controller.dart';
 import '../maintenance/background_write_scheduler.dart';
 import '../maintenance/backup_manager.dart';
 import '../maintenance/cache_manager.dart';
+import '../maintenance/capacity_eviction_manager.dart';
 import '../maintenance/compaction_manager.dart';
 import '../maintenance/crontab_manager.dart';
 import '../maintenance/foreign_key_manager.dart';
@@ -284,6 +285,9 @@ class DataStoreImpl {
   // TTL cleanup manager
   late TtlCleanupManager _ttlCleanupManager;
 
+  // Capacity eviction manager (register after TTL conceptually)
+  late CapacityEvictionManager _capacityEvictionManager;
+
   // WAL/write buffering/parallel journal managers
   // Not `final` so that they can be recreated on `initialize(reinitialize: true)`.
   late WalManager walManager;
@@ -474,6 +478,28 @@ class DataStoreImpl {
 
   void clearAllTtlPlanCache() {
     _ttlCleanupManager.invalidatePlanCache();
+  }
+
+  /// Capacity eviction plan-cache hooks for schema/cache managers.
+  void upsertCapacityPlanForSchema(TableSchema schema) {
+    _capacityEvictionManager.upsertPlanForSchema(schema);
+  }
+
+  void removeCapacityPlanForTable(TableContext table) {
+    _capacityEvictionManager.removePlanForTable(table);
+  }
+
+  void clearAllCapacityPlanCache() {
+    _capacityEvictionManager.invalidatePlanCache();
+  }
+
+  /// O(1) wake after growth (debounced capacity eviction).
+  ///
+  /// Disk: after PJM flush. Memory: after batch insert into the buffer/cache
+  /// path only — single-row inserts stay on the crontab interval.
+  @pragma('vm:prefer-inline')
+  void maybeWakeCapacityEviction(TableContext table) {
+    _capacityEvictionManager.maybeWakeAfterGrowth(table);
   }
 
   /// Get foreign key manager
@@ -861,6 +887,7 @@ class DataStoreImpl {
       compactionManager = CompactionManager(this);
       overflowManager = OverflowManager(this);
       _ttlCleanupManager = TtlCleanupManager(this);
+      _capacityEvictionManager = CapacityEvictionManager(this);
 
       cacheManager = CacheManager(this);
       notificationManager = NotificationManager([
@@ -981,6 +1008,9 @@ class DataStoreImpl {
           }));
           CrontabManager.start();
           _ttlCleanupManager.registerCleanupTask();
+          // Capacity runs independently; register after TTL so catch-up
+          // conceptually follows TTL cleanup.
+          _capacityEvictionManager.registerCleanupTask();
 
           if (!isMemoryMode) {
             unawaited(_resetTempDir());
@@ -1219,6 +1249,9 @@ class DataStoreImpl {
         _ttlCleanupManager.unregisterCleanupTask();
       } catch (_) {}
       try {
+        _capacityEvictionManager.unregisterCleanupTask();
+      } catch (_) {}
+      try {
         compactionManager.dispose();
       } catch (_) {}
       try {
@@ -1277,6 +1310,7 @@ class DataStoreImpl {
     try {
       // Stop background triggers first to prevent new work from entering pipelines
       _ttlCleanupManager.unregisterCleanupTask();
+      _capacityEvictionManager.unregisterCleanupTask();
       compactionManager.dispose();
 
       // Perform all flushing and shutdown as system operation to bypass transaction locks
@@ -1489,6 +1523,8 @@ class DataStoreImpl {
           allowReservedTableNames: isSystemTable,
           allowInternalTableNamePrefix: isSystemTable,
           allowOtherInternalFields: isSystemTable,
+          // New tables must set TTL sourceField (no virtual-ingest grandfather).
+          requireTtlSourceField: true,
         );
 
         // Validate foreign key constraints with referenced tables
@@ -6470,6 +6506,19 @@ class DataStoreImpl {
     final Map<String, FieldSchema> fieldMap = {
       for (final field in schema.fields) field.name: field,
     };
+    // Capacity LRU touch — resolved once per batchUpdate (not per row).
+    // Non-LRU / no capacity: stop after policy check; never touch sourceField.
+    String? lruSrc;
+    String? lruNowIso;
+    final capacityCfg = schema.capacityConfig;
+    if (capacityCfg != null &&
+        capacityCfg.policy == CapacityEvictionPolicy.lru) {
+      final src = capacityCfg.sourceField;
+      if (src != null && src.isNotEmpty && fieldMap.containsKey(src)) {
+        lruSrc = src;
+        lruNowIso = DateTime.now().toIso8601String();
+      }
+    }
 
     final bool hasActiveForeignKeys = _foreignKeyManager != null &&
         schema.foreignKeys.any((fk) => fk.enabled);
@@ -6787,6 +6836,18 @@ class DataStoreImpl {
                 break;
               }
             }
+          }
+
+          // Capacity LRU: bump sourceField when payload omitted it.
+          // Non-LRU tables: lruSrc is null → one null check, no HashMap work.
+          if (lruSrc != null &&
+              !hasValidationError &&
+              !record.containsKey(lruSrc) &&
+              existingRecord[lruSrc] != lruNowIso) {
+            updatedRecord ??= Map<String, dynamic>.of(existingRecord);
+            updatedRecord[lruSrc] = lruNowIso;
+            // Payload omitted this field, so it cannot already be in changedFields.
+            changedFields.add(lruSrc);
           }
 
           if (hasValidationError) {

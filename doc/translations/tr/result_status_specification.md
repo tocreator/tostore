@@ -158,7 +158,7 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
 
 ### 4.3 SchemaValidationStatus (Tablo Şeması Doğrulama ve Uyumsuz Geçiş)
 
-- **Kategori Aralığı**: `[30000, 39999]` — `30000–30013` statik şema doğrulama, `31001–31006` geçiş korumaları.
+- **Kategori Aralığı**: `[30000, 39999]` — `30000–30014` statik şema doğrulama, `31001–31006` geçiş korumaları.
 - **Özel Alan Tanımı**:
 
   | Alan | Tür | Ayrıntılar |
@@ -185,6 +185,7 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
   | `30011`<br>`devSchemaTableExists` | Tablo zaten mevcut | <ul><li>`tableName`: Tablo adı</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
   | `30012`<br>`devSchemaFieldExists` | Şema yükseltme: zaten mevcut olan bir alan eklenmeye çalışılıyor | <ul><li>`tableName`: Tablo adı</li><li>`field`: Çakışan alan adı</li><li>`wrongValue`: `null`</li></ul> |
   | `30013`<br>`devSchemaIndexExists` | Şema yükseltme: zaten mevcut olan bir dizin eklenmeye çalışılıyor | <ul><li>`tableName`: Tablo adı</li><li>`field`: Dizin adı</li><li>`wrongValue`: `null`</li></ul> |
+  | `30014`<br>`devInvalidSchemaCapacityConfig` | Kapasite temizleme yapılandırması doğrulaması başarısız | <ul><li>`tableName`: Tablo adı (KV yapılandırma etiketlerinde boş olabilir)</li><li>`field`: `null`</li><li>`wrongValue`: Geçersiz kapasite yapılandırma Map'i, örn. `{ "maxEntries": null, "maxBytes": null }`</li></ul> |
   | `31001`<br>`devMigrationNotAllowedWithData` | Geçiş veri değişikliği gerektiriyor ancak açıkça izin verilmemiş | <ul><li>`tableName`: Tablo adı</li><li>`field`: `null`</li><li>`wrongValue`: Geçiş yükseltme farkları eşlemesi</li></ul> |
   | `31002`<br>`devMigrationUnsafeTypeConversion` | Fiziksel geçiş: alan için desteklenmeyen tür dönüşümü | <ul><li>`tableName`: Tablo adı</li><li>`field`: Alan adı</li><li>`wrongValue`: Çakışan türler eşlemesi, örneğin `{ "from": "text", "to": "integer" }`</li></ul> |
   | `31003`<br>`devMigrationCannotAddNonNullField` | Boş olmayan tabloya varsayılan değer olmadan null olamaz alan eklenemez | <ul><li>`tableName`: Tablo adı</li><li>`field`: Hatalı alan adı</li><li>`wrongValue`: Geçiş parametreleri, örneğin `{ "nullable": false, "defaultValue": null }`</li></ul> |
@@ -515,6 +516,7 @@ Tam durum yönlendirmesi ve ayrıştırması için aşağıdaki tabloya bakın:
 | **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Geliştirici Hatası | Tablo zaten mevcut |
 | **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Geliştirici Hatası | Alan zaten mevcut |
 | **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Geliştirici Hatası | Dizin zaten mevcut |
+| **30014** | `DEV_INVALID_SCHEMA_CAPACITY_CONFIG` | `ResultType.devInvalidSchemaCapacityConfig` | Geliştirici Hatası | Kapasite temizleme yapılandırması doğrulaması başarısız |
 | **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Geliştirici Hatası | Geçiş veri değişikliği gerektiriyor ancak açıkça izin verilmemiş |
 | **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Geliştirici Hatası | Alan için desteklenmeyen veri türü değişikliği |
 | **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Geliştirici Hatası | Varsayılan değer olmadan null olamaz alan eklenmesine izin verilmez |

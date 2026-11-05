@@ -610,52 +610,158 @@ class IndexManager {
     return result ?? IndexSearchResult.empty();
   }
 
-  Future<void> removeInternalKvExpiryIndexEntryByRawKey(
+  Future<void> removeInternalKvExpiryIndexEntriesByRawKeys(
     TableContext table,
-    Uint8List keyBytes,
+    Iterable<Uint8List> keyBytesList,
   ) async {
-    if (!_isInternalKvExpiryIndex(table, SystemTable.keyValueExpiryIndexUid) ||
-        keyBytes.isEmpty) {
+    if (!_isInternalKvExpiryIndex(table, SystemTable.keyValueExpiryIndexUid)) {
       return;
     }
+    await removeIndexEntriesByRawKeys(
+      table,
+      SystemTable.keyValueExpiryIndexUid,
+      keyBytesList,
+    );
+  }
+
+  /// Batch tombstone of raw B+Tree index keys (one [writeChanges] flush).
+  ///
+  /// Only for indexes whose keys cannot be reconstructed on DELETE (virtual
+  /// TTL ingest / KV expiry). Real sourceField indexes must go through
+  /// [deleteInternal] → flush. Runs under the table write lock.
+  Future<void> removeIndexEntriesByRawKeys(
+    TableContext table,
+    IndexUid indexUid,
+    Iterable<Uint8List> keyBytesList,
+  ) async {
+    if (indexUid.isEmpty) return;
 
     try {
-      try {
-        final decoded = MemComparableKey.decodeTuple(keyBytes);
-        _indexDataCache.remove(
-          <dynamic>[
-            table.tableUid,
-            SystemTable.keyValueExpiryIndexUid,
-            ...decoded,
-          ],
+      final deltas = <DataBlockEntry>[];
+      final yieldController = YieldController(
+        'IndexManager.removeIndexEntriesByRawKeys',
+      );
+      for (final keyBytes in keyBytesList) {
+        if (keyBytes.isEmpty) continue;
+        try {
+          final decoded = MemComparableKey.decodeTuple(keyBytes);
+          _indexDataCache.remove(
+            <dynamic>[
+              table.tableUid,
+              indexUid,
+              ...decoded,
+            ],
+          );
+        } catch (_) {}
+        deltas.add(
+          DataBlockEntry(keyBytes, Uint8List.fromList(const <int>[1])),
         );
-      } catch (_) {}
+        final y = yieldController.maybeYield();
+        if (y != null) await y;
+      }
+      if (deltas.isEmpty) return;
 
       if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
         return;
       }
 
-      final meta = await getIndexMeta(
-        table.tableUid,
-        SystemTable.keyValueExpiryIndexUid,
-      );
-      if (meta == null) {
-        return;
-      }
+      await _dataStore.tableDataManager.withTableWriteLock(
+        table,
+        (_) async {
+          final meta = await getIndexMeta(table.tableUid, indexUid);
+          if (meta == null) return;
 
-      await _dataStore.indexTreePartitionManager?.writeChanges(
-        table: table,
-        indexUid: SystemTable.keyValueExpiryIndexUid,
-        indexMeta: meta,
-        deltas: <DataBlockEntry>[
-          DataBlockEntry(keyBytes, Uint8List.fromList(const <int>[1])),
-        ],
+          await _dataStore.indexTreePartitionManager?.writeChanges(
+            table: table,
+            indexUid: indexUid,
+            indexMeta: meta,
+            deltas: deltas,
+          );
+        },
+        operationPrefix: 'index_tombstone_',
       );
     } catch (e) {
       Logger.warn(
-          'Failed to remove internal KV expiry index entry for ${table.tableName}',
-          rawError: e);
+        'Failed to remove index entries by raw keys for ${table.tableName}.$indexUid',
+        rawError: e,
+      );
     }
+  }
+
+  /// Ascending scan from the leftmost index key (oldest-first for time keys).
+  ///
+  /// Uses an unbounded B+Tree range (`start`/`end` empty) and stops at [limit].
+  /// Prefer this over fabricating a far-future upper-bound sentinel.
+  Future<IndexSearchResult> searchOldestEntries(
+    TableContext table,
+    IndexUid indexUid, {
+    int? limit,
+
+    /// Exclusive keyset cursor from a previous [IndexSearchResult.lastKey].
+    Uint8List? startAfterKey,
+  }) async {
+    if (indexUid.isEmpty) return IndexSearchResult.empty();
+    if (limit != null && limit <= 0) return IndexSearchResult.empty();
+
+    final schema = table.schema.name.isNotEmpty
+        ? table.schema
+        : await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
+    if (schema == null) return IndexSearchResult.empty();
+
+    final indexSchema = _findBtreeIndexSchema(schema, indexUid, table: table);
+    if (indexSchema == null || indexSchema.fields.isEmpty) {
+      return IndexSearchResult.empty();
+    }
+
+    var meta = await getIndexMeta(table.tableUid, indexUid);
+    final bool isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
+    final bool metaWasMissing = meta == null;
+
+    meta ??= IndexMeta.createEmpty(
+      indexUid: indexUid,
+      tableUid: table.tableUid,
+      isUnique: indexSchema.unique,
+    );
+
+    if (!isMemoryMode && meta.isBuilding) {
+      if (isIndexBuildOwned(table, indexUid)) {
+        return IndexSearchResult.empty();
+      }
+      await endIndexBuild(table, indexUid);
+      meta = (await getIndexMeta(table.tableUid, indexUid)) ??
+          meta.copyWith(isBuilding: false);
+    }
+
+    if (!isMemoryMode && !_isDiskIndexFileUsable(meta)) {
+      final gated = await _gateUnusableDiskIndexSearch(
+        table: table,
+        indexUid: indexUid,
+        schema: schema,
+        readFromFileOnly: false,
+        metaWasMissing: metaWasMissing,
+      );
+      if (gated != null) return gated;
+    }
+
+    // Exclusive cursor → inclusive start (same rule as searchIndex).
+    var startInclusive = Uint8List(0);
+    if (startAfterKey != null && startAfterKey.isNotEmpty) {
+      startInclusive = Uint8List(startAfterKey.length + 1);
+      startInclusive.setAll(0, startAfterKey);
+      startInclusive[startAfterKey.length] = 0;
+    }
+
+    return _searchIndexByKeyRangeLogical(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      startKeyInclusive: startInclusive,
+      endKeyExclusive: Uint8List(0),
+      reverse: false,
+      limit: limit,
+      offset: null,
+    );
   }
 
   /// Evict index metadata cache
@@ -3364,19 +3470,22 @@ class IndexManager {
       final bool isUnique = meta.isUnique;
       final fields = idx.fields;
 
-      // Internal TTL virtual index: single-field index on `_system_ingest_ts_ms`
-      // when table-level TTL uses the internal ingest-time source (sourceField == null/empty).
-      // Internal TTL index is only written on INSERT; UPDATE/DELETE skips it.
+      // Internal TTL ingest virtual index: single-field on
+      // `_system_ingest_ts_ms` when TTL omits sourceField.
+      // INSERT-only; UPDATE/DELETE cannot reconstruct the key (no row value).
+      // Capacity never uses this virtual index (requires real sourceField).
       final bool usesInternalTtlSource = schema.ttlConfig != null &&
           (schema.ttlConfig!.sourceField == null ||
               schema.ttlConfig!.sourceField!.isEmpty);
       final bool isInternalTtlIndex = usesInternalTtlSource &&
           fields.length == 1 &&
           fields.first == TableSchema.internalTtlIngestTsMsField;
+
+      // Table LRU indexes a real user datetime sourceField — standard encode.
       final bool isInternalKvExpiryIndex =
           _isInternalKvExpiryIndex(table, indexUid);
 
-      // Per-index, per-batch ingest timestamp for internal TTL index INSERTs.
+      // Per-index, per-batch timestamps for internal virtual ingest writes.
       final String? batchIngestIso =
           isInternalTtlIndex ? DateTime.now().toIso8601String() : null;
       final deltas = await _prepareIndexWriteDeltasBatch(

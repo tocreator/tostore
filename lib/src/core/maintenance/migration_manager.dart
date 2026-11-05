@@ -2319,6 +2319,11 @@ class MigrationManager {
             allowReservedTableNames: allowSystemSchema,
             allowInternalTableNamePrefix: allowSystemSchema,
             allowOtherInternalFields: allowSystemSchema,
+            requireTtlSourceField: TableTtlConfig.shouldRequireSourceField(
+              oldTtl: oldSchema.ttlConfig,
+              newTtl: targetSchema.ttlConfig,
+              isNewTable: false,
+            ),
           );
 
           // 3. For runtime manual migrations, validate new foreign key constraints
@@ -2443,8 +2448,14 @@ class MigrationManager {
           }
         }
       }
-      // Calculate table write requirement once
-      final needsTableWrite = _needDataMigration(sortedOperations, oldSchema);
+      // Pass targetSchema so addField of capacity/TTL sourceField forces a
+      // table rewrite to materialize defaults; specificIndexUids still limits
+      // rebuild to only new/changed indexes.
+      final needsTableWrite = _needDataMigration(
+        sortedOperations,
+        oldSchema,
+        targetSchema: targetSchema,
+      );
 
       // Plan field layout for atomic schema cutover (evolve +/- deleted-slot compact).
       FieldStorageLayout? targetFieldLayout;
@@ -2636,8 +2647,12 @@ class MigrationManager {
               outDroppedChildIndexes: childIndexesToDrop,
             );
           });
+          final liveAfterEnqueueCutover =
+              await _dataStore.tableMetaManager?.getTableSchema(tableUid);
           task = task.copyWith(
             isSchemaUpdated: true,
+            targetSchemaSnapshot:
+                liveAfterEnqueueCutover ?? task.targetSchemaSnapshot,
             referencingChildIndexesToDrop:
                 childIndexesToDrop.isNotEmpty ? childIndexesToDrop : null,
             clearPromotePhase: true,
@@ -2862,6 +2877,9 @@ class MigrationManager {
           break;
         case MigrationType.setTableTtlConfig:
           parts.add('setTableTtlConfig');
+          break;
+        case MigrationType.setTableCapacityConfig:
+          parts.add('setTableCapacityConfig');
           break;
         case MigrationType.dropTable:
           parts.add('dropTable');
@@ -3643,11 +3661,68 @@ class MigrationManager {
   }
 
   bool _needDataMigration(
-      List<MigrationOperation> operations, TableSchema? oldSchema) {
+    List<MigrationOperation> operations,
+    TableSchema? oldSchema, {
+    TableSchema? targetSchema,
+  }) {
     if (oldSchema == null) return false;
     for (final operation in operations) {
       if (operation.type == MigrationType.promoteFieldToPrimaryKey) {
         return true;
+      }
+      if (operation.type == MigrationType.addField) {
+        // Capacity/TTL sourceField only: engine-owned implicits need defaults
+        // materialised or their index stays empty. Explicit / unique / FK
+        // indexes stay index-only (caller owns backfill semantics).
+        // Rebuild scope stays limited via specificIndexUids.
+        //
+        // Runtime [updateSchema] often omits [targetSchema] — also detect
+        // sourceField from sibling setTtlConfig / setCapacityConfig ops.
+        final field = operation.field;
+        if (field != null &&
+            _addedFieldNeedsSourceDefaultMaterialize(
+              field,
+              operations: operations,
+              targetSchema: targetSchema,
+              oldSchema: oldSchema,
+            )) {
+          return true;
+        }
+      }
+      if (operation.type == MigrationType.setTableTtlConfig) {
+        // Attaching/changing an explicit sourceField must rewrite rows when
+        // defaults may be missing (new column, cross-task addField without
+        // materialize, or grandfather → explicit). Same sourceField + ttlMs
+        // only → index/schema metadata, no rewrite.
+        if (_ttlOrCapacitySourceAttachNeedsRewrite(
+          newSourceField: operation.ttlConfig?.sourceField,
+          oldSourceField: operation.oldTtlConfig?.sourceField ??
+              oldSchema.ttlConfig?.sourceField,
+          oldHadConfig:
+              operation.oldTtlConfig != null || oldSchema.ttlConfig != null,
+          oldSchema: oldSchema,
+          operations: operations,
+        )) {
+          return true;
+        }
+      }
+      if (operation.type == MigrationType.setTableCapacityConfig) {
+        final cap = operation.capacityConfig;
+        if (cap != null &&
+            (cap.policy == CapacityEvictionPolicy.lru ||
+                cap.needsFifoSourceFieldIndex(
+                    oldSchema.primaryKeyConfig.type)) &&
+            _ttlOrCapacitySourceAttachNeedsRewrite(
+              newSourceField: cap.sourceField,
+              oldSourceField: operation.oldCapacityConfig?.sourceField ??
+                  oldSchema.capacityConfig?.sourceField,
+              oldHadConfig: operation.oldCapacityConfig != null ||
+                  oldSchema.capacityConfig != null,
+              oldSchema: oldSchema,
+              operations: operations,
+            )) {
+          return true;
+        }
       }
       if (operation.type == MigrationType.modifyField) {
         // Only migrate data if field definition changes affect storage or constraints
@@ -3700,6 +3775,103 @@ class MigrationManager {
       }
     }
     return false;
+  }
+
+  /// True when an added field is a TTL/capacity `sourceField` that must be
+  /// materialised with defaults (otherwise the new index stays empty).
+  bool _addedFieldNeedsSourceDefaultMaterialize(
+    FieldSchema field, {
+    required List<MigrationOperation> operations,
+    TableSchema? targetSchema,
+    TableSchema? oldSchema,
+  }) {
+    final hasDefault = field.defaultValue != null ||
+        field.defaultValueType != DefaultValueType.none;
+    if (!hasDefault) return false;
+
+    if (targetSchema != null &&
+        _fieldIsCapacityOrTtlSource(field.name, targetSchema)) {
+      return true;
+    }
+
+    final pkType = targetSchema?.primaryKeyConfig.type ??
+        oldSchema?.primaryKeyConfig.type ??
+        PrimaryKeyType.sequential;
+
+    // Runtime updateSchema: infer from sibling ops in this task.
+    for (final op in operations) {
+      if (op.type == MigrationType.setTableTtlConfig) {
+        final src = op.ttlConfig?.sourceField;
+        if (src != null && src.isNotEmpty && src == field.name) {
+          return true;
+        }
+      }
+      if (op.type == MigrationType.setTableCapacityConfig) {
+        final cap = op.capacityConfig;
+        final src = cap?.sourceField;
+        if (cap != null &&
+            src != null &&
+            src.isNotEmpty &&
+            src == field.name &&
+            (cap.policy == CapacityEvictionPolicy.lru ||
+                cap.needsFifoSourceFieldIndex(pkType))) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  bool _fieldIsCapacityOrTtlSource(String fieldName, TableSchema schema) {
+    final ttl = schema.ttlConfig;
+    if (ttl != null) {
+      final ttlSource = ttl.sourceField;
+      if (ttlSource != null && ttlSource.isNotEmpty && fieldName == ttlSource) {
+        return true;
+      }
+    }
+
+    final capacity = schema.capacityConfig;
+    if (capacity != null) {
+      final capSource = capacity.sourceField;
+      if (capSource != null &&
+          capSource.isNotEmpty &&
+          fieldName == capSource &&
+          (capacity.policy == CapacityEvictionPolicy.lru ||
+              capacity
+                  .needsFifoSourceFieldIndex(schema.primaryKeyConfig.type))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Whether attaching/changing an explicit [newSourceField] needs row rewrite.
+  ///
+  /// - Field absent from old schema / added in this task → rewrite (defaults).
+  /// - First enable or grandfather→explicit / sourceField rename → rewrite
+  ///   (cross-task `addField` without materialize otherwise leaves empty index).
+  /// - Same explicit sourceField already in use → no rewrite.
+  bool _ttlOrCapacitySourceAttachNeedsRewrite({
+    required String? newSourceField,
+    required String? oldSourceField,
+    required bool oldHadConfig,
+    required TableSchema oldSchema,
+    required List<MigrationOperation> operations,
+  }) {
+    if (newSourceField == null || newSourceField.isEmpty) return false;
+
+    final existsInOld = oldSchema.fields.any((f) => f.name == newSourceField);
+    final addedHere = operations.any((op) =>
+        op.type == MigrationType.addField && op.field?.name == newSourceField);
+    if (!existsInOld || addedHere) return true;
+
+    final oldSrc = (oldSourceField == null || oldSourceField.isEmpty)
+        ? null
+        : oldSourceField;
+    final oldImplicit = !oldHadConfig || oldSrc == null;
+    if (oldImplicit) return true;
+    return oldSrc != newSourceField;
   }
 
   bool _needRuntimeRecordBridge(
@@ -3842,6 +4014,17 @@ class MigrationManager {
       ));
     }
 
+    if (_isCapacityConfigChanged(
+      normalizedOldSchema.capacityConfig,
+      normalizedNewSchema.capacityConfig,
+    )) {
+      operations.add(MigrationOperation(
+        type: MigrationType.setTableCapacityConfig,
+        capacityConfig: newSchema.capacityConfig,
+        oldCapacityConfig: oldSchema.capacityConfig,
+      ));
+    }
+
     // Check indexes changes
     _compareIndexes(normalizedOldSchema, normalizedNewSchema, operations);
 
@@ -3970,6 +4153,13 @@ class MigrationManager {
             : newTtl.sourceField;
 
     return oldTtl.ttlMs != newTtl.ttlMs || oldSource != newSource;
+  }
+
+  bool _isCapacityConfigChanged(
+    TableCapacityConfig? oldCapacity,
+    TableCapacityConfig? newCapacity,
+  ) {
+    return !_areCapacityConfigsEqual(oldCapacity, newCapacity);
   }
 
   /// Compare fields and generate operations
@@ -5300,7 +5490,11 @@ class MigrationManager {
 
       oldFieldLayout = currentTask.oldFieldLayoutSnapshot ?? oldFieldLayout;
 
-      final needsTableWrite = _needDataMigration(sortedOperations, oldSchema);
+      final needsTableWrite = _needDataMigration(
+        sortedOperations,
+        oldSchema,
+        targetSchema: currentTask.targetSchemaSnapshot,
+      );
       final specificIndexUids =
           currentTask.specificIndexUids ?? const <IndexUid>[];
       final isPromoteShadowBackfill = currentTask.isPromotePrimaryKeyTask &&
@@ -6638,16 +6832,17 @@ class MigrationManager {
       MigrationType.promoteFieldToPrimaryKey: 0,
       MigrationType.setPrimaryKeyConfig: 1,
       MigrationType.setTableTtlConfig: 2,
-      MigrationType.addIndex: 3,
-      MigrationType.modifyIndex: 4,
-      MigrationType.renameIndex: 5,
-      MigrationType.removeIndex: 6,
-      MigrationType.addField: 7,
-      MigrationType.modifyField: 8,
-      MigrationType.renameField: 9,
-      MigrationType.removeField: 10,
-      MigrationType.renameTable: 11,
-      MigrationType.dropTable: 12,
+      MigrationType.setTableCapacityConfig: 3,
+      MigrationType.addIndex: 4,
+      MigrationType.modifyIndex: 5,
+      MigrationType.renameIndex: 6,
+      MigrationType.removeIndex: 7,
+      MigrationType.addField: 8,
+      MigrationType.modifyField: 9,
+      MigrationType.renameField: 10,
+      MigrationType.removeField: 11,
+      MigrationType.renameTable: 12,
+      MigrationType.dropTable: 13,
     };
 
     // Sort operations by priority
@@ -7992,6 +8187,7 @@ class MigrationManager {
         case MigrationType.removeIndex:
         case MigrationType.modifyIndex:
         case MigrationType.setTableTtlConfig:
+        case MigrationType.setTableCapacityConfig:
         case MigrationType.addForeignKey:
         case MigrationType.removeForeignKey:
         case MigrationType.modifyForeignKey:
@@ -8027,10 +8223,11 @@ class MigrationManager {
               foreignKeys: result.foreignKeys
                   .where((fk) => !fk.fields.contains(fieldName))
                   .toList(),
-              // Disable TTL if the source field is removed
-              ttlConfig: result.ttlConfig?.sourceField == fieldName
-                  ? null
-                  : result.ttlConfig,
+              // Disable TTL / capacity if the source field is removed.
+              // Must use clearTtlConfig — copyWith(ttlConfig: null) is a no-op.
+              clearTtlConfig: result.ttlConfig?.sourceField == fieldName,
+              clearCapacityConfig:
+                  result.capacityConfig?.sourceField == fieldName,
             );
           }
           break;
@@ -8076,10 +8273,13 @@ class MigrationManager {
                   }
                   return fk;
                 }).toList(),
-                // Update TTL config
+                // Update TTL / capacity source fields
                 ttlConfig: result.ttlConfig?.sourceField == oldName
                     ? result.ttlConfig!.copyWith(sourceField: newName)
                     : result.ttlConfig,
+                capacityConfig: result.capacityConfig?.sourceField == oldName
+                    ? result.capacityConfig!.copyWith(sourceField: newName)
+                    : result.capacityConfig,
               );
             }
           }
@@ -8215,7 +8415,14 @@ class MigrationManager {
           }
           break;
         case MigrationType.setTableTtlConfig:
-          result = result.copyWith(ttlConfig: op.ttlConfig);
+          result = op.ttlConfig == null
+              ? result.copyWith(clearTtlConfig: true)
+              : result.copyWith(ttlConfig: op.ttlConfig);
+          break;
+        case MigrationType.setTableCapacityConfig:
+          result = op.capacityConfig == null
+              ? result.copyWith(clearCapacityConfig: true)
+              : result.copyWith(capacityConfig: op.capacityConfig);
           break;
         case MigrationType.promoteFieldToPrimaryKey:
           final sourceName = op.fieldName;
@@ -8712,6 +8919,22 @@ class MigrationManager {
           folded.add(op);
           break;
 
+        case MigrationType.setTableCapacityConfig:
+          if (_areCapacityConfigsEqual(
+              effectiveSchema.capacityConfig, op.capacityConfig)) {
+            break;
+          }
+          if (isAutoGenerated &&
+              declaredTargetSchema != null &&
+              _areCapacityConfigsEqual(
+                effectiveSchema.capacityConfig,
+                declaredTargetSchema.capacityConfig,
+              )) {
+            break;
+          }
+          folded.add(op);
+          break;
+
         case MigrationType.promoteFieldToPrimaryKey:
           // Promote is never folded away: physical rewrite is required whenever
           // the op is still pending (empty-table fast path is handled earlier).
@@ -8946,6 +9169,19 @@ class MigrationManager {
     if (identical(a, b)) return true;
     if (a == null || b == null) return a == b;
     return a.ttlMs == b.ttlMs && a.sourceField == b.sourceField;
+  }
+
+  bool _areCapacityConfigsEqual(
+    TableCapacityConfig? a,
+    TableCapacityConfig? b,
+  ) {
+    if (identical(a, b)) return true;
+    if (a == null || b == null) return a == b;
+    return a.maxEntries == b.maxEntries &&
+        a.maxBytes == b.maxBytes &&
+        a.policy == b.policy &&
+        a.evictRatio == b.evictRatio &&
+        a.sourceField == b.sourceField;
   }
 
   bool _hasPendingDropTaskForTable(TableUid tableUid) {
@@ -9366,6 +9602,7 @@ class MigrationManager {
         _needDataMigration(
           triggerTask.operations,
           triggerTask.oldSchemaSnapshot,
+          targetSchema: triggerTask.targetSchemaSnapshot,
         );
 
     final triggerIsPkChange = triggerTask.operations.any(

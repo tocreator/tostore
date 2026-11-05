@@ -158,7 +158,7 @@ Depending on the `code` / `codeKey` range and the specific subclass of `ResultSt
 
 ### 4.3 SchemaValidationStatus (Table Schema Validation & Incompatible Migration)
 
-- **Category Range**: `code` inside `[30000, 39999]` — `30000–30013` static schema validation, `31001–31006` migration guards.
+- **Category Range**: `code` inside `[30000, 39999]` — `30000–30014` static schema validation, `31001–31006` migration guards.
 - **Dedicated Field Definition**:
 
   | Field | Type | Details |
@@ -185,6 +185,7 @@ Depending on the `code` / `codeKey` range and the specific subclass of `ResultSt
   | `30011`<br>`devSchemaTableExists` | Table already exists | <ul><li>`tableName`: Table name</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
   | `30012`<br>`devSchemaFieldExists` | Schema upgrade: adding a field that already exists | <ul><li>`tableName`: Table name</li><li>`field`: Conflicting field name</li><li>`wrongValue`: `null`</li></ul> |
   | `30013`<br>`devSchemaIndexExists` | Schema upgrade: adding an index that already exists | <ul><li>`tableName`: Table name</li><li>`field`: Index name</li><li>`wrongValue`: `null`</li></ul> |
+  | `30014`<br>`devInvalidSchemaCapacityConfig` | Capacity eviction configuration validation failed | <ul><li>`tableName`: Table name (may be empty for KV config labels)</li><li>`field`: `null`</li><li>`wrongValue`: Invalid capacity config map, e.g. `{ "maxEntries": null, "maxBytes": null }`</li></ul> |
   | `31001`<br>`devMigrationNotAllowedWithData` | Migration requires data modification and was not explicitly allowed | <ul><li>`tableName`: Table name</li><li>`field`: `null`</li><li>`wrongValue`: Migration upgrade diffs map</li></ul> |
   | `31002`<br>`devMigrationUnsafeTypeConversion` | Physical migration: unsupported type conversion for field | <ul><li>`tableName`: Table name</li><li>`field`: Field name</li><li>`wrongValue`: Conflicting types map, e.g. `{ "from": "text", "to": "integer" }`</li></ul> |
   | `31003`<br>`devMigrationCannotAddNonNullField` | Cannot add non-nullable field without a default value to non-empty table | <ul><li>`tableName`: Table name</li><li>`field`: Transgressing field name</li><li>`wrongValue`: Migration parameters, e.g. `{ "nullable": false, "defaultValue": null }`</li></ul> |
@@ -515,6 +516,7 @@ Refer to the table below for exact status routing and parsing:
 | **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Developer Error | Table already exists |
 | **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Developer Error | Field already exists |
 | **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Developer Error | Index already exists |
+| **30014** | `DEV_INVALID_SCHEMA_CAPACITY_CONFIG` | `ResultType.devInvalidSchemaCapacityConfig` | Developer Error | Capacity eviction configuration validation failed |
 | **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Developer Error | Migration requires data modification and was not explicitly allowed |
 | **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Developer Error | Unsupported data type change for field |
 | **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Developer Error | Cannot add non-nullable field without a default value |

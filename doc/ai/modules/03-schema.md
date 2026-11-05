@@ -33,6 +33,7 @@ const TableSchema({
   bool isGlobal = false,
   String? tableId,
   TableTtlConfig? ttlConfig,
+  TableCapacityConfig? capacityConfig,
 });
 ```
 
@@ -46,6 +47,7 @@ const TableSchema({
 | `foreignKeys` | Optional; see Spaces / TTL / FK module |
 | `isGlobal` | `true` = shared across spaces; data not space-isolated |
 | `ttlConfig` | `null` = TTL off; see TTL module |
+| `capacityConfig` | `null` = capacity eviction off; see Capacity module; MAY combine with `ttlConfig` |
 
 **MUST NOT** use the reserved prefix `_system_` for business table/field names (engine-reserved). Business may use `system_` without the leading underscore.
 
@@ -187,6 +189,7 @@ SchemaBuilder updateSchema(String tableName);
 | `setPrimaryKeyConfig(PrimaryKeyConfig)` | Change PK config |
 | `promoteFieldToPrimaryKey({sourceFieldName, targetPrimaryKeyName?})` | Promote unique non-null field to PK |
 | `setTtlConfig` / `disableTtl` | Table TTL |
+| `setCapacityConfig` / `disableCapacity` | Table capacity eviction (FIFO/LRU) |
 | `addForeignKey` / `removeForeignKey` / `modifyForeignKey` | FKs |
 | `allowAfterDataMigration()` | Allow ops that require post-data migration |
 

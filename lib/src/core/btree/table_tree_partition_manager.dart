@@ -1548,6 +1548,10 @@ final class TableTreePartitionManager {
       packSession = null;
     }
 
+    /// Full pre-toast encode lengths — capacity logical avg (not file HWM).
+    var capacityLogicalBytesSum = 0;
+    var capacityLogicalRecordCount = 0;
+
     if (putOps.isNotEmpty) {
       // Cheap size probe: full encode without toast to see if any row needs it.
       final probeEncoded = await _encodeRecordPayloadsForWrite(
@@ -1556,13 +1560,17 @@ final class TableTreePartitionManager {
         fieldStruct: fieldStruct,
       );
       var anyToast = false;
+      // Must walk all encodes: capacity logical avg needs the full sum.
+      // Do not break on first toast hit (that would undercount the sum).
       for (final encoded in probeEncoded) {
-        if (_dataStore.overflowManager
-            .shouldExternalize(_dataStore.configuredPageSize, encoded.length)) {
+        capacityLogicalBytesSum += encoded.length;
+        if (!anyToast &&
+            _dataStore.overflowManager.shouldExternalize(
+                _dataStore.configuredPageSize, encoded.length)) {
           anyToast = true;
-          break;
         }
       }
+      capacityLogicalRecordCount = probeEncoded.length;
 
       if (!anyToast) {
         for (int i = 0; i < putOps.length; i++) {
@@ -2164,6 +2172,14 @@ final class TableTreePartitionManager {
       sizeDelta: sizeDeltaSum + overflowSizeDeltaSum,
       recordDelta: recordsDeltaSum,
     );
+    // Capacity maxBytes uses count×logicalAvg (encode lengths), not file HWM.
+    if (capacityLogicalRecordCount > 0 && capacityLogicalBytesSum > 0) {
+      _dataStore.tableDataManager.recordCapacityLogicalSizeSample(
+        table,
+        totalLogicalBytes: capacityLogicalBytesSum,
+        recordCount: capacityLogicalRecordCount,
+      );
+    }
 
     // Partition 0 page 0 carries tree-global metadata + local partition stats.
     // Local size must use the same rule as the loop above: btreeNextPageNo only

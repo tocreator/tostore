@@ -34,18 +34,21 @@ RFC 2119 keywords apply.
 
 12. `ttl` and `expiresAt` MUST NOT be passed together on the same set operation.
 13. Cross-space shared keys MUST set `isGlobal: true`.
+13a. KV capacity eviction is configured only via `DataStoreConfig.kvCapacityConfig` / `globalKvCapacityConfig` — MUST NOT invent per-`set` capacity parameters.
 
 ## Schema and keys
 
 14. Schema evolution SHOULD use declarative schemas and/or `updateSchema` chain; avoid inventing manual file migrations.
 15. `getVersion` / `setVersion` are user bookkeeping only; they MUST NOT be treated as engine migration drivers.
 16. `EncryptionConfig.encryptionKey` rotation uses `rotateEncryptionKey`. Data re-encryption uses `encodingKey` change (engine migrates). Agents MUST NOT confuse the two.
+16a. Table `ttlConfig` and `capacityConfig` MAY be combined. Agents MUST NOT confuse `cacheMemoryBudgetMB` (memory cache size) with `CapacityConfig` (max record/keys).
 
 ## Performance (application code)
 
 17. Agents SHOULD prefer indexed predicates, cursors/pagination, and `batch*` APIs for large writes.
 18. Agents SHOULD avoid loading unbounded result sets; use `limit` / `cursor` / streaming.
 19. For UI, prefer `watch` / `watchValue` over polling.
+
 
 ## Documentation discipline
 

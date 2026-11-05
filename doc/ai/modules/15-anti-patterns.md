@@ -45,6 +45,12 @@ Common mistakes when generating ToStore client code. Prefer the ✅ form.
 - ❌ Expecting space-local key to be visible after `switchSpace` without `isGlobal: true`
 - ✅ Use `isGlobal: true` for cross-space values (e.g. login state)
 
+- ❌ Inventing per-`kv.set` capacity / maxEntries parameters
+- ✅ Configure `DataStoreConfig.kvCapacityConfig` / `globalKvCapacityConfig`
+
+- ❌ Confusing `cacheMemoryBudgetMB` with table/KV `CapacityConfig`
+- ✅ `cacheMemoryBudgetMB` = memory cache size; `CapacityConfig` = max records/keys to keep
+
 ## Queries
 
 - ❌ Unbounded `await db.query('huge_table');` on large tables

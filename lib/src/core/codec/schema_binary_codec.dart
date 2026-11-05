@@ -20,6 +20,7 @@ abstract final class TableSchemaFieldId {
   static const int schemaVersion = 10;
   static const int isSystemTable = 11;
   static const int autoIndexes = 12;
+  static const int capacityConfig = 13;
   // Reserved 20--31.
 }
 
@@ -69,6 +70,14 @@ abstract final class SequentialIdConfigFieldId {
 abstract final class TableTtlConfigFieldId {
   static const int ttlMs = 1;
   static const int sourceField = 2;
+}
+
+abstract final class CapacityConfigFieldId {
+  static const int maxEntries = 1;
+  static const int maxBytes = 2;
+  static const int policy = 3;
+  static const int evictRatio = 4;
+  static const int sourceField = 5;
 }
 
 abstract final class VectorFieldConfigFieldId {
@@ -163,6 +172,11 @@ abstract final class SchemaBinaryCodec {
         writeTableTtlConfig(sw, schema.ttlConfig!);
       });
     }
+    if (schema.capacityConfig != null) {
+      w.writeMessage(TableSchemaFieldId.capacityConfig, (sw) {
+        writeCapacityConfig(sw, schema.capacityConfig!);
+      });
+    }
     if (schema.tableUid.isNotEmpty) {
       w.writeFieldTag(TableSchemaFieldId.tableUid, WireType.lengthDelimited);
       w.writeString(schema.tableUid.value);
@@ -194,6 +208,7 @@ abstract final class SchemaBinaryCodec {
     var isGlobal = false;
     String? tableId;
     TableTtlConfig? ttlConfig;
+    TableCapacityConfig? capacityConfig;
     var tableUid = TableUid.empty;
     String? schemaVersion;
     var isSystemTable = false;
@@ -237,6 +252,11 @@ abstract final class SchemaBinaryCodec {
             ttlConfig = readTableTtlConfig(nr);
           });
           break;
+        case TableSchemaFieldId.capacityConfig:
+          r.readMessage((nr, _) {
+            capacityConfig = readCapacityConfig(nr);
+          });
+          break;
         case TableSchemaFieldId.tableUid:
           tableUid = TableUid(r.readString());
           break;
@@ -268,6 +288,7 @@ abstract final class SchemaBinaryCodec {
       isGlobal: isGlobal,
       tableId: tableId,
       ttlConfig: ttlConfig,
+      capacityConfig: capacityConfig,
       tableUid: tableUid,
       schemaVersion: schemaVersion,
       isSystemTable: isSystemTable,
@@ -658,6 +679,70 @@ abstract final class SchemaBinaryCodec {
       }
     }
     return TableTtlConfig(ttlMs: ttlMs, sourceField: sourceField);
+  }
+
+  // -- CapacityConfig -------------------------------------------------------
+
+  static void writeCapacityConfig(BinaryWriter w, CapacityConfig config) {
+    if (config.maxEntries != null) {
+      w.writeFieldTag(CapacityConfigFieldId.maxEntries, WireType.varint);
+      w.writeVarint(config.maxEntries!);
+    }
+    if (config.maxBytes != null) {
+      w.writeFieldTag(CapacityConfigFieldId.maxBytes, WireType.varint);
+      w.writeVarint(config.maxBytes!);
+    }
+    w.writeFieldTag(CapacityConfigFieldId.policy, WireType.varint);
+    w.writeVarint(config.policy.index);
+    w.writeFieldTag(CapacityConfigFieldId.evictRatio, WireType.fixed64);
+    w.writeDouble(config.evictRatio);
+    if (config.sourceField != null && config.sourceField!.isNotEmpty) {
+      w.writeFieldTag(
+          CapacityConfigFieldId.sourceField, WireType.lengthDelimited);
+      w.writeString(config.sourceField!);
+    }
+  }
+
+  static CapacityConfig readCapacityConfig(BinaryReader r) {
+    int? maxEntries;
+    int? maxBytes;
+    var policy = CapacityEvictionPolicy.fifo;
+    var evictRatio = CapacityConfig.defaultEvictRatio;
+    String? sourceField;
+    while (!r.isEOF) {
+      final (fid, wireType) = r.readFieldTag();
+      switch (fid) {
+        case CapacityConfigFieldId.maxEntries:
+          maxEntries = r.readVarint();
+          break;
+        case CapacityConfigFieldId.maxBytes:
+          maxBytes = r.readVarint();
+          break;
+        case CapacityConfigFieldId.policy:
+          policy = _enumAt(
+            CapacityEvictionPolicy.values,
+            r.readVarint(),
+            CapacityEvictionPolicy.fifo,
+          );
+          break;
+        case CapacityConfigFieldId.evictRatio:
+          evictRatio = r.readDouble();
+          break;
+        case CapacityConfigFieldId.sourceField:
+          sourceField = r.readString();
+          break;
+        default:
+          r.skipField(wireType);
+          break;
+      }
+    }
+    return CapacityConfig(
+      maxEntries: maxEntries,
+      maxBytes: maxBytes,
+      policy: policy,
+      evictRatio: evictRatio,
+      sourceField: sourceField,
+    );
   }
 
   // -- Vector configs -------------------------------------------------------

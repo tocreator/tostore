@@ -158,7 +158,7 @@ Dependendo do intervalo de `code` / `codeKey` e da subclasse específica de `Res
 
 ### 4.3 SchemaValidationStatus (Validação de esquema de tabela & migração incompatível)
 
-- **Intervalo de Categoria**: `code` dentro de `[30000, 39999]` — `30000–30013` validação estática de schema, `31001–31006` proteções de migração.
+- **Intervalo de Categoria**: `code` dentro de `[30000, 39999]` — `30000–30014` validação estática de schema, `31001–31006` proteções de migração.
 - **Definição de Campo Dedicado**:
 
   | Campo | Tipo | Detalhes |
@@ -185,6 +185,7 @@ Dependendo do intervalo de `code` / `codeKey` e da subclasse específica de `Res
   | `30011`<br>`devSchemaTableExists` | Tabela já existe | <ul><li>`tableName`: Nome da tabela</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
   | `30012`<br>`devSchemaFieldExists` | Atualização de esquema: adicionando um campo que já existe | <ul><li>`tableName`: Nome da tabela</li><li>`field`: Nome do campo conflitante</li><li>`wrongValue`: `null`</li></ul> |
   | `30013`<br>`devSchemaIndexExists` | Atualização de esquema: adicionando um índice que já existe | <ul><li>`tableName`: Nome da tabela</li><li>`field`: Nome do índice</li><li>`wrongValue`: `null`</li></ul> |
+  | `30014`<br>`devInvalidSchemaCapacityConfig` | Falha na validação da configuração de evicção por capacidade | <ul><li>`tableName`: Nome da tabela (pode ficar vazio para rótulos de config KV)</li><li>`field`: `null`</li><li>`wrongValue`: Map de configuração de capacidade inválida, ex. `{ "maxEntries": null, "maxBytes": null }`</li></ul> |
   | `31001`<br>`devMigrationNotAllowedWithData` | A migração requer modificação de dados e não foi explicitamente permitida | <ul><li>`tableName`: Nome da tabela</li><li>`field`: `null`</li><li>`wrongValue`: Map de diferenças de atualização de migração</li></ul> |
   | `31002`<br>`devMigrationUnsafeTypeConversion` | Migração física: conversão de tipo não suportada para o campo | <ul><li>`tableName`: Nome da tabela</li><li>`field`: Nome do campo</li><li>`wrongValue`: Map de tipos conflitantes, por exemplo `{ "from": "text", "to": "integer" }`</li></ul> |
   | `31003`<br>`devMigrationCannotAddNonNullField` | Não é possível adicionar campo não-nulo sem um valor padrão a uma tabela não vazia | <ul><li>`tableName`: Nome da tabela</li><li>`field`: Nome do campo transgressor</li><li>`wrongValue`: Parâmetros de migração, por exemplo `{ "nullable": false, "defaultValue": null }`</li></ul> |
@@ -515,6 +516,7 @@ Consulte a tabela abaixo para roteamento e análise exatos do status:
 | **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Erro de Desenvolvedor | Tabela já existe |
 | **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Erro de Desenvolvedor | Campo já existe |
 | **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Erro de Desenvolvedor | Índice já existe |
+| **30014** | `DEV_INVALID_SCHEMA_CAPACITY_CONFIG` | `ResultType.devInvalidSchemaCapacityConfig` | Erro de Desenvolvedor | Falha na validação da configuração de evicção por capacidade |
 | **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Erro de Desenvolvedor | A migração requer modificação de dados e não foi explicitamente permitida |
 | **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Erro de Desenvolvedor | Alteração de tipo de dados não suportada para o campo |
 | **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Erro de Desenvolvedor | Não é permitido adicionar campo não-nulo sem valor padrão |

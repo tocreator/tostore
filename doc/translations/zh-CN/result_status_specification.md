@@ -162,7 +162,7 @@
 
 ### 4.3 SchemaValidationStatus（数据库表结构校验与不兼容迁移状态）
 
-- **大类范围**：`code` 处于区间 `[30000, 39999]`（`30000–30013` 为 Schema 静态校验，`31001–31006` 为迁移防护）。
+- **大类范围**：`code` 处于区间 `[30000, 39999]`（`30000–30014` 为 Schema 静态校验，`31001–31006` 为迁移防护）。
 - **专属字段定义**：
 
   | 专属字段 (Field) | 类型 (Type) | 字段含义及填充规则 (Details)                                                                     |
@@ -189,6 +189,7 @@
   | `30011`<br>`devSchemaTableExists` | 创建表冲突，目标表已经存在 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
   | `30012`<br>`devSchemaFieldExists` | 结构升级中，添加了已经存在的同名字段 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 冲突的字段名</li><li>`wrongValue`: `null`</li></ul> |
   | `30013`<br>`devSchemaIndexExists` | 追加了同名的索引配置 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 索引名称</li><li>`wrongValue`: `null`</li></ul> |
+  | `30014`<br>`devInvalidSchemaCapacityConfig` | 容量淘汰配置校验失败 | <ul><li>`tableName`: 数据库表名（KV 配置标签场景下可为空）</li><li>`field`: `null`</li><li>`wrongValue`: 无效的容量配置 Map，如 `{ "maxEntries": null, "maxBytes": null }`</li></ul> |
   | `31001`<br>`devMigrationNotAllowedWithData` | 结构物理迁移要求对已有数据表进行列修改/删除等有损物理变动，但调用未显式授权允许物理迁移 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: 进行迁移的升级差异集</li></ul> |
   | `31002`<br>`devMigrationUnsafeTypeConversion` | 物理迁移：不支持且极高风险的数据类型转换操作 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 字段名</li><li>`wrongValue`: 迁移时发生转换冲突的类型参数，如 `{ "from": "text", "to": "integer" }`</li></ul> |
   | `31003`<br>`devMigrationCannotAddNonNullField` | 无法对已有数据的表追加不带 default 值的非空 (NOT NULL) 字段 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 试图添加的非空字段名</li><li>`wrongValue`: 冲突的迁移参数，如 `{ "nullable": false, "defaultValue": null }`</li></ul> |
@@ -520,6 +521,7 @@ try {
 | **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | 开发者错误 | 创建表冲突，目标表已经存在 |
 | **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | 开发者错误 | 结构升级中，添加了已经存在的同名字段 |
 | **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | 开发者错误 | 追加了同名的索引配置 |
+| **30014** | `DEV_INVALID_SCHEMA_CAPACITY_CONFIG` | `ResultType.devInvalidSchemaCapacityConfig` | 开发者错误 | 容量淘汰配置校验失败 |
 | **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | **致命错误** | 结构迁移需要物理变更字段但未被显式允许（`allowPhysicalMigration=false`） |
 | **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | **致命错误** | 物理迁移：不支持且极高风险的数据类型转换操作 |
 | **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | **致命错误** | 无法对已有数据的表追加不带 default 值的非空 (NOT NULL) 字段 |

@@ -139,4 +139,29 @@ abstract final class WmbpTokenizer {
     if (term.length != 2) return false;
     return isCjk(term.codeUnitAt(0)) && isCjk(term.codeUnitAt(1));
   }
+
+  /// True when [term] is a pure CJK run of length `>= 3` (BMP).
+  ///
+  /// Pre-tokenized queries expand these with [addOverlappingCjkBigrams] (bigrams
+  /// only — no automatic unigrams). Contiguity comes from the caller string.
+  static bool isLongPureCjk(String term) {
+    final int n = term.length;
+    if (n < 3) return false;
+    for (int i = 0; i < n; i++) {
+      if (!isCjk(term.codeUnitAt(i))) return false;
+    }
+    return true;
+  }
+
+  /// Adds overlapping CJK bigrams from a pure CJK [term] into [counts].
+  ///
+  /// Does not emit unigrams. No-op when [term] is not [isLongPureCjk].
+  static void addOverlappingCjkBigrams(String term, Map<String, int> counts) {
+    if (!isLongPureCjk(term)) return;
+    final units = term.codeUnits;
+    for (int i = 1; i < units.length; i++) {
+      final key = String.fromCharCodes(<int>[units[i - 1], units[i]]);
+      counts[key] = (counts[key] ?? 0) + 1;
+    }
+  }
 }

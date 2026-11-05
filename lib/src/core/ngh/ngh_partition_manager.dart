@@ -1513,6 +1513,7 @@ final class NghPartitionManager {
       table,
       sizeDelta: sizeDeltaSum,
       entryDelta: vectorsDelta,
+      indexUid: indexUid,
     );
 
     await _stagePartitionMeta(leafStats, leafPageSize, updatedMeta, stageWrite,

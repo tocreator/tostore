@@ -145,6 +145,19 @@ class TableDataManager {
   int? _lastFlushAvgTableRecordSizeBytes;
   int? _lastFlushAvgIndexEntrySizeBytes;
 
+  /// Per-table **logical** record-payload average for capacity `maxBytes`.
+  ///
+  /// Fed from encode/toast payload lengths on flush (not file HWM).
+  /// Process-lifetime memory — no meta migration.
+  final Map<String, int> _capacityLogicalAvgBytes = {};
+
+  /// Per-table, per-index last sampled bytes-per-record for capacity `maxBytes`.
+  ///
+  /// Keyed `tableUid -> (indexUid -> avgBytesPerRecord)`. Summed into the
+  /// capacity avg so indexes (incl. vector) are counted without using sticky
+  /// index file HWM totals.
+  final Map<String, Map<String, int>> _capacityIndexBytesPerRecordByIndex = {};
+
   /// Upgrade: old KV lacked [SpaceStats.totalIndexEntryCount] while index bytes
   /// were already tracked -- force one full reconcile to seed the denominator.
   bool _indexEntryBaselinePending = false;
@@ -511,6 +524,8 @@ class TableDataManager {
 
     // Also remove from record count cache
     _tableRecordCounts.remove(table.tableUid);
+    _capacityLogicalAvgBytes.remove(table.tableUid);
+    _capacityIndexBytesPerRecordByIndex.remove(table.tableUid);
     _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
   }
 
@@ -523,6 +538,119 @@ class TableDataManager {
   /// Remove record count cache for all tables.
   void removeRecordCountCacheAll() {
     _tableRecordCounts.clear();
+  }
+
+  /// Process-lifetime capacity avg: record payload + sampled index bytes/record.
+  ///
+  /// Returns null until a record payload sample exists (disk put flush, or
+  /// memory-mode [ensureCapacityLogicalAvgFromMemoryCache] on eviction poll).
+  /// Index addon may still be 0 until index flush samples land.
+  int? getCapacityLogicalAvgBytesSync(TableContext table) {
+    final recordAvg = _capacityLogicalAvgBytes[table.tableUid];
+    if (recordAvg == null || recordAvg <= 0) return null;
+    final indexAvg = _capacityIndexBytesPerRecordSum(table.tableUid);
+    return recordAvg + indexAvg;
+  }
+
+  int _capacityIndexBytesPerRecordSum(String tableUid) {
+    final byIndex = _capacityIndexBytesPerRecordByIndex[tableUid];
+    if (byIndex == null || byIndex.isEmpty) return 0;
+    var sum = 0;
+    for (final v in byIndex.values) {
+      if (v > 0) sum += v;
+    }
+    return sum;
+  }
+
+  /// O(1) capacity occupancy estimate: `recordCount × (recordAvg + indexAvg)`.
+  ///
+  /// Null when count or record avg is not yet in memory — callers skip the
+  /// bytes dimension (never fall back to file HWM / overflowTotalSizeBytes).
+  int? estimateCapacityBytesSync(TableContext table) {
+    final count = getTableRecordCountSync(table);
+    final avg = getCapacityLogicalAvgBytesSync(table);
+    if (count == null || avg == null) return null;
+    return count * avg;
+  }
+
+  /// Update per-table capacity record-payload average from encode/toast lengths.
+  ///
+  /// Disk: table writeChanges after put encode. Memory: eviction poll via
+  /// [ensureCapacityLogicalAvgFromMemoryCache] (not the write hot path).
+  void recordCapacityLogicalSizeSample(
+    TableContext table, {
+    required int totalLogicalBytes,
+    required int recordCount,
+  }) {
+    if (recordCount <= 0 || totalLogicalBytes <= 0) return;
+    final batchAvg = max(1, totalLogicalBytes ~/ recordCount);
+    final prev = _capacityLogicalAvgBytes[table.tableUid];
+    if (prev == null || prev <= 0) {
+      _capacityLogicalAvgBytes[table.tableUid] = batchAvg;
+      return;
+    }
+    _capacityLogicalAvgBytes[table.tableUid] =
+        max(1, ((batchAvg * 3) + prev) ~/ 4);
+  }
+
+  /// Cold-path sample for memory-mode `maxBytes` when put-encode never runs.
+  ///
+  /// No-op if avg already warm or the record cache is empty. Call only from
+  /// capacity eviction (not insert/update).
+  Future<void> ensureCapacityLogicalAvgFromMemoryCache(
+    TableContext table, {
+    int maxSamples = 16,
+  }) async {
+    final existing = _capacityLogicalAvgBytes[table.tableUid];
+    if (existing != null && existing > 0) return;
+    if (maxSamples <= 0) return;
+    if (_tableRecordCache.maxByteThreshold <= 0) return;
+
+    var total = 0;
+    var n = 0;
+    await _tableRecordCache.scanRange(
+      [table.tableUid],
+      null,
+      onEntry: (_, value) {
+        total += estimateRecordSizeBytes(value);
+        n++;
+        return n < maxSamples;
+      },
+    );
+    if (n > 0) {
+      recordCapacityLogicalSizeSample(
+        table,
+        totalLogicalBytes: total,
+        recordCount: n,
+      );
+    }
+  }
+
+  /// Update one index's bytes-per-record contribution for capacity `maxBytes`.
+  ///
+  /// [bytesPerRecord] is typically `sizeDelta ~/ entryDelta` from that index's
+  /// flush (one entry ≈ one table row for btree/vector inserts).
+  void recordCapacityIndexSizeSample(
+    TableContext table, {
+    required IndexUid indexUid,
+    required int bytesPerRecord,
+  }) {
+    if (indexUid.isEmpty || bytesPerRecord <= 0) return;
+    final byIndex = _capacityIndexBytesPerRecordByIndex.putIfAbsent(
+      table.tableUid,
+      () => <String, int>{},
+    );
+    final prev = byIndex[indexUid.value];
+    if (prev == null || prev <= 0) {
+      byIndex[indexUid.value] = bytesPerRecord;
+      return;
+    }
+    byIndex[indexUid.value] = max(1, ((bytesPerRecord * 3) + prev) ~/ 4);
+  }
+
+  void clearCapacityLogicalAvg(TableContext table) {
+    _capacityLogicalAvgBytes.remove(table.tableUid);
+    _capacityIndexBytesPerRecordByIndex.remove(table.tableUid);
   }
 
   /// Evict a ratio of table record cache entries under memory pressure.
@@ -983,14 +1111,24 @@ class TableDataManager {
     TableContext table, {
     int sizeDelta = 0,
     int entryDelta = 0,
+    IndexUid? indexUid,
   }) {
     if (!_contributesToSpaceStats(table)) return;
     if (sizeDelta == 0 && entryDelta == 0) return;
     if (sizeDelta != 0) _deltaIndexDataSizeBytes += sizeDelta;
     if (entryDelta != 0) _deltaIndexEntryCount += entryDelta;
     if (entryDelta > 0 && sizeDelta > 0) {
-      _lastFlushAvgIndexEntrySizeBytes = sizeDelta ~/ entryDelta;
+      final perEntry = sizeDelta ~/ entryDelta;
+      _lastFlushAvgIndexEntrySizeBytes = perEntry;
       _refreshFlushRecordSizeSample();
+      // Capacity maxBytes: attribute this index's growth per row (not file HWM).
+      if (indexUid != null && indexUid.isNotEmpty && perEntry > 0) {
+        recordCapacityIndexSizeSample(
+          table,
+          indexUid: indexUid,
+          bytesPerRecord: perEntry,
+        );
+      }
     }
     _needSaveStats = true;
   }
@@ -1505,6 +1643,8 @@ class TableDataManager {
       _tableRecordCache.clear();
       _tableDataMetaCache.clear();
       _tableRecordCounts.clear();
+      _capacityLogicalAvgBytes.clear();
+      _capacityIndexBytesPerRecordByIndex.clear();
       _recordCountLoadingFutures.clear();
       _metaLoadingFutures.clear();
       _dataStore.writeBufferManager.clearAllTransactionBuffers();
@@ -2214,6 +2354,12 @@ class TableDataManager {
 
       if (successIds.isNotEmpty && !deferQueryCacheInvalidation) {
         _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
+      }
+
+      // Memory mode never hits PJM flush wake; batch growth only (not
+      // per-row addToBufferSync) so capacity is not polled every insert.
+      if (successIds.isNotEmpty && operation == BufferOperationType.insert) {
+        _dataStore.maybeWakeCapacityEviction(table);
       }
 
       return (successRecordIds: successIds, failedRecordIds: failedIds);

@@ -350,6 +350,7 @@ enum MigrationType {
   renameTable,
   setPrimaryKeyConfig,
   setTableTtlConfig,
+  setTableCapacityConfig,
   dropTable,
   addForeignKey,
   removeForeignKey,
@@ -565,6 +566,8 @@ class MigrationOperation {
   final PrimaryKeyConfig? oldPrimaryKeyConfig;
   final TableTtlConfig? ttlConfig;
   final TableTtlConfig? oldTtlConfig;
+  final TableCapacityConfig? capacityConfig;
+  final TableCapacityConfig? oldCapacityConfig;
   final ForeignKeySchema? foreignKey;
   final String? foreignKeyName;
   final ForeignKeySchema? oldForeignKey;
@@ -591,6 +594,8 @@ class MigrationOperation {
     this.oldPrimaryKeyConfig,
     this.ttlConfig,
     this.oldTtlConfig,
+    this.capacityConfig,
+    this.oldCapacityConfig,
     this.foreignKey,
     this.foreignKeyName,
     this.oldForeignKey,
@@ -614,6 +619,8 @@ class MigrationOperation {
       'oldPrimaryKeyConfig': oldPrimaryKeyConfig?.toJson(),
       'ttlConfig': ttlConfig?.toJson(),
       'oldTtlConfig': oldTtlConfig?.toJson(),
+      'capacityConfig': capacityConfig?.toJson(),
+      'oldCapacityConfig': oldCapacityConfig?.toJson(),
       'foreignKey': foreignKey?.toJson(),
       'foreignKeyName': foreignKeyName,
       'oldForeignKey': oldForeignKey?.toJson(),
@@ -654,6 +661,16 @@ class MigrationOperation {
       oldTtlConfig: json['oldTtlConfig'] != null
           ? TableTtlConfig.fromJson(
               Map<String, dynamic>.from(json['oldTtlConfig'] as Map),
+            )
+          : null,
+      capacityConfig: json['capacityConfig'] != null
+          ? TableCapacityConfig.fromJson(
+              Map<String, dynamic>.from(json['capacityConfig'] as Map),
+            )
+          : null,
+      oldCapacityConfig: json['oldCapacityConfig'] != null
+          ? TableCapacityConfig.fromJson(
+              Map<String, dynamic>.from(json['oldCapacityConfig'] as Map),
             )
           : null,
       foreignKey: json['foreignKey'] != null

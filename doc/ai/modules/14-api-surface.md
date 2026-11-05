@@ -102,7 +102,7 @@ import 'package:tostore/tostore.dart';
 | `UpdateBuilder` | `update` | set*, compute, allow*, inherits ChainBuilder where* |
 | `DeleteBuilder` | `delete` | allowDeleteAll, allowLargeScaleOperation, where* |
 | `StreamQueryBuilder` | `streamQuery` | where*, select, stream/listen |
-| `SchemaBuilder` | `updateSchema` | add/remove/rename/modify field/index/FK/TTL/PK |
+| `SchemaBuilder` | `updateSchema` | add/remove/rename/modify field/index/FK/TTL/capacity/PK |
 | `KvQueryBuilder` | `kv.query` | prefix, orderBy*, limit, offset, cursor, peek |
 
 ### ChainBuilder predicate surface
@@ -122,7 +122,7 @@ Agents MAY import these via `package:tostore/tostore.dart`:
 | `status_provider.dart` | `DbStatus` |
 | `backup_scope.dart` | `BackupScope` |
 | `config_info.dart` | `ConfigInfo` |
-| `data_store_config.dart` | `DataStoreConfig`, `PersistenceMode`, `DistributedNodeConfig`, `TransactionIsolationLevel`, `RecoveryDurability`, `EncryptionType`, `EncryptionScope`, `EncryptionConfig` |
+| `data_store_config.dart` | `DataStoreConfig`, `PersistenceMode`, `DistributedNodeConfig`, `TransactionIsolationLevel`, `RecoveryDurability`, `EncryptionType`, `EncryptionScope`, `EncryptionConfig` (also `kvCapacityConfig` / `globalKvCapacityConfig`) |
 | `db_exception.dart` | `DbException`, `DbClosedException` |
 | `db_result.dart` | `DbResult` |
 | `db_startup_stage.dart` | `DbStartupStage`, `StartupProgressCallback` |
@@ -138,7 +138,7 @@ Agents MAY import these via `package:tostore/tostore.dart`:
 | `schema_update_result.dart` | `SchemaUpdateResult` |
 | `space_info.dart` | `SpaceInfo` |
 | `table_info.dart` | `TableInfo` |
-| `table_schema.dart` | `TableSchema`, `FieldSchema`, `IndexSchema`, `TableTtlConfig`, `DataType`, `IndexType`, `DefaultValueType`, `PrimaryKeyType`, `SequentialIdConfig`, `PrimaryKeyConfig`, `VectorData`, `VectorFieldConfig`, `VectorIndexType`, `VectorDistanceMetric`, `VectorIndexConfig`, `ForeignKeyCascadeAction`, `ForeignKeySchema`, … |
+| `table_schema.dart` | `TableSchema`, `FieldSchema`, `IndexSchema`, `TableTtlConfig`, `CapacityConfig`, `CapacityEvictionPolicy`, `TableCapacityConfig`, `KvCapacityConfig`, `DataType`, `IndexType`, `DefaultValueType`, `PrimaryKeyType`, `SequentialIdConfig`, `PrimaryKeyConfig`, `VectorData`, `VectorFieldConfig`, `VectorIndexType`, `VectorDistanceMetric`, `VectorIndexConfig`, `ForeignKeyCascadeAction`, `ForeignKeySchema`, … |
 | `text_query.dart` | `TextQuery`, `TextTerm`, `TextMatchOperator` |
 | `sparse_vector_data.dart` | `SparseVectorData` |
 | `transaction_result.dart` | `TransactionResult`, `TransactionStatus`, `TransactionErrorType`, `TransactionError` |

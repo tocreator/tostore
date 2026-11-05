@@ -1557,6 +1557,7 @@ final class IndexTreePartitionManager {
       table,
       sizeDelta: sizeDeltaSum,
       entryDelta: entriesDeltaSum,
+      indexUid: indexUid,
     );
 
     // Partition 0 page 0 carries index-global metadata + local partition stats.

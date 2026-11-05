@@ -22,6 +22,7 @@ class TableSchema {
   static const String internalSystemPrefix = '_system_';
 
   /// Internal virtual field name for TTL ingest-time source.
+  /// Also used as FIFO capacity order when the primary key is not monotonic.
   static const String internalTtlIngestTsMsField = '_system_ingest_ts_ms';
 
   /// Table name
@@ -56,8 +57,14 @@ class TableSchema {
 
   /// Table-level TTL config.
   /// - null: TTL disabled
-  /// - sourceField == null: use internal `_system_ingest_ts_ms`
+  /// Prefer an explicit [TableTtlConfig.sourceField]. Omitting it (virtual
+  /// `_system_ingest_ts_ms`) is grandfathered for online tables only.
   final TableTtlConfig? ttlConfig;
+
+  /// Table-level capacity eviction config (FIFO/LRU).
+  /// - null: capacity eviction disabled
+  /// May be combined with [ttlConfig]; uses independent time fields.
+  final TableCapacityConfig? capacityConfig;
 
   /// List of automatically generated / implicit indexes
   final List<IndexSchema>? autoIndexes;
@@ -72,6 +79,7 @@ class TableSchema {
     this.isGlobal = false,
     this.tableId,
     this.ttlConfig,
+    this.capacityConfig,
   })  : tableUid = TableUid.empty,
         schemaVersion = null,
         isSystemTable = false,
@@ -87,6 +95,7 @@ class TableSchema {
     required this.isGlobal,
     this.tableId,
     this.ttlConfig,
+    this.capacityConfig,
     this.tableUid = TableUid.empty,
     this.schemaVersion,
     required this.isSystemTable,
@@ -103,6 +112,7 @@ class TableSchema {
     bool isGlobal = false,
     String? tableId,
     TableTtlConfig? ttlConfig,
+    TableCapacityConfig? capacityConfig,
     TableUid tableUid = TableUid.empty,
     String? schemaVersion,
     bool isSystemTable = false,
@@ -117,6 +127,7 @@ class TableSchema {
       isGlobal: isGlobal,
       tableId: tableId,
       ttlConfig: ttlConfig,
+      capacityConfig: capacityConfig,
       tableUid: tableUid,
       schemaVersion: schemaVersion,
       isSystemTable: isSystemTable,
@@ -140,6 +151,7 @@ class TableSchema {
         isGlobal: isGlobal,
         tableId: tableId,
         ttlConfig: ttlConfig,
+        capacityConfig: capacityConfig,
         tableUid: tableUid.isNotEmpty
             ? tableUid
             : TableUid(GlobalIdGenerator.generate('t')),
@@ -159,6 +171,7 @@ class TableSchema {
       isGlobal: cleaned.isGlobal,
       tableId: cleaned.tableId,
       ttlConfig: cleaned.ttlConfig,
+      capacityConfig: cleaned.capacityConfig,
       tableUid: TableUid(GlobalIdGenerator.generate('t')),
       schemaVersion: schemaVersion,
       isSystemTable: false,
@@ -178,6 +191,7 @@ class TableSchema {
       isGlobal: isGlobal,
       tableId: tableId,
       ttlConfig: ttlConfig,
+      capacityConfig: capacityConfig,
       tableUid: TableUid.empty,
       schemaVersion: null,
       isSystemTable: false,
@@ -530,6 +544,38 @@ class TableSchema {
       }
     }
 
+    final capacity = capacityConfig;
+    if (capacity != null) {
+      // LRU, or FIFO + PrimaryKeyType.none: index the user datetime sourceField.
+      // Other FIFO primary key types use primary-key order (no extra index).
+      // Never create `_system_ingest_ts_ms` for capacity.
+      final capacityFields = <String>[];
+      final capField = capacity.sourceField;
+      if (capField != null &&
+          capField.isNotEmpty &&
+          (capacity.policy == CapacityEvictionPolicy.lru ||
+              capacity.needsFifoSourceFieldIndex(primaryKeyConfig.type))) {
+        capacityFields.add(capField);
+      }
+      for (final capField in capacityFields) {
+        final alreadyCovered = indexes.any(
+                (i) => i.fields.isNotEmpty && i.fields.first == capField) ||
+            implicitIndexes
+                .any((i) => i.fields.isNotEmpty && i.fields.first == capField);
+        if (!alreadyCovered) {
+          final capIndex = IndexSchema(
+            indexName: capField,
+            fields: [capField],
+            unique: false,
+          );
+          if (!existingIndexNames.contains(capIndex.actualIndexName)) {
+            implicitIndexes.add(capIndex);
+            existingIndexNames.add(capIndex.actualIndexName);
+          }
+        }
+      }
+    }
+
     for (final fk in foreignKeys) {
       if (!fk.enabled || !fk.autoCreateIndex) continue;
 
@@ -568,11 +614,17 @@ class TableSchema {
   }
 
   /// Validate table schema
+  ///
+  /// [requireTtlSourceField] when true, [TableTtlConfig.sourceField] must be
+  /// set (new tables / newly enabling TTL). When false, omitted sourceField
+  /// remains allowed for online tables that already use the virtual ingest
+  /// index (`_system_ingest_ts_ms`).
   bool validateTableSchema({
     Set<String> reservedTableNames = const <String>{},
     bool allowReservedTableNames = false,
     bool allowInternalTableNamePrefix = false,
     bool allowOtherInternalFields = false,
+    bool requireTtlSourceField = false,
   }) {
     // validate name format
     final tableNameRegex = allowInternalTableNamePrefix
@@ -654,7 +706,7 @@ class TableSchema {
             SchemaValidationStatus(
               type: ResultType.devInvalidSchemaFieldName,
               message:
-                  'Field "${field.name}" in table "$name" is reserved for internal TTL management and cannot be user-defined.',
+                  'Field "${field.name}" in table "$name" is reserved for internal TTL/FIFO management and cannot be user-defined.',
               tableName: name,
               field: field.name,
             )
@@ -804,7 +856,13 @@ class TableSchema {
     // Validate table TTL configuration
     final ttl = ttlConfig;
     if (ttl != null) {
-      ttl.checkTtlConfig(this);
+      ttl.checkTtlConfig(this, requireSourceField: requireTtlSourceField);
+    }
+
+    // Validate table capacity configuration
+    final capacity = capacityConfig;
+    if (capacity != null) {
+      capacity.checkCapacityConfig(this);
     }
 
     return true;
@@ -1272,6 +1330,9 @@ class TableSchema {
     bool? isGlobal,
     String? tableId,
     TableTtlConfig? ttlConfig,
+    bool clearTtlConfig = false,
+    TableCapacityConfig? capacityConfig,
+    bool clearCapacityConfig = false,
     TableUid? tableUid,
     String? schemaVersion,
     bool? isSystemTable,
@@ -1285,7 +1346,9 @@ class TableSchema {
       foreignKeys: foreignKeys ?? this.foreignKeys,
       isGlobal: isGlobal ?? this.isGlobal,
       tableId: tableId ?? this.tableId,
-      ttlConfig: ttlConfig ?? this.ttlConfig,
+      ttlConfig: clearTtlConfig ? null : (ttlConfig ?? this.ttlConfig),
+      capacityConfig:
+          clearCapacityConfig ? null : (capacityConfig ?? this.capacityConfig),
       tableUid: tableUid ?? this.tableUid,
       schemaVersion: schemaVersion ?? this.schemaVersion,
       isSystemTable: isSystemTable ?? this.isSystemTable,
@@ -1303,6 +1366,7 @@ class TableSchema {
       'isGlobal': isGlobal,
       if (tableId != null) 'tableId': tableId,
       if (ttlConfig != null) 'ttlConfig': ttlConfig!.toJson(),
+      if (capacityConfig != null) 'capacityConfig': capacityConfig!.toJson(),
       'tableUid': tableUid,
       if (schemaVersion != null) 'schemaVersion': schemaVersion,
       if (isSystemTable) 'isSystemTable': isSystemTable,
@@ -1357,6 +1421,10 @@ class TableSchema {
       tableId: json['tableId'] as String?,
       ttlConfig: json['ttlConfig'] is Map<String, dynamic>
           ? TableTtlConfig.fromJson(json['ttlConfig'] as Map<String, dynamic>)
+          : null,
+      capacityConfig: json['capacityConfig'] is Map<String, dynamic>
+          ? CapacityConfig.fromJson(
+              json['capacityConfig'] as Map<String, dynamic>)
           : null,
       tableUid: TableUid((json['tableUid'] as String?) ?? ''),
       schemaVersion: json['schemaVersion'] as String?,
@@ -1568,8 +1636,8 @@ class TableSchema {
       return getPrimaryKeyMatcherType();
     }
 
-    // Backward compatibility: for internal TTL source field, treat it as datetime
-    // even when legacy schema snapshots have not materialized this field yet.
+    // Internal TTL / FIFO ingest virtual field: datetime even when not in
+    // the user field list.
     if (fieldName == internalTtlIngestTsMsField) {
       return MatcherType.datetime;
     }
@@ -1770,6 +1838,19 @@ class TableSchema {
         } else {
           byteBuffer.addByte(0);
         }
+      } else {
+        byteBuffer.addByte(0);
+      }
+
+      // Write capacity config
+      if (schema.capacityConfig != null) {
+        byteBuffer.addByte(1);
+        final cap = schema.capacityConfig!;
+        _addStringToBuffer(byteBuffer, cap.policy.name);
+        _addStringToBuffer(byteBuffer, (cap.maxEntries ?? 0).toString());
+        _addStringToBuffer(byteBuffer, (cap.maxBytes ?? 0).toString());
+        _addStringToBuffer(byteBuffer, cap.evictRatio.toString());
+        _addStringToBuffer(byteBuffer, cap.sourceField ?? '');
       } else {
         byteBuffer.addByte(0);
       }
@@ -2879,14 +2960,14 @@ class IndexSchema {
 /// Table TTL configuration.
 ///
 /// - [ttlMs] is the TTL duration in milliseconds and must be > 0.
-/// - [sourceField] is optional:
-///   - null => use internal `_system_ingest_ts_ms`
-///   - non-null => must point to a non-nullable `DataType.datetime` field
-///
-/// Note:
-/// For custom sourceField, `defaultValueType` must be
-/// `DefaultValueType.currentTimestamp` to ensure automatic timestamp filling
-/// when callers omit this field on insert paths.
+/// - [sourceField]:
+///   - **Required** for new tables and when enabling TTL on an existing table
+///     that did not previously use TTL.
+///   - **Optional only for online compatibility**: tables that already persist
+///     TTL with a null/empty [sourceField] may keep omitting it (virtual
+///     `_system_ingest_ts_ms` index). Prefer migrating to an explicit field.
+///   - When set, must be a non-nullable `DataType.datetime` field with
+///     `DefaultValueType.currentTimestamp`.
 class TableTtlConfig {
   final int ttlMs;
   final String? sourceField;
@@ -2895,6 +2976,26 @@ class TableTtlConfig {
     required this.ttlMs,
     this.sourceField,
   });
+
+  /// Whether validation must require a non-empty [sourceField].
+  ///
+  /// - New table → yes.
+  /// - Existing table enabling TTL for the first time → yes.
+  /// - Existing table that already used omitted sourceField (virtual ingest)
+  ///   → no (grandfather; avoids multi-million-row index rebuilds).
+  /// - Existing table that already had an explicit sourceField → yes.
+  static bool shouldRequireSourceField({
+    required TableTtlConfig? oldTtl,
+    required TableTtlConfig? newTtl,
+    required bool isNewTable,
+  }) {
+    if (newTtl == null) return false;
+    if (isNewTable) return true;
+    if (oldTtl == null) return true;
+    final oldField = oldTtl.sourceField;
+    final oldImplicit = oldField == null || oldField.isEmpty;
+    return !oldImplicit;
+  }
 
   Map<String, dynamic> toJson() {
     return {
@@ -2921,7 +3022,10 @@ class TableTtlConfig {
     );
   }
 
-  void checkTtlConfig(TableSchema schema) {
+  void checkTtlConfig(
+    TableSchema schema, {
+    bool requireSourceField = false,
+  }) {
     if (ttlMs <= 0) {
       throw DbException([
         SchemaValidationStatus(
@@ -2935,6 +3039,19 @@ class TableTtlConfig {
 
     final field = sourceField;
     if (field == null || field.isEmpty) {
+      if (requireSourceField) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaTtlConfig,
+            message: 'TTL sourceField is required for table "${schema.name}". '
+                'Provide a non-nullable DataType.datetime field with '
+                'DefaultValueType.currentTimestamp. Omitting sourceField '
+                'is only allowed for tables that already used that legacy mode.',
+            tableName: schema.name,
+            field: 'sourceField',
+          )
+        ]);
+      }
       return;
     }
 
@@ -2992,6 +3109,283 @@ class TableTtlConfig {
     }
   }
 }
+
+/// User-data capacity eviction policy.
+///
+/// Distinct from engine-internal page/record cache eviction modes.
+enum CapacityEvictionPolicy {
+  /// Evict oldest insertions first.
+  fifo,
+
+  /// Evict least-recently-written records first.
+  ///
+  /// Tables require [CapacityConfig.sourceField]. KV does not use sourceField.
+  lru,
+}
+
+/// Shared capacity eviction configuration for tables and KV stores.
+///
+/// - At least one of [maxEntries] / [maxBytes] must be set and > 0.
+/// - High watermark = max*; low watermark = max* * (1 - [evictRatio]).
+/// - Table [CapacityEvictionPolicy.lru] always requires [sourceField].
+/// - Table [CapacityEvictionPolicy.fifo] requires [sourceField] **only** when
+///   [PrimaryKeyType.none] (no engine-assigned primary key).
+/// - FIFO with any other primary key type must leave [sourceField] null
+///   (evict by primary key order).
+/// - KV capacity configs must leave [sourceField] null (engine-managed).
+class CapacityConfig {
+  static const double defaultEvictRatio = 0.30;
+  static const double minEvictRatio = 0.05;
+  static const double maxEvictRatio = 0.50;
+
+  /// Maximum record/key count. Null = not constrained by count.
+  final int? maxEntries;
+
+  /// Approximate maximum storage size in bytes. Null = not constrained by size.
+  final int? maxBytes;
+
+  /// Eviction policy. Defaults to [CapacityEvictionPolicy.fifo].
+  final CapacityEvictionPolicy policy;
+
+  /// Fraction of capacity to free when over the high watermark.
+  /// Clamped to [[minEvictRatio], [maxEvictRatio]].
+  final double evictRatio;
+
+  /// Table ordering field (user `DataType.datetime`).
+  ///
+  /// Required only for:
+  /// - [CapacityEvictionPolicy.lru]
+  /// - [CapacityEvictionPolicy.fifo] when primary key type is [PrimaryKeyType.none]
+  ///
+  /// Must be null for KV capacity and for FIFO with engine-assigned PKs.
+  final String? sourceField;
+
+  const CapacityConfig({
+    this.maxEntries,
+    this.maxBytes,
+    this.policy = CapacityEvictionPolicy.fifo,
+    double evictRatio = defaultEvictRatio,
+    this.sourceField,
+  }) : evictRatio = evictRatio < minEvictRatio
+            ? minEvictRatio
+            : (evictRatio > maxEvictRatio ? maxEvictRatio : evictRatio);
+
+  /// True when FIFO evicts by ascending primary key (any type except [none]).
+  bool usesPrimaryKeyFifo(PrimaryKeyType pkType) {
+    return policy == CapacityEvictionPolicy.fifo &&
+        pkType != PrimaryKeyType.none;
+  }
+
+  /// True when FIFO + [PrimaryKeyType.none] needs a durable [sourceField] index.
+  bool needsFifoSourceFieldIndex(PrimaryKeyType pkType) {
+    return policy == CapacityEvictionPolicy.fifo &&
+        pkType == PrimaryKeyType.none;
+  }
+
+  int? highEntries() => maxEntries;
+  int? lowEntries() {
+    final high = maxEntries;
+    if (high == null || high <= 0) return null;
+    return (high * (1.0 - evictRatio)).floor().clamp(0, high);
+  }
+
+  int? highBytes() => maxBytes;
+  int? lowBytes() {
+    final high = maxBytes;
+    if (high == null || high <= 0) return null;
+    return (high * (1.0 - evictRatio)).floor().clamp(0, high);
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      if (maxEntries != null) 'maxEntries': maxEntries,
+      if (maxBytes != null) 'maxBytes': maxBytes,
+      'policy': policy.name,
+      'evictRatio': evictRatio,
+      if (sourceField != null) 'sourceField': sourceField,
+    };
+  }
+
+  factory CapacityConfig.fromJson(Map<String, dynamic> json) {
+    final policyName = (json['policy'] as String?) ?? 'fifo';
+    final policy = CapacityEvictionPolicy.values.firstWhere(
+      (e) => e.name == policyName,
+      orElse: () => CapacityEvictionPolicy.fifo,
+    );
+    return CapacityConfig(
+      maxEntries: (json['maxEntries'] as num?)?.toInt(),
+      maxBytes: (json['maxBytes'] as num?)?.toInt(),
+      policy: policy,
+      evictRatio: (json['evictRatio'] as num?)?.toDouble() ?? defaultEvictRatio,
+      sourceField: json['sourceField'] as String?,
+    );
+  }
+
+  CapacityConfig copyWith({
+    int? maxEntries,
+    int? maxBytes,
+    CapacityEvictionPolicy? policy,
+    double? evictRatio,
+    String? sourceField,
+    bool clearMaxEntries = false,
+    bool clearMaxBytes = false,
+    bool clearSourceField = false,
+  }) {
+    return CapacityConfig(
+      maxEntries: clearMaxEntries ? null : (maxEntries ?? this.maxEntries),
+      maxBytes: clearMaxBytes ? null : (maxBytes ?? this.maxBytes),
+      policy: policy ?? this.policy,
+      evictRatio: evictRatio ?? this.evictRatio,
+      sourceField: clearSourceField ? null : (sourceField ?? this.sourceField),
+    );
+  }
+
+  void checkCapacityConfig(TableSchema schema) {
+    final entriesOk = maxEntries != null && maxEntries! > 0;
+    final bytesOk = maxBytes != null && maxBytes! > 0;
+    if (!entriesOk && !bytesOk) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devInvalidSchemaCapacityConfig,
+          message:
+              'Capacity config for table "${schema.name}" requires at least one of maxEntries/maxBytes > 0.',
+          tableName: schema.name,
+          wrongValue: {
+            'maxEntries': maxEntries,
+            'maxBytes': maxBytes,
+          },
+        )
+      ]);
+    }
+
+    final pkType = schema.primaryKeyConfig.type;
+    final field = sourceField;
+    final hasSource = field != null && field.isNotEmpty;
+
+    // FIFO + engine-assigned PK: sourceField is not used (and not allowed).
+    if (usesPrimaryKeyFifo(pkType)) {
+      if (hasSource) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaCapacityConfig,
+            message:
+                'Capacity FIFO for table "${schema.name}": sourceField is only required/allowed when primaryKey type is none, or when policy is lru. '
+                'With primaryKey type ${pkType.name}, omit sourceField (FIFO uses primary key order).',
+            tableName: schema.name,
+            field: field,
+          )
+        ]);
+      }
+      return;
+    }
+
+    // LRU, or FIFO + PrimaryKeyType.none: durable datetime sourceField required.
+    final policyLabel = policy == CapacityEvictionPolicy.lru ? 'LRU' : 'FIFO';
+    if (!hasSource) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devInvalidSchemaCapacityConfig,
+          message: policy == CapacityEvictionPolicy.lru
+              ? 'Capacity LRU for table "${schema.name}" requires sourceField (a DataType.datetime field used for eviction order).'
+              : 'Capacity FIFO for table "${schema.name}" with primaryKey type none requires sourceField (insert-time DataType.datetime; do not update it).',
+          tableName: schema.name,
+        )
+      ]);
+    }
+
+    final matched = schema.fields.where((f) => f.name == field);
+    if (matched.isEmpty) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devInvalidSchemaCapacityConfig,
+          message:
+              'Capacity $policyLabel source field "$field" does not exist in table "${schema.name}".',
+          tableName: schema.name,
+          field: field,
+        )
+      ]);
+    }
+
+    final fieldSchema = matched.first;
+    if (fieldSchema.type != DataType.datetime) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devInvalidSchemaCapacityConfig,
+          message:
+              'Capacity $policyLabel source field "$field" must be DataType.datetime, but got ${fieldSchema.type.name} in table "${schema.name}".',
+          tableName: schema.name,
+          field: field,
+          wrongValue: fieldSchema.type.name,
+        )
+      ]);
+    }
+
+    if (fieldSchema.nullable) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devInvalidSchemaCapacityConfig,
+          message:
+              'Capacity $policyLabel source field "$field" must be non-nullable in table "${schema.name}".',
+          tableName: schema.name,
+          field: field,
+          wrongValue: {'nullable': true},
+        )
+      ]);
+    }
+
+    if (fieldSchema.defaultValueType != DefaultValueType.currentTimestamp) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devInvalidSchemaCapacityConfig,
+          message:
+              'Capacity $policyLabel source field "$field" must use DefaultValueType.currentTimestamp in table "${schema.name}".',
+          tableName: schema.name,
+          field: field,
+          wrongValue: fieldSchema.defaultValueType.name,
+        )
+      ]);
+    }
+  }
+
+  /// Validate for DataStoreConfig KV capacity fields (no table context).
+  void checkKvCapacityConfig({required String label}) {
+    final entriesOk = maxEntries != null && maxEntries! > 0;
+    final bytesOk = maxBytes != null && maxBytes! > 0;
+    if (!entriesOk && !bytesOk) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devInvalidSchemaCapacityConfig,
+          message:
+              'Capacity config "$label" requires at least one of maxEntries/maxBytes > 0.',
+          tableName: '',
+          field: label,
+          wrongValue: {
+            'maxEntries': maxEntries,
+            'maxBytes': maxBytes,
+          },
+        )
+      ]);
+    }
+    if (sourceField != null && sourceField!.isNotEmpty) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devInvalidSchemaCapacityConfig,
+          message:
+              'Capacity config "$label" must not set sourceField (KV capacity is engine-managed).',
+          tableName: '',
+          field: label,
+          wrongValue: sourceField,
+        )
+      ]);
+    }
+  }
+}
+
+/// Table capacity config alias (same shape as [CapacityConfig]).
+typedef TableCapacityConfig = CapacityConfig;
+
+/// KV capacity config alias (same shape as [CapacityConfig]).
+typedef KvCapacityConfig = CapacityConfig;
 
 /// Field data type.
 enum DataType {

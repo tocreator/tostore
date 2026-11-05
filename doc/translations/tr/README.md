@@ -33,12 +33,12 @@
 - [Neden Saklamalı](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum Kılavuzu](#installation) | [KV Modu](#quick-start-kv) | [Tablo Modu](#quick-start-table) | [Bellek Modu](#quick-start-memory)
 - [Şema Tanımı](#schema-definition) | [Dağıtılmış Mimari](#distributed-architecture) | [Basamaklı Yabancı Anahtarlar](#foreign-keys) | [Mobil/Masaüstü](#mobile-integration) | [Sunucu/Aracı](#server-integration) | [Birincil Anahtar Algoritmaları](#primary-key-examples)
 - [Gelişmiş Sorgular (KATIL)](#query-advanced) | [Toplama ve İstatistikler](#aggregation-stats) | [Karmaşık Mantık (Sorgu Durumu)](#query-condition) | [Reaktif Sorgu (izle)](#reactive-query) | [Akış Sorgusu](#streaming-query)
-- [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Kurtarma Garantisi](#recovery-durability) | [Hibrit getirme (yoğun / seyrek / metin)](#hybrid-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Bellek Probu ve Senkron Arama (peek)](#query-peek) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
+- [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Kurtarma Garantisi](#recovery-durability) | [Hibrit getirme (yoğun / seyrek / metin)](#hybrid-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Kapasite temizleme](#capacity-eviction) | [Etkili Sayfalandırma](#query-pagination) | [Bellek Probu ve Senkron Arama (peek)](#query-peek) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
 - [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Katkıda Bulunma](#contribute) | [YZ asistanları](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
 
-ToStore, AGI çağı ve uç zeka senaryoları için tasarlanmış modern bir veri motorudur. Kendi kendini yönlendiren (Self-Routing) düğüm mimarisi üzerine kurulu olan bu sistem, düğümlere yüksek özerklik ve esnek yatay ölçeklenebilirlik sağlarken performansı veri ölçeğinden mantıksal olarak ayırır — uç ve bulut tek düğüm dağıtımları 10 milyar+ ölçeği destekleyecek şekilde tasarlanmıştır.
+ToStore, AGI çağı ve uç zeka senaryoları için tasarlanmış modern bir veri motorudur. Kendi kendini yönlendiren (Self-Routing) düğüm mimarisi üzerine kurulu olan bu sistem, düğümlere yüksek özerklik ve esnek yatay ölçeklenebilirlik sağlarken performansı veri ölçeğinden mantıksal olarak ayırır — uç ve bulutta tek düğüm, trilyon ölçekli yapılandırılmış tablolar ve vektör / seyrek metin getirmede de 10 milyar+ ölçek için tasarlanmıştır.
 
 Çalışma zamanı modellemesi ve engelsiz yürütme yolları, mimari evrimi her zaman çevrimiçi ve iş operasyonlarına tamamen şeffaf tutar — bildirimsel şema değişiklikleri, veri kodlama anahtarı rotasyonu ve büyük ölçekli veri yeniden yapılandırması kesintisiz olarak gerçekleşir. Ajanları ve otomatik işletimi destekler: çalışma zamanında tablo oluşturma, dinamik bellek evrimi ile bunların özerk evrimi ve sürekli yinelemesi — hizmet kesintisi olmadan.
 
@@ -57,7 +57,7 @@ Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca
 - 🧠 **Kendi Kendini Yönlendiren Dağıtık Mimari**
   - Fiziksel adreslemeyi veri ölçeğinden ayıran kendi kendini yönlendiren düğüm mimarisi
   - Yüksek düzeyde özerk düğümler esnek bir veri topolojisi oluşturmak için işbirliği yapar
-  - Esnek yatay ölçeklendirme; tek düğüm dağıtımları 10 milyar+ ölçeği destekleyecek şekilde tasarlanmıştır
+  - Esnek yatay ölçeklendirme; tek düğüm: trilyon ölçekli tablolar, 10 milyar+ vektör
 
 - 🌐 **Birleşik Platformlar Arası Veri Motoru**
   - Mobil, masaüstü, web ve sunucu ortamlarında birleşik API
@@ -65,7 +65,7 @@ Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca
   - Yerel depolamadan uç-bulut işbirliğine kadar eksiksiz veri hattı
 
 - 🔍 **Yapılandırılmış Sorgular ve Hibrit Getirme**
-  - Karmaşık yüklemler, JOIN'ler, toplama işlemleri ve tablo düzeyinde TTL
+  - Karmaşık yüklemler, JOIN'ler, toplama işlemleri, tablo düzeyinde TTL ve kapasite temizleme (FIFO / LRU)
   - Sözcüksel metin, yoğun vektör ve nöral seyrek getirme aynı sorgu zincirinde
   - Çok yollu getirme füzyon sıralaması; puanlar ve kanal tanılaması sonuçta döner
 
@@ -102,7 +102,7 @@ ToStore istemci kodunu bir YZ asistanıyla üretirken, tek dosyalık derlemeyi [
 > **Depolama modunu nasıl seçmelisiniz?**
 > 1. [**Anahtar-Değer Modu (KV)**](#quick-start-kv): Yapılandırma erişimi, dağınık durum yönetimi veya JSON veri depolama için en iyisi. Başlamanın en hızlı yoludur.
 > 2. [**Yapılandırılmış Tablo Modu**](#quick-start-table): Karmaşık sorgular, kısıtlama doğrulama veya büyük ölçekli veri yönetimi gerektiren temel iş verileri için en iyisi. Bütünlük mantığını motora aktararak uygulama katmanı geliştirme ve bakım maliyetlerini önemli ölçüde azaltabilirsiniz.
-> 3. [**Bellek Modu**](#quick-start-memory): Geçici hesaplama, birim testleri veya **ultra hızlı küresel durum yönetimi** için en iyisi. Global sorgular ve `watch` dinleyicilerle, bir yığın global değişkeni muhafaza etmeden uygulama etkileşimini yeniden şekillendirebilirsiniz.
+> 3. [**Bellek Modu**](#quick-start-memory): Geçici hesaplama, birim testleri, sınırlı bellek içi önbellekler (TTL ve FIFO / LRU kapasite temizleme) veya **ultra hızlı küresel durum yönetimi** için en iyisi. Global sorgular ve `watch` dinleyicilerle, bir yığın global değişkeni muhafaza etmeden uygulama etkileşimini yeniden şekillendirebilirsiniz.
 
 ### <a id="quick-start-kv"></a>Anahtar-Değer Depolama (KV)
 Bu mod, önceden tanımlanmış yapılandırılmış tablolara ihtiyacınız olmadığında uygundur. Basittir, pratiktir ve yüksek performanslı bir depolama motoruyla desteklenir. **Etkili indeksleme mimarisi, çok büyük veri ölçeklerindeki sıradan mobil cihazlarda bile sorgu performansını son derece istikrarlı ve son derece duyarlı tutar.** Farklı Alanlardaki veriler doğal olarak izole edilirken küresel paylaşım da desteklenir.
@@ -221,6 +221,8 @@ StreamBuilder(
 
 Önbelleğe alma, geçici hesaplama veya diskte kalıcılık gerektirmeyen iş yükleri gibi senaryolar için, `ToStore.memory()` aracılığıyla saf bir bellek içi veritabanını başlatabilirsiniz. Bu modda, şemalar, dizinler ve anahtar/değer çiftleri de dahil olmak üzere tüm veriler, maksimum okuma/yazma performansı için tamamen bellekte saklanır.
 
+Bellek modu birden fazla temizleme stratejisini destekler: zamana dayalı [Tablo düzeyinde TTL](#ttl-config) / KV TTL ve sayı/boyuta dayalı [Kapasite temizleme](#capacity-eviction) (**FIFO / LRU**). Ayrı veya birlikte kullanarak sıcak verilerin zamanında sona ermesini veya sınırlı kalmasını sağlayın—oturum önbellekleri, sorgu sonuç havuzları ve belleğe duyarlı yollar için idealdir.
+
 #### 💡 Ayrıca Küresel Devlet Yönetimi olarak da çalışıyor
 Bir yığın küresel değişkene veya ağır bir devlet yönetimi çerçevesine ihtiyacınız yok. Bellek modunu `watchValue` veya `watch()` ile birleştirerek, widget'lar ve sayfalar arasında tam otomatik kullanıcı arayüzü yenilemesi elde edebilirsiniz. Bir veritabanının güçlü alma yeteneklerini korurken, size sıradan değişkenlerin çok ötesinde reaktif bir deneyim sunar; bu da onu oturum açma durumu, canlı yapılandırma veya genel mesaj sayaçları için ideal kılar.
 
@@ -228,8 +230,15 @@ Bir yığın küresel değişkene veya ağır bir devlet yönetimi çerçevesine
 > **Not**: Salt bellek modunda oluşturulan veriler, uygulama kapatıldıktan veya yeniden başlatıldıktan sonra tamamen kaybolur. Temel iş verileri için kullanmayın.
 
 ```dart
-// Initialize a pure in-memory database
-final memDb = await ToStore.memory();
+// Pure in-memory DB — TTL and/or FIFO/LRU capacity eviction as needed
+final memDb = await ToStore.memory(
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+    ),
+  ),
+);
 
 // Set a global state value (for example: unread message count)
 await memDb.setValue('unread_count', 5, isGlobal: true);
@@ -303,6 +312,7 @@ const userSchema = TableSchema(
   foreignKeys: const [], // Optional foreign-key constraints; see "Foreign Keys & Cascading"
   isGlobal: false, // Whether this is a global table; true means it can be shared across spaces
   ttlConfig: null, // Optional table-level TTL; see "Table-level TTL"
+  capacityConfig: null, // Optional capacity eviction; see "Capacity Eviction"
 );
 
 const appSchemas = [userSchema];
@@ -917,17 +927,76 @@ const TableSchema(
     ),
   ],
   ttlConfig: TableTtlConfig(
-    ttlMs: 7 * 24 * 60 * 60 * 1000, // Keep for 7 days
-    // When sourceField is omitted, the engine creates the needed index automatically.
-    // Optional custom sourceField requirements:
-    // 1) type must be DataType.datetime
-    // 2) nullable must be false
-    // 3) defaultValueType must be DefaultValueType.currentTimestamp
-    // sourceField: 'created_at',
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // 7 gün sakla
+    // Yeni tablolar / TTL'yi ilk kez açarken zorunlu:
+    // 1) DataType.datetime  2) nullable: false
+    // 3) DefaultValueType.currentTimestamp
+    sourceField: 'created_at',
   ),
 );
 ```
 
+### <a id="capacity-eviction"></a>Kapasite temizleme (FIFO / LRU)
+
+Bir tabloda tutulan kayıt sayısını adet ve/veya yaklaşık boyuta göre sınırlar. TTL'den bağımsızdır; ikisi birlikte kullanılabilir. Aşan satırlar arka planda otomatik temizlenir.
+
+```dart
+// FIFO (varsayılan): birincil anahtara göre en eskileri çıkar.
+// sourceField ayarlamayın (PrimaryKeyType.none hariç).
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  // maxBytes: 50 * 1024 * 1024, // isteğe bağlı boyut sınırı
+  policy: CapacityEvictionPolicy.fifo,
+),
+
+// LRU: sourceField zorunlu (datetime, non-null, currentTimestamp).
+// Kayıt yeniden kullanıldığında bu alanı güncelleyin.
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  policy: CapacityEvictionPolicy.lru,
+  sourceField: 'last_active_at',
+),
+```
+
+- `maxEntries` / `maxBytes` değerlerinden en az birini ayarlayın.
+- FIFO + `PrimaryKeyType.none` için de `sourceField` gerekir (aynı datetime kuralları).
+
+Mevcut bir tabloda kapasite temizlemeyi çalışma zamanında açabilir, değiştirebilir veya kapatabilirsiniz (yeniden açmaya gerek yok):
+
+```dart
+// Etkinleştir / güncelle
+await db.updateSchema('recent_events').setCapacityConfig(
+  CapacityConfig(
+    maxEntries: 10000,
+    policy: CapacityEvictionPolicy.lru,
+    sourceField: 'last_active_at',
+  ),
+);
+
+// Kapat (mevcut satırlar kalır; kapasiteye göre silme durur)
+await db.updateSchema('recent_events').disableCapacity();
+```
+
+KV kapasitesi veritabanı açılırken `DataStoreConfig` ile ayarlanır (her `kv.set` çağrısında değil):
+- `kvCapacityConfig`: **geçerli alan** anahtar limiti
+- `globalKvCapacityConfig`: **global** KV limiti
+- Tablo `CapacityConfig` ile aynı biçim, ancak `sourceField` yok
+
+```dart
+final db = await ToStore.open(
+  dbPath: '...',
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+    ),
+    globalKvCapacityConfig: CapacityConfig(
+      maxEntries: 2000,
+      policy: CapacityEvictionPolicy.fifo,
+    ),
+  ),
+);
+```
 
 ### Akıllı Depolama (Upsert)
 ToStore, `data`'de bulunan birincil anahtara veya benzersiz alana göre güncelleme veya ekleme kararı verir. `where` burada desteklenmemektedir; çakışma hedefi verilerin kendisi tarafından belirlenir.
@@ -1847,6 +1916,8 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultRecoveryDurability`** | **`standard`** | **Yanıt anında kurtarma garantisi.** Yazma işlemlerinin sonuç döndürmeden önce sahip olduğu kendi kendini iyileştirme düzeyini tanımlar:<br>• **`standard` (Varsayılan)**: **Yanıt öncesi çökmeye dayanıklı.** Uygulama çökmelerine, istisnalara ve OOM sonlandırmalarına karşı koruma.<br>• **`durable`**: **Yanıt öncesi güç kesintisine dayanıklı.** Yanıttan önce fiziksel depolamaya zorlanır; ani elektrik kesintisinde bile tam kurtarma.<br>• **`async`**: **Maksimum işleme hızı.** Hemen yanıt verir ve arka planda kaydeder; küçük verilerde yanıttan sonra yalnızca birkaç milisaniyelik kayıp penceresi vardır. |
 | **`persistRecoveryOnCommit`** | **doğru** | **Güçlü dayanıklılık garantisi.** Doğru olduğunda, taahhüt edilen işlemler fiziksel depolamayla senkronize edilir. Yanlış olduğunda, temizleme işlemi daha iyi hız için arka planda eşzamansız olarak yapılır; aşırı çökmelerde çok küçük miktarda veri kaybı riski vardır. |
 | **`ttlCleanupIntervalMs`** | **300000** | **Genel TTL yoklaması.** Motor boşta değilken süresi dolmuş verileri taramak için arka plan aralığı. Daha düşük değerler, süresi dolmuş verileri daha çabuk siler ancak daha fazla masrafa neden olur. |
+| **`kvCapacityConfig`** | **null** | **Alan KV kapasitesi.** Alan anahtarları için FIFO/LRU sınırı; `sourceField` ayarlamayın. Bkz. [Kapasite temizleme](#capacity-eviction). |
+| **`globalKvCapacityConfig`** | **null** | **Global KV kapasitesi.** `kvCapacityConfig` ile aynı biçim. |
 | **`maxConcurrency`** | (otomatik) | **Hesaplama eşzamanlılık kontrolü.** Vektör hesaplama ve şifreleme/şifre çözme gibi yoğun görevler için maksimum paralel çalışan sayısını ayarlar. Otomatik tutmak genellikle en iyisidir. |
 
 ```dart

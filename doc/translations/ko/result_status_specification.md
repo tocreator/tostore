@@ -158,7 +158,7 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
 
 ### 4.3 SchemaValidationStatus (테이블 스키마 검증 및 호환 불가 마이그레이션 상태)
 
-- **범주 범위**: `code`가 `[30000, 39999]` — `30000–30013` 정적 스키마 검증, `31001–31006` 마이그레이션 가드.
+- **범주 범위**: `code`가 `[30000, 39999]` — `30000–30014` 정적 스키마 검증, `31001–31006` 마이그레이션 가드.
 - **전용 필드 정의**:
 
   | 필드 | 유형 | 상세 내용 |
@@ -185,6 +185,7 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
   | `30011`<br>`devSchemaTableExists` | 테이블이 이미 존재합니다 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
   | `30012`<br>`devSchemaFieldExists` | 스키마 업그레이드: 이미 존재하는 필드를 추가하려 함 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 충돌하는 필드 이름</li><li>`wrongValue`: `null`</li></ul> |
   | `30013`<br>`devSchemaIndexExists` | 스키마 업그레이드: 이미 존재하는 인덱스를 추가하려 함 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 인덱스 이름</li><li>`wrongValue`: `null`</li></ul> |
+  | `30014`<br>`devInvalidSchemaCapacityConfig` | 용량 제거 구성 검증 실패 | <ul><li>`tableName`: 테이블 이름(KV 구성 라벨에서는 비어 있을 수 있음)</li><li>`field`: `null`</li><li>`wrongValue`: 잘못된 용량 구성 Map, 예 `{ "maxEntries": null, "maxBytes": null }`</li></ul> |
   | `31001`<br>`devMigrationNotAllowedWithData` | 마이그레이션에 데이터 변경이 필요하지만 명시적으로 허용되지 않음 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `null`</li><li>`wrongValue`: 마이그레이션 업그레이드 차분 맵</li></ul> |
   | `31002`<br>`devMigrationUnsafeTypeConversion` | 물리 마이그레이션: 필드의 지원되지 않는 유형 변환 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 필드 이름</li><li>`wrongValue`: 충돌하는 유형 맵, 예 `{ "from": "text", "to": "integer" }`</li></ul> |
   | `31003`<br>`devMigrationCannotAddNonNullField` | 데이터가 있는 테이블에 기본값 없이 비NULL 필드를 추가할 수 없음 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 위배되는 필드 이름</li><li>`wrongValue`: 마이그레이션 매개변수, 예 `{ "nullable": false, "defaultValue": null }`</li></ul> |
@@ -515,6 +516,7 @@ try {
 | **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | 개발자 오류 | 테이블이 이미 존재합니다 |
 | **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | 개발자 오류 | 필드가 이미 존재합니다 |
 | **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | 개발자 오류 | 인덱스가 이미 존재합니다 |
+| **30014** | `DEV_INVALID_SCHEMA_CAPACITY_CONFIG` | `ResultType.devInvalidSchemaCapacityConfig` | 개발자 오류 | 용량 제거 구성 검증 실패 |
 | **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | 개발자 오류 | 마이그레이션에 데이터 변경이 필요하지만 명시적으로 허용되지 않음 |
 | **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | 개발자 오류 | 지원되지 않는 유형 변환 |
 | **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | 개발자 오류 | 데이터가 있는 테이블에 기본값 없이 비NULL 필드를 추가할 수 없음 |

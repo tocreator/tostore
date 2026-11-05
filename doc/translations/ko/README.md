@@ -33,12 +33,12 @@
 - [ToStore를 선택해야 하는 이유](#why-tostore) | [주요 기능](#key-features) | [설치 안내](#installation) | [KV 모드](#quick-start-kv) | [테이블 모드](#quick-start-table) | [메모리 모드](#quick-start-memory)
 - [스키마 정의](#schema-definition) | [분산 아키텍처](#distributed-architecture) | [계단식 외래 키](#foreign-keys) | [모바일/데스크톱](#mobile-integration) | [서버/에이전트](#server-integration) | [기본 키 알고리즘](#primary-key-examples)
 - [고급 쿼리(JOIN)](#query-advanced) | [집계 및 통계](#aggregation-stats) | [복잡한 논리(쿼리조건)](#query-condition) | [반응형 쿼리(보기)](#reactive-query) | [스트리밍 쿼리](#streaming-query)
-- [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [복구 보장](#recovery-durability) | [하이브리드 검색(밀집 / 희소 / 텍스트)](#hybrid-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [메모리 프로브 및 동기 검색 (peek)](#query-peek) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
+- [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [복구 보장](#recovery-durability) | [하이브리드 검색(밀집 / 희소 / 텍스트)](#hybrid-advanced) | [테이블 수준 TTL](#ttl-config) | [용량 제거](#capacity-eviction) | [효율적인 페이지 매김](#query-pagination) | [메모리 프로브 및 동기 검색 (peek)](#query-peek) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
 - [관리](#database-maintenance) | [보안설정](#security-config) | [오류 처리](#error-handling) | [성능 및 진단](#performance) | [기여](#contribute) | [AI 코딩 어시스턴트](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>왜 ToStore를 선택해야 할까요?
 
-ToStore는 AGI 시대와 엣지 인텔리전스 시나리오를 위해 설계된 현대적인 데이터 엔진입니다. Self-Routing 노드 아키텍처를 기반으로 노드에 높은 자율성과 유연한 수평적 확장성을 제공하며, 성능과 데이터 규모를 논리적으로 분리합니다—엣지와 클라우드 단일 노드 배포 모두 100억 건 이상 규모를 지원하도록 설계되었습니다.
+ToStore는 AGI 시대와 엣지 인텔리전스 시나리오를 위해 설계된 현대적인 데이터 엔진입니다. Self-Routing 노드 아키텍처를 기반으로 노드에 높은 자율성과 유연한 수평적 확장성을 제공하며, 성능과 데이터 규모를 논리적으로 분리합니다—엣지와 클라우드 단일 노드는 구조화 테이블 조 단위 이상, 벡터·희소 텍스트 검색은 100억 건 이상 규모를 지원하도록 설계되었습니다.
 
 런타임 모델링과 논블로킹 실행 경로를 통해 아키텍처 진화는 항상 온라인이며 비즈니스에 완전히 투명합니다—선언적 스키마 변경, 데이터 인코딩 키 순환, 대규모 데이터 리팩토링이 모두 온라인에서 원활하게 수행됩니다. Agent와 자동화 운영을 위한 런타임 테이블 생성, 동적 메모리 진화 및 이들의 자율적 진화와 지속적 반복을 지원하며, 서비스는 중단되지 않습니다.
 
@@ -57,7 +57,7 @@ ToStore는 AGI 시대와 엣지 인텔리전스 시나리오를 위해 설계된
 - 🧠 **Self-Routing 분산 아키텍처**
   - 물리적 주소 지정과 데이터 규모를 분리하는 Self-Routing 노드 아키텍처
   - 고도로 자율적인 노드가 협력하여 유연한 데이터 토폴로지 구축
-  - 탄력적 수평 확장; 단일 노드 배포도 100억 건 이상 규모를 지원하도록 설계
+  - 탄력적 수평 확장; 단일 노드 테이블 조 단위·벡터 100억 건 이상
 
 - 🌐 **통합 크로스 플랫폼 데이터 엔진**
   - 모바일, 데스크톱, 웹, 서버 환경 전반에 걸친 통합 API
@@ -65,7 +65,7 @@ ToStore는 AGI 시대와 엣지 인텔리전스 시나리오를 위해 설계된
   - 로컬 스토리지부터 엣지-클라우드 협업까지 완전한 데이터 파이프라인
 
 - 🔍 **구조화 쿼리 및 하이브리드 검색**
-  - 복잡한 조건, JOIN, 집계 및 테이블 수준 TTL
+  - 복잡한 조건, JOIN, 집계, 테이블 수준 TTL 및 용량 제거(FIFO / LRU)
   - 어휘 텍스트·밀집 벡터·신경 희소 검색을 동일 쿼리 체인에서 조합
   - 다중 경로 리콜 융합 랭킹. 점수와 채널 진단을 결과와 함께 반환
 
@@ -102,7 +102,7 @@ AI 어시스턴트로 ToStore 클라이언트 코드를 생성할 때는 단일 
 > **저장 모드를 어떻게 선택해야 합니까?**
 > 1. [**키-값 모드(KV)**](#quick-start-kv): 구성 액세스, 분산 상태 관리 또는 JSON 데이터 저장에 가장 적합합니다. 시작하는 가장 빠른 방법입니다.
 > 2. [**구조화된 테이블 모드**](#quick-start-table): 복잡한 쿼리, 제약 조건 확인 또는 대규모 데이터 거버넌스가 필요한 핵심 비즈니스 데이터에 가장 적합합니다. 무결성 로직을 엔진에 적용하면 애플리케이션 계층 개발 및 유지 관리 비용을 크게 줄일 수 있습니다.
-> 3. [**메모리 모드**](#quick-start-memory): 임시 계산, 단위 테스트 또는 **초고속 전역 상태 관리**에 가장 적합합니다. 글로벌 쿼리와 `watch` 리스너를 사용하면 수많은 글로벌 변수를 유지하지 않고도 애플리케이션 상호 작용을 재구성할 수 있습니다.
+> 3. [**메모리 모드**](#quick-start-memory): 임시 계산, 단위 테스트, 유계 인메모리 캐시(TTL 및 FIFO / LRU 용량 제거) 또는 **초고속 전역 상태 관리**에 가장 적합합니다. 글로벌 쿼리와 `watch` 리스너를 사용하면 수많은 글로벌 변수를 유지하지 않고도 애플리케이션 상호 작용을 재구성할 수 있습니다.
 
 ### <a id="quick-start-kv"></a>키-값 저장소(KV)
 이 모드는 사전 정의된 구조화된 테이블이 필요하지 않은 경우에 적합합니다. 간단하고 실용적이며 고성능 스토리지 엔진이 지원됩니다. **효율적인 인덱싱 아키텍처는 매우 큰 데이터 규모의 일반 모바일 장치에서도 쿼리 성능을 매우 안정적으로 유지하고 응답성이 뛰어납니다.** 서로 다른 공간의 데이터는 자연스럽게 격리되는 동시에 글로벌 공유도 지원됩니다.
@@ -221,6 +221,8 @@ StreamBuilder(
 
 캐싱, 임시 계산 또는 디스크에 대한 지속성이 필요하지 않은 작업 부하와 같은 시나리오의 경우 `ToStore.memory()`을 통해 순수 메모리 내 데이터베이스를 초기화할 수 있습니다. 이 모드에서는 스키마, 인덱스, 키-값 쌍을 포함한 모든 데이터가 최대 읽기/쓰기 성능을 위해 메모리에 완전히 저장됩니다.
 
+메모리 모드도 여러 제거 전략을 지원합니다. 시간 기반 [테이블 수준 TTL](#ttl-config) / KV TTL과 건수·크기 기반 [용량 제거](#capacity-eviction)(**FIFO / LRU**). 단독 또는 함께 써서 핫 데이터를 기한에 맞춰 만료시키거나 한도 내로 유지하세요—세션 캐시·쿼리 결과 풀 등 메모리에 민감한 경로에 적합합니다.
+
 #### 💡 전역 상태 관리로도 작동
 전역 변수 더미나 무거운 상태 관리 프레임워크가 필요하지 않습니다. 메모리 모드를 `watchValue` 또는 `watch()`과 결합하면 위젯과 페이지 전체에서 완전 자동 UI 새로 고침을 달성할 수 있습니다. 데이터베이스의 강력한 검색 기능을 유지하면서 일반 변수를 훨씬 뛰어넘는 반응형 경험을 제공하므로 로그인 상태, 실시간 구성 또는 글로벌 메시지 카운터에 이상적입니다.
 
@@ -228,8 +230,15 @@ StreamBuilder(
 > **참고**: 순수 메모리 모드에서 생성된 데이터는 앱을 닫거나 다시 시작하면 완전히 손실됩니다. 핵심 비즈니스 데이터에는 사용하지 마세요.
 
 ```dart
-// Initialize a pure in-memory database
-final memDb = await ToStore.memory();
+// Pure in-memory DB — TTL and/or FIFO/LRU capacity eviction as needed
+final memDb = await ToStore.memory(
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+    ),
+  ),
+);
 
 // Set a global state value (for example: unread message count)
 await memDb.setValue('unread_count', 5, isGlobal: true);
@@ -303,6 +312,7 @@ const userSchema = TableSchema(
   foreignKeys: const [], // Optional foreign-key constraints; see "Foreign Keys & Cascading"
   isGlobal: false, // Whether this is a global table; true means it can be shared across spaces
   ttlConfig: null, // Optional table-level TTL; see "Table-level TTL"
+  capacityConfig: null, // Optional capacity eviction; see "Capacity Eviction"
 );
 
 const appSchemas = [userSchema];
@@ -918,17 +928,76 @@ const TableSchema(
     ),
   ],
   ttlConfig: TableTtlConfig(
-    ttlMs: 7 * 24 * 60 * 60 * 1000, // Keep for 7 days
-    // When sourceField is omitted, the engine creates the needed index automatically.
-    // Optional custom sourceField requirements:
-    // 1) type must be DataType.datetime
-    // 2) nullable must be false
-    // 3) defaultValueType must be DefaultValueType.currentTimestamp
-    // sourceField: 'created_at',
+    ttlMs: 7 * 24 * 60 * 60 * 1000, // 7일 보관
+    // 새 테이블 / 처음 TTL을 켤 때 필수:
+    // 1) DataType.datetime  2) nullable: false
+    // 3) DefaultValueType.currentTimestamp
+    sourceField: 'created_at',
   ),
 );
 ```
 
+### <a id="capacity-eviction"></a>용량 제거（FIFO / LRU）
+
+건수 및/또는 대략적인 크기로 테이블 보관량을 제한합니다. TTL과 독립적이며 함께 사용할 수 있습니다. 한도를 넘는 행은 백그라운드에서 자동으로 제거됩니다.
+
+```dart
+// FIFO(기본): 기본 키 기준으로 오래된 것부터 제거.
+// sourceField를 설정하지 마세요(PrimaryKeyType.none 제외).
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  // maxBytes: 50 * 1024 * 1024, // 선택적 크기 제한
+  policy: CapacityEvictionPolicy.fifo,
+),
+
+// LRU: sourceField 필수(datetime, non-null, currentTimestamp).
+// 최근 사용으로 칠 때 해당 필드를 갱신하세요.
+capacityConfig: CapacityConfig(
+  maxEntries: 10000,
+  policy: CapacityEvictionPolicy.lru,
+  sourceField: 'last_active_at',
+),
+```
+
+- `maxEntries` / `maxBytes` 중 하나 이상 설정.
+- FIFO + `PrimaryKeyType.none`도 `sourceField` 필요(동일한 datetime 규칙).
+
+기존 테이블에서도 런타임에 용량 제거를 켜거나 바꾸거나 끌 수 있습니다(재오픈 불필요):
+
+```dart
+// 활성화 / 변경
+await db.updateSchema('recent_events').setCapacityConfig(
+  CapacityConfig(
+    maxEntries: 10000,
+    policy: CapacityEvictionPolicy.lru,
+    sourceField: 'last_active_at',
+  ),
+);
+
+// 비활성화(기존 행 유지; 용량 기반 삭제 중단)
+await db.updateSchema('recent_events').disableCapacity();
+```
+
+KV 용량은 DB를 열 때 `DataStoreConfig`로 설정합니다(`kv.set`마다 전달하지 않음):
+- `kvCapacityConfig`: **현재 스페이스** 키 한도
+- `globalKvCapacityConfig`: **전역** KV 한도
+- 테이블 `CapacityConfig`와 같은 형태이지만 `sourceField`는 설정하지 않음
+
+```dart
+final db = await ToStore.open(
+  dbPath: '...',
+  config: DataStoreConfig(
+    kvCapacityConfig: CapacityConfig(
+      maxEntries: 5000,
+      policy: CapacityEvictionPolicy.lru,
+    ),
+    globalKvCapacityConfig: CapacityConfig(
+      maxEntries: 2000,
+      policy: CapacityEvictionPolicy.fifo,
+    ),
+  ),
+);
+```
 
 ### 지능형 스토리지(Upsert)
 ToStore에서는 `data`에 포함된 기본 키 또는 고유 필드를 기준으로 업데이트할지 삽입할지 결정합니다. `where`은 여기서 지원되지 않습니다. 충돌 대상은 데이터 자체에 의해 결정됩니다.
@@ -1849,6 +1918,8 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultRecoveryDurability`** | **`standard`** | **응답 시 복구 보장.** 쓰기 작업이 결과를 반환하기 전에 갖추는 자가 치유 복구 수준을 정의합니다:<br>• **`standard` (기본값)**: **응답 전 충돌 자가 치유 보장.** 앱 비정상 종료, 예외, OOM 종료로부터 보호.<br>• **`durable`**: **응답 전 정전 자가 치유 보장.** 물리 디스크 동기화 후 반환하여 돌발 정전에도 복구 가능.<br>• **`async`**: **초고속 처리량.** 즉시 응답 후 백그라운드 저장. 응답 후 소량 데이터 기준 수 밀리초의 극히 짧은 손실 윈도우만 존재. |
 | **`persistRecoveryOnCommit`** | **사실** | **강력한 내구성 보장.** true인 경우 커밋된 트랜잭션이 물리적 스토리지에 동기화됩니다. false인 경우 더 나은 속도를 위해 플러시가 백그라운드에서 비동기적으로 수행되며 극단적인 충돌 시 소량의 데이터가 손실될 위험이 적습니다. |
 | **`ttlCleanupIntervalMs`** | **300000** | **글로벌 TTL 폴링.** 엔진이 유휴 상태가 아닐 때 만료된 데이터를 검색하는 백그라운드 간격입니다. 값이 낮을수록 만료된 데이터가 더 빨리 삭제되지만 오버헤드가 더 많이 발생합니다. |
+| **`kvCapacityConfig`** | **null** | **스페이스 KV 용량.** 스페이스 키의 FIFO/LRU 한도; `sourceField`를 설정하지 마세요. [용량 제거](#capacity-eviction) 참고. |
+| **`globalKvCapacityConfig`** | **null** | **전역 KV 용량.** `kvCapacityConfig`와 동일한 형태. |
 | **`maxConcurrency`** | (자동) | **컴퓨팅 동시성 제어.** 벡터 계산 및 암호화/암호 해독과 같은 집약적인 작업을 위한 최대 병렬 작업자 수를 설정합니다. 일반적으로 자동으로 유지하는 것이 가장 좋습니다. |
 
 ```dart
