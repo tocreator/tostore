@@ -57,7 +57,7 @@ ToStore は、AGI 時代とエッジ インテリジェンス シナリオ向け
 - 🧠 **Self-Routing 分散アーキテクチャ**
   - 物理アドレッシングとデータ規模を切り離す Self-Routing ノードアーキテクチャ
   - 高度に自律的なノードが連携して柔軟なデータトポロジを構築
-  - 弾力的な水平スケーリング；単一ノードは表で兆件超、ベクトルで 100 億件超
+  - 弾力的な水平スケーリング；負荷に応じた動的拡張とタスク分散
 
 - 🌐 **統合クロスプラットフォーム データエンジン**
   - モバイル、デスクトップ、Web、サーバー環境にわたる統合 API
@@ -89,7 +89,7 @@ ToStore は、AGI 時代とエッジ インテリジェンス シナリオ向け
 
 ```yaml
 dependencies:
-  tostore: any # Please use the latest version
+  tostore: ^3.6.1
 ```
 
 ### For AI Coding Assistants
@@ -126,7 +126,7 @@ await db.setValue('current_user', 'John', isGlobal: true);
 // Automatic expiration cleanup (TTL)
 // Supports either a relative lifetime (ttl) or an absolute expiration time (expiresAt)
 await db.setValue('temp_config', 'value', ttl: Duration(hours: 2));
-await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 31));
+await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 28));
 
 // Read data
 final profile = await db.getValue('user_profile'); // Map<String, dynamic>
@@ -1978,7 +1978,7 @@ ToStore は継続的に進化し続ける現代のデータエンジンであり
 バグ修正、ドキュメント改善、アーキテクチャの改良、新しいアイデアの提案など、PR を通じてご参加ください：
 
 - 🔗 **PR 提出**: [Pull Requests](https://github.com/tocreator/tostore/pulls)
-- 📖 **ドキュメント**: [Wiki](https://github.com/tocreator/tostore)
+- 📖 **リポジトリ**: [GitHub](https://github.com/tocreator/tostore)
 - 📢 **問題報告**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **技術的なディスカッション**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 

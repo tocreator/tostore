@@ -57,7 +57,7 @@ Da sich die Datenverarbeitung zunehmend in Richtung Edge Intelligence verlagert,
 - 🧠 **Self-Routing-Verteilte Architektur**
   - Self-Routing-Knotenarchitektur, die physische Adressierung vom Datenumfang entkoppelt
   - Hochautonome Knoten arbeiten zusammen für eine flexible Datentopologie
-  - Elastische horizontale Skalierung; Einzelknoten: Tabellen Billionen-, Vektoren 10B+-Maßstab
+  - Elastische horizontale Skalierung; dynamische Erweiterung und Lastverteilung nach Auslastung
 
 - 🌐 **Einheitliche plattformübergreifende Daten-Engine**
   - Einheitliche API für Mobil-, Desktop-, Web- und Serverumgebungen
@@ -89,7 +89,7 @@ Fügen Sie `tostore` zu Ihrem `pubspec.yaml` hinzu:
 
 ```yaml
 dependencies:
-  tostore: any # Please use the latest version
+  tostore: ^3.6.1
 ```
 
 ### For AI Coding Assistants
@@ -126,7 +126,7 @@ await db.setValue('current_user', 'John', isGlobal: true);
 // Automatic expiration cleanup (TTL)
 // Supports either a relative lifetime (ttl) or an absolute expiration time (expiresAt)
 await db.setValue('temp_config', 'value', ttl: Duration(hours: 2));
-await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 31));
+await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 28));
 
 // Read data
 final profile = await db.getValue('user_profile'); // Map<String, dynamic>
@@ -1978,7 +1978,7 @@ ToStore ist eine sich stetig weiterentwickelnde moderne Daten-Engine, und wir be
 Ob Fehler beheben, Dokumentation verbessern, Architektur optimieren oder neue Ideen vorschlagen – Sie können über PR teilnehmen:
 
 - 🔗 **PR einreichen**: [Pull Requests](https://github.com/tocreator/tostore/pulls)
-- 📖 **Dokumentation**: [Wiki](https://github.com/tocreator/tostore)
+- 📖 **Repository**: [GitHub](https://github.com/tocreator/tostore)
 - 📢 **Problemberichterstattung**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **Technische Diskussion**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 

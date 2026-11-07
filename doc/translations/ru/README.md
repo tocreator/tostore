@@ -57,7 +57,7 @@ ToStore — это современный движок данных, разра�
 - 🧠 **Самомаршрутизируемая распределенная архитектура**
   - Архитектура самомаршрутизируемых узлов, отделяющая физическую адресацию от масштаба данных
   - Высокоавтономные узлы совместно создают гибкую топологию данных
-  - Упругая горизонтальная масштабируемость; один узел — таблицы триллионного масштаба, векторы 10 млрд+
+  - Упругая горизонтальная масштабируемость; динамическое расширение и распределение задач по нагрузке
 
 - 🌐 **Единая кроссплатформенная система данных**
   - Единый API для мобильных, настольных, веб- и серверных сред
@@ -89,7 +89,7 @@ ToStore — это современный движок данных, разра�
 
 ```yaml
 dependencies:
-  tostore: any # Please use the latest version
+  tostore: ^3.6.1
 ```
 
 ### For AI Coding Assistants
@@ -126,7 +126,7 @@ await db.setValue('current_user', 'John', isGlobal: true);
 // Automatic expiration cleanup (TTL)
 // Supports either a relative lifetime (ttl) or an absolute expiration time (expiresAt)
 await db.setValue('temp_config', 'value', ttl: Duration(hours: 2));
-await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 31));
+await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 28));
 
 // Read data
 final profile = await db.getValue('user_profile'); // Map<String, dynamic>
@@ -1978,7 +1978,7 @@ ToStore — это постоянно развивающийся совреме�
 Будь то исправление ошибок, улучшение документации, совершенствование архитектуры или предложение новых идей — вы можете участвовать через PR:
 
 - 🔗 **Отправить PR**: [Pull Requests](https://github.com/tocreator/tostore/pulls)
-- 📖 **Документация**: [Wiki](https://github.com/tocreator/tostore)
+- 📖 **Репозиторий**: [GitHub](https://github.com/tocreator/tostore)
 - 📢 **Отчеты о проблемах**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **Техническое обсуждение**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 

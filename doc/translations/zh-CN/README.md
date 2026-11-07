@@ -65,7 +65,7 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
 - 🧠 **自寻径分布式架构**
   - 自寻径节点架构，物理寻址与数据规模解耦
   - 高自治节点互联协同，构建灵活的数据拓扑
-  - 弹性水平扩展；单机表万亿级、向量百亿级以上
+  - 弹性水平扩展；按负载动态扩容与任务分流
 
 - 🌐 **统一的跨平台数据引擎**
   - 移动端、桌面端、Web 与服务端统一 API
@@ -98,7 +98,7 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
 
 ```yaml
 dependencies:
-  tostore: any # 请使用最新版本
+  tostore: ^3.6.1
 ```
 
 ### For AI Coding Assistants
@@ -138,7 +138,7 @@ await db.setValue('current_user', 'John', isGlobal: true);
 // 过期自动清理 (TTL)
 // 支持设置生存时间 (ttl) 或 明确的过期时刻 (expiresAt)
 await db.setValue('temp_config', 'value', ttl: Duration(hours: 2));
-await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 31));
+await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 28));
 
 // 获取数据
 final profile = await db.getValue('user_profile'); // Map<String, dynamic>
@@ -2012,7 +2012,7 @@ ToStore 是一个持续演进的现代数据引擎，我们非常欢迎社区参
 无论是修复 bug、优化文档、改进架构，还是提出新想法，都可以通过 PR 参与：
 
 - 🔗 **提交 PR**：[Pull Requests](https://github.com/tocreator/tostore/pulls)
-- 📖 **文档**：[Wiki](https://github.com/tocreator/tostore)
+- 📖 **仓库**：[GitHub](https://github.com/tocreator/tostore)
 - 📢 **问题反馈**：[GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **技术讨论**：[GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 

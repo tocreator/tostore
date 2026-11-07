@@ -57,7 +57,7 @@ Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca
 - 🧠 **Kendi Kendini Yönlendiren Dağıtık Mimari**
   - Fiziksel adreslemeyi veri ölçeğinden ayıran kendi kendini yönlendiren düğüm mimarisi
   - Yüksek düzeyde özerk düğümler esnek bir veri topolojisi oluşturmak için işbirliği yapar
-  - Esnek yatay ölçeklendirme; tek düğüm: trilyon ölçekli tablolar, 10 milyar+ vektör
+  - Esnek yatay ölçeklendirme; yüke göre dinamik genişleme ve görev dağıtımı
 
 - 🌐 **Birleşik Platformlar Arası Veri Motoru**
   - Mobil, masaüstü, web ve sunucu ortamlarında birleşik API
@@ -89,7 +89,7 @@ Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca
 
 ```yaml
 dependencies:
-  tostore: any # Please use the latest version
+  tostore: ^3.6.1
 ```
 
 ### For AI Coding Assistants
@@ -126,7 +126,7 @@ await db.setValue('current_user', 'John', isGlobal: true);
 // Automatic expiration cleanup (TTL)
 // Supports either a relative lifetime (ttl) or an absolute expiration time (expiresAt)
 await db.setValue('temp_config', 'value', ttl: Duration(hours: 2));
-await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 31));
+await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 28));
 
 // Read data
 final profile = await db.getValue('user_profile'); // Map<String, dynamic>
@@ -1977,7 +1977,7 @@ ToStore sürekli gelişen modern bir veri motorudur ve topluluk katkılarını i
 İster hata düzeltme, ister belge iyileştirme, mimari geliştirme veya yeni fikir önerme olsun, PR aracılığıyla katılabilirsiniz:
 
 - 🔗 **PR Gönder**: [Pull Requests](https://github.com/tocreator/tostore/pulls)
-- 📖 **Belgeler**: [Wiki](https://github.com/tocreator/tostore)
+- 📖 **Depo**: [GitHub](https://github.com/tocreator/tostore)
 - 📢 **Sorun Bildirme**: [GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **Teknik Tartışma**: [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 

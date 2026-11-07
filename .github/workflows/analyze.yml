@@ -10,15 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # pub get also resolves example/. That app depends on flutter_test,
-      # so the job needs a Flutter SDK, not a standalone Dart SDK.
+      # Package tests use dart:io + package:test. Flutter SDK is used so
+      # example/ resolution stays consistent if the workspace expands later.
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
       - name: Install dependencies
         run: dart pub get
+      - name: Format
+        run: dart format --output=none --set-exit-if-changed lib test
       - name: Analyze
-        run: dart analyze
-      - name: Smoke test
+        run: dart analyze --fatal-infos
+      - name: Feature smoke tests
         run: dart test

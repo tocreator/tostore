@@ -57,7 +57,7 @@ Alors que l'informatique continue de se déplacer vers l'intelligence en périph
 - 🧠 **Architecture distribuée auto-routée**
   - Architecture de nœuds auto-routés découplant l'adressage physique de l'échelle des données
   - Nœuds hautement autonomes collaborant pour construire une topologie de données flexible
-  - Extensibilité horizontale élastique ; mono-nœud : tables à l'échelle du billion, vecteurs 10B+
+  - Extensibilité horizontale élastique ; expansion dynamique et répartition des tâches selon la charge
 
 - 🌐 **Moteur de données multiplateforme unifié**
   - API unifiée dans les environnements mobiles, de bureau, Web et serveur
@@ -89,7 +89,7 @@ Ajoutez `tostore` à votre `pubspec.yaml` :
 
 ```yaml
 dependencies:
-  tostore: any # Please use the latest version
+  tostore: ^3.6.1
 ```
 
 ### For AI Coding Assistants
@@ -126,7 +126,7 @@ await db.setValue('current_user', 'John', isGlobal: true);
 // Automatic expiration cleanup (TTL)
 // Supports either a relative lifetime (ttl) or an absolute expiration time (expiresAt)
 await db.setValue('temp_config', 'value', ttl: Duration(hours: 2));
-await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 31));
+await db.setValue('session_token', 'abc', expiresAt: DateTime(2026, 2, 28));
 
 // Read data
 final profile = await db.getValue('user_profile'); // Map<String, dynamic>
@@ -1978,7 +1978,7 @@ ToStore est un moteur de données moderne en évolution continue, et nous accuei
 Qu'il s'agisse de corriger des bugs, d'améliorer la documentation, de perfectionner l'architecture ou de proposer de nouvelles idées, vous pouvez participer via PR :
 
 - 🔗 **Soumettre un PR** : [Pull Requests](https://github.com/tocreator/tostore/pulls)
-- 📖 **Documentation** : [Wiki](https://github.com/tocreator/tostore)
+- 📖 **Dépôt** : [GitHub](https://github.com/tocreator/tostore)
 - 📢 **Rapport de problèmes** : [GitHub Issues](https://github.com/tocreator/tostore/issues)
 - 💬 **Discussion technique** : [GitHub Discussions](https://github.com/tocreator/tostore/discussions)
 

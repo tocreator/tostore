@@ -20,24 +20,38 @@ class QueryAggregation {
   String get outputName => alias ?? '${type.name}($field)';
 }
 
-/// A helper class to construct aggregations for select clauses.
+/// Factories for [QueryAggregation] values used by query `select` / `selectAgg`.
+///
+/// [count] counts every visited row. [sum], [avg], [min], and [max] read
+/// [field] and skip null or non-numeric values. The default result key is
+/// `count(field)` (or `sum(field)`, and so on) unless [alias] is set.
 class Agg {
+  const Agg._();
+
+  /// Counts every visited row.
+  ///
+  /// [field] is not read. It is only part of the default output name
+  /// (`count(field)`).
   static QueryAggregation count(String field, {String? alias}) =>
       QueryAggregation(
           type: QueryAggregationType.count, field: field, alias: alias);
 
+  /// Sums numeric values of [field]. Null and non-numeric values are skipped.
   static QueryAggregation sum(String field, {String? alias}) =>
       QueryAggregation(
           type: QueryAggregationType.sum, field: field, alias: alias);
 
+  /// Averages numeric values of [field]. Null and non-numeric values are skipped.
   static QueryAggregation avg(String field, {String? alias}) =>
       QueryAggregation(
           type: QueryAggregationType.avg, field: field, alias: alias);
 
+  /// Lowest numeric value of [field]. Null and non-numeric values are skipped.
   static QueryAggregation min(String field, {String? alias}) =>
       QueryAggregation(
           type: QueryAggregationType.min, field: field, alias: alias);
 
+  /// Highest numeric value of [field]. Null and non-numeric values are skipped.
   static QueryAggregation max(String field, {String? alias}) =>
       QueryAggregation(
           type: QueryAggregationType.max, field: field, alias: alias);

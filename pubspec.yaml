@@ -3,7 +3,7 @@ description: "Data engine: AI vector & SQL/NoSQL database. Key-value/KV, embeddi
 version: 3.6.1
 homepage: https://github.com/tocreator/tostore
 repository: https://github.com/tocreator/tostore
-documentation: https://github.com/tocreator/tostore/wiki
+documentation: https://github.com/tocreator/tostore/blob/main/README.md
 
 topics:
   - database
