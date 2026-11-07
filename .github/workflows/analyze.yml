@@ -10,9 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dart-lang/setup-dart@v1
+      # pub get also resolves example/. That app depends on flutter_test,
+      # so the job needs a Flutter SDK, not a standalone Dart SDK.
+      - uses: subosito/flutter-action@v2
         with:
-          sdk: stable
+          channel: stable
+          cache: true
       - name: Install dependencies
         run: dart pub get
       - name: Analyze
