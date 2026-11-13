@@ -6,6 +6,7 @@ import '../../model/key_migration_info.dart';
 import '../../model/meta_info.dart';
 import '../../model/migration_meta.dart';
 import '../../handler/binary_codec.dart';
+import '../../handler/encryption.dart';
 import 'meta_file_codec.dart';
 
 /// Stable field IDs for [MigrationMeta]. Never reuse IDs.
@@ -102,19 +103,25 @@ final class MigrationMetaCodec {
   static Uint8List encodeFile(
     MigrationMeta meta, {
     required EncryptionConfig? encryptionConfig,
+    required EncryptionManager encryptionManager,
   }) {
     return MetaFileCodec.encodeFile(
       encodePayload(meta),
       encrypt: MetaFileCodec.shouldEncrypt(encryptionConfig),
       aad: MetaFileCodec.migrationMetaAad,
+      encryptionManager: encryptionManager,
     );
   }
 
-  static MigrationMeta decodeFile(Uint8List frameBytes) {
+  static MigrationMeta decodeFile(
+    Uint8List frameBytes, {
+    required EncryptionManager encryptionManager,
+  }) {
     return decodePayload(
       MetaFileCodec.decodeFile(
         frameBytes,
         aad: MetaFileCodec.migrationMetaAad,
+        encryptionManager: encryptionManager,
         maxBodyLimit: MetaFileCodec.maxBodyBytesSmall,
       ),
     );

@@ -40,8 +40,16 @@ class WalEncoder {
   ///
   /// Wire layout is unchanged vs historical writers — only allocation/copy paths
   /// are tightened (especially [EncryptionType.none]).
-  static Uint8List encode(Map<String, dynamic> walEntry, int partitionIndex) {
-    final payload = _payloadBytes(walEntry, partitionIndex);
+  static Uint8List encode(
+    Map<String, dynamic> walEntry,
+    int partitionIndex, {
+    required EncryptionManager encryptionManager,
+  }) {
+    final payload = _payloadBytes(
+      walEntry,
+      partitionIndex,
+      encryptionManager: encryptionManager,
+    );
     final out = Uint8List(9 + payload.length);
     _writeRecordHeader(out, 0, payload.length);
     out.setRange(9, 9 + payload.length, payload);
@@ -60,7 +68,10 @@ class WalEncoder {
   ///
   /// [partitionIndex] - WAL partition index for AAD verification
   static List<Map<String, dynamic>> decodeFile(
-      Uint8List fileBytes, int partitionIndex) {
+    Uint8List fileBytes,
+    int partitionIndex, {
+    required EncryptionManager encryptionManager,
+  }) {
     final List<Map<String, dynamic>> entries = [];
     int offset = 0;
 
@@ -116,7 +127,11 @@ class WalEncoder {
       offset += recordLength;
 
       try {
-        final entry = decodeSingle(recordData, partitionIndex);
+        final entry = decodeSingle(
+          recordData,
+          partitionIndex,
+          encryptionManager: encryptionManager,
+        );
         if (entry != null) {
           entries.add(entry);
           continue;
@@ -217,7 +232,10 @@ class WalEncoder {
   ///
   /// [partitionIndex] - WAL partition index for AAD verification (must match encoding)
   static Map<String, dynamic>? decodeSingle(
-      Uint8List data, int partitionIndex) {
+    Uint8List data,
+    int partitionIndex, {
+    required EncryptionManager encryptionManager,
+  }) {
     if (data.length < 9) return null;
 
     final header = ByteData.sublistView(data, 0, 9);
@@ -241,7 +259,11 @@ class WalEncoder {
     final encryptedData = Uint8List.sublistView(data, 9, 9 + dataLen);
 
     // Step 2/3: Decrypt. AAD only needed for AEAD algorithms.
-    final decrypted = _decodePayload(encryptedData, partitionIndex);
+    final decrypted = _decodePayload(
+      encryptedData,
+      partitionIndex,
+      encryptionManager: encryptionManager,
+    );
 
     // Step 4: Parse MessagePack binary. Require the map to consume the whole
     // payload so a torn frame whose dataLen later fits (because new records
@@ -265,8 +287,16 @@ class WalEncoder {
   /// New code should use decodeFile() for reading entire WAL files.
   ///
   /// [partitionIndex] - WAL partition index for AAD verification
-  static Map<String, dynamic>? decode(Uint8List data, int partitionIndex) {
-    return decodeSingle(data, partitionIndex);
+  static Map<String, dynamic>? decode(
+    Uint8List data,
+    int partitionIndex, {
+    required EncryptionManager encryptionManager,
+  }) {
+    return decodeSingle(
+      data,
+      partitionIndex,
+      encryptionManager: encryptionManager,
+    );
   }
 
   /// Encode WAL entry with length prefix for record-based storage
@@ -278,9 +308,16 @@ class WalEncoder {
   ///
   /// Hot path for [WalManager]: builds the length-prefixed record in **one**
   /// allocation. Byte layout matches the historical encode()+prepend path.
-  static Uint8List encodeAsLine(Map<String, dynamic> walEntry) {
+  static Uint8List encodeAsLine(
+    Map<String, dynamic> walEntry, {
+    required EncryptionManager encryptionManager,
+  }) {
     final partitionIndex = (walEntry['p'] as int?) ?? 0;
-    final payload = _payloadBytes(walEntry, partitionIndex);
+    final payload = _payloadBytes(
+      walEntry,
+      partitionIndex,
+      encryptionManager: encryptionManager,
+    );
     final recordLen = 9 + payload.length;
     final out = Uint8List(4 + recordLen);
     final view = ByteData.sublistView(out);
@@ -294,24 +331,29 @@ class WalEncoder {
   /// ToWL header. Identical to the historical encode() payload bytes.
   static Uint8List _payloadBytes(
     Map<String, dynamic> walEntry,
-    int partitionIndex,
-  ) {
+    int partitionIndex, {
+    required EncryptionManager encryptionManager,
+  }) {
     final serialized = BinaryMapCodec.encodeMap(walEntry);
 
     // none: EncryptionManager.encodeBytes returns [serialized] unchanged —
     // skip AAD alloc + encodeBytes call (same on-disk payload).
-    if (EncryptionManager.getEncryptionType() == EncryptionType.none) {
+    if (encryptionManager.getEncryptionType() == EncryptionType.none) {
       return serialized;
     }
 
-    return EncryptionManager.encodeBytes(
+    return encryptionManager.encodeBytes(
       serialized,
       aad: _partitionAad(partitionIndex),
     );
   }
 
-  static Uint8List _decodePayload(Uint8List encryptedData, int partitionIndex) {
-    return EncryptionManager.decodeBytes(
+  static Uint8List _decodePayload(
+    Uint8List encryptedData,
+    int partitionIndex, {
+    required EncryptionManager encryptionManager,
+  }) {
+    return encryptionManager.decodeBytes(
       encryptedData,
       aad: _partitionAad(partitionIndex),
     );
@@ -381,7 +423,10 @@ class WalEncoder {
   ///
   /// Returns null if no valid record found or the tail is insufficient.
   static Map<String, dynamic>? decodeLastEntryFromTail(
-      Uint8List tailBytes, int partitionIndex) {
+    Uint8List tailBytes,
+    int partitionIndex, {
+    required EncryptionManager encryptionManager,
+  }) {
     if (tailBytes.length < 4) return null;
 
     // Start from the end and scan backwards to find the last complete record
@@ -448,7 +493,11 @@ class WalEncoder {
       // Magic matches! This is very likely a valid record. Now attempt full decode.
       // The decodeSingle will verify version, decrypt, and parse the entry.
       try {
-        final entry = decodeSingle(recordData, partitionIndex);
+        final entry = decodeSingle(
+          recordData,
+          partitionIndex,
+          encryptionManager: encryptionManager,
+        );
         if (entry != null) {
           return entry; // Found the last valid entry
         }

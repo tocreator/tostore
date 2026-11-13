@@ -1209,7 +1209,11 @@ class _WmbpStorageVolume implements WmbpPageVolume {
       WmbpConstants.pageHeaderSize,
       WmbpConstants.pageHeaderSize + len,
     );
-    final encoded = StorePageCodec.encodePayload(plain, config: store.config);
+    final encoded = StorePageCodec.encodePayload(
+      plain,
+      config: store.config,
+      encryptionManager: store.encryptionManager,
+    );
     if (encoded.length > WmbpConstants.pagePayloadSize) {
       throw DbException([
         GeneralStatus(
@@ -1257,7 +1261,10 @@ class _WmbpStorageVolume implements WmbpPageVolume {
       WmbpConstants.pageHeaderSize,
       WmbpConstants.pageHeaderSize + len,
     );
-    final plain = StorePageCodec.decodePayload(encoded);
+    final plain = StorePageCodec.decodePayload(
+      encoded,
+      encryptionManager: store.encryptionManager,
+    );
     if (plain.length > WmbpConstants.pagePayloadSize) {
       throw DbException([
         GeneralStatus(

@@ -11,6 +11,7 @@ import '../../model/table_schema.dart';
 import '../../model/wal_pointer.dart';
 import '../../handler/binary_codec.dart';
 import '../../handler/binary_map_codec.dart';
+import '../../handler/encryption.dart';
 import 'meta_file_codec.dart';
 import 'schema_binary_codec.dart';
 import 'wal_meta_codec.dart';
@@ -444,19 +445,25 @@ final class MigrationTaskCodec {
   static Uint8List encodeFile(
     MigrationTask task, {
     required EncryptionConfig? encryptionConfig,
+    required EncryptionManager encryptionManager,
   }) {
     return MetaFileCodec.encodeFile(
       encodePayload(task),
       encrypt: MetaFileCodec.shouldEncrypt(encryptionConfig),
       aad: MetaFileCodec.migrationTaskAad,
+      encryptionManager: encryptionManager,
     );
   }
 
-  static MigrationTask decodeFile(Uint8List frameBytes) {
+  static MigrationTask decodeFile(
+    Uint8List frameBytes, {
+    required EncryptionManager encryptionManager,
+  }) {
     return decodePayload(
       MetaFileCodec.decodeFile(
         frameBytes,
         aad: MetaFileCodec.migrationTaskAad,
+        encryptionManager: encryptionManager,
         maxBodyLimit: MetaFileCodec.maxBodyBytes,
       ),
     );

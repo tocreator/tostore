@@ -8,6 +8,7 @@ import '../../model/table_identity.dart';
 import '../../model/table_op_meta.dart';
 import '../../model/wal_pointer.dart';
 import '../../handler/binary_codec.dart';
+import '../../handler/encryption.dart';
 import 'meta_file_codec.dart';
 
 /// Stable field IDs for [WalMeta] binary encoding. Never reuse IDs.
@@ -201,19 +202,28 @@ final class WalMetaCodec {
   static Uint8List encodeFile(
     WalMeta meta, {
     required EncryptionConfig? encryptionConfig,
+    required EncryptionManager encryptionManager,
   }) {
     final encrypt = MetaFileCodec.shouldEncrypt(encryptionConfig);
     return MetaFileCodec.encodeFile(
       encodePayload(meta),
       encrypt: encrypt,
       aad: MetaFileCodec.walMetaAad,
+      encryptionManager: encryptionManager,
     );
   }
 
   /// Decode full on-disk file bytes.
-  static WalMeta decodeFile(Uint8List frameBytes) {
+  static WalMeta decodeFile(
+    Uint8List frameBytes, {
+    required EncryptionManager encryptionManager,
+  }) {
     return decodePayload(
-      MetaFileCodec.decodeFile(frameBytes, aad: MetaFileCodec.walMetaAad),
+      MetaFileCodec.decodeFile(
+        frameBytes,
+        aad: MetaFileCodec.walMetaAad,
+        encryptionManager: encryptionManager,
+      ),
     );
   }
 

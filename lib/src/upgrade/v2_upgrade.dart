@@ -5,7 +5,6 @@ import '../core/compute/workload_scheduler.dart';
 import '../core/compute/yield_controller.dart';
 import '../core/engine/data_store_impl.dart';
 import '../handler/chacha20_poly1305_old.dart';
-import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
 import '../model/data_store_config.dart';
@@ -599,7 +598,7 @@ class V2Upgrade {
         return [];
       }
 
-      final decodedString = EncryptionManager.decode(partitionBytes);
+      final decodedString = _dataStore.encryptionManager.decode(partitionBytes);
       if (decodedString.isEmpty) {
         return [];
       }

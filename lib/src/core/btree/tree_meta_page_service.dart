@@ -2,7 +2,6 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../../handler/encryption.dart';
 import '../../model/data_store_config.dart';
 import '../../model/db_exception.dart';
 import '../../model/meta_info.dart';
@@ -25,8 +24,8 @@ import 'tree_meta_page.dart';
 /// index, and vector managers stay consistent.
 ///
 /// **Encryption:** When [encryptionKey] / [encryptionKeyId] are omitted, keys are
-/// taken from [EncryptionManager.getCurrentEncodingState] at call time (main-isolate
-/// global state, including [EncoderConfig.fallbackKeys] for decoding older pages).
+/// taken from [_dataStore.encryptionManager.getCurrentEncodingState] at call time
+/// (instance-scoped state, including [EncoderConfig.fallbackKeys] for decoding older pages).
 /// This service does not run in compute isolates; batch data-page encode uses a
 /// separate [EncoderConfig] snapshot -- page-0 meta in the same [writeChanges] should
 /// pass the same [encryptionKey] / [encryptionKeyId] as sibling B+Tree pages when a
@@ -299,6 +298,7 @@ final class TreeMetaPageService {
     final encoded = StorePageCodec.encodePayload(
       payload,
       config: _config,
+      encryptionManager: _dataStore.encryptionManager,
       encryptionKey: keys.key,
       encryptionKeyId: keys.keyId,
       aad: _aad(partitionNo, pageType),
@@ -540,6 +540,7 @@ final class TreeMetaPageService {
     final keys = _resolveEncryptionKeys(encryptionKey, encryptionKeyId);
     return StorePageCodec.decodePayload(
       encoded,
+      encryptionManager: _dataStore.encryptionManager,
       encryptionKey: keys.key,
       encryptionKeyId: keys.keyId,
       aad: _aad(partitionNo, pageType),
@@ -553,10 +554,11 @@ final class TreeMetaPageService {
     if (encryptionKey != null) {
       return (
         key: encryptionKey,
-        keyId: encryptionKeyId ?? EncryptionManager.getCurrentKeyId(),
+        keyId:
+            encryptionKeyId ?? _dataStore.encryptionManager.getCurrentKeyId(),
       );
     }
-    final state = EncryptionManager.getCurrentEncodingState();
+    final state = _dataStore.encryptionManager.getCurrentEncodingState();
     return (key: state.activeKey, keyId: state.keyId);
   }
 

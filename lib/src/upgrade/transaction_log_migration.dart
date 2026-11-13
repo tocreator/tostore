@@ -109,7 +109,10 @@ class TransactionLogMigration {
       if (await _dataStore.storage.existsFile(tobfPath)) {
         final bytes = await _dataStore.storage.readAsBytes(tobfPath);
         if (bytes.isNotEmpty) {
-          final meta = TxnMetaCodec.decodeMainFile(bytes);
+          final meta = TxnMetaCodec.decodeMainFile(
+            bytes,
+            encryptionManager: _dataStore.encryptionManager,
+          );
           final partitions = Set<int>.from(meta.activePartitions);
           partitions.add(meta.currentPartitionIndex);
           return partitions;
@@ -250,6 +253,7 @@ class TransactionLogMigration {
         event,
         partitionIndex,
         resolveTable: (tableUid) => _resolveTxnTableCodec(tableUid, spaceName),
+        encryptionManager: _dataStore.encryptionManager,
       ));
     }
     final rewritten = out.toBytes();

@@ -168,6 +168,7 @@ final class OverflowManager {
     final encodedPayload = StorePageCodec.encodePayload(
       payload,
       config: _dataStore.config,
+      encryptionManager: _dataStore.encryptionManager,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
       aad: _aadForOverflowPage(partitionNo, pageNo),
@@ -190,6 +191,7 @@ final class OverflowManager {
     final encodedPayload = StorePageCodec.encodePayload(
       FreePage(nextFreePageNo: nextFreePageNo).encodePayload(),
       config: _dataStore.config,
+      encryptionManager: _dataStore.encryptionManager,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
       aad: _aadForOverflowPage(partitionNo, pageNo),
@@ -244,6 +246,7 @@ final class OverflowManager {
         pageSize: pageSize,
         plainPayloadLen: mid,
         config: _dataStore.config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKeyId: encryptionKeyId,
       );
       if (ok) {
@@ -369,6 +372,7 @@ final class OverflowManager {
           }
           final decoded = StorePageCodec.decodePayload(
             parsed.encodedPayload,
+            encryptionManager: _dataStore.encryptionManager,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             aad: _aadForOverflowPage(pNo, freeHead),
@@ -431,6 +435,7 @@ final class OverflowManager {
     final parsed = StorePageIO.parsePageBytes(pageBytes);
     return StorePageCodec.decodePayload(
       parsed.encodedPayload,
+      encryptionManager: _dataStore.encryptionManager,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
       aad: _aadForOverflowPage(partitionNo, pageNo),
@@ -1029,6 +1034,7 @@ final class OverflowManager {
       final encodedPayload = StorePageCodec.encodePayload(
         payload,
         config: _dataStore.config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aadForOverflowPage(targetPartitionNo, pn),
@@ -1121,6 +1127,7 @@ final class OverflowManager {
           if (parsed.type != StorePageType.overflow) break;
           final decodedPayload = StorePageCodec.decodePayload(
             parsed.encodedPayload,
+            encryptionManager: _dataStore.encryptionManager,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             aad: _aadForOverflowPage(ref.overflowPartitionNo, curPageNo),
@@ -1161,6 +1168,7 @@ final class OverflowManager {
         final encodedPayload = StorePageCodec.encodePayload(
           payload,
           config: _dataStore.config,
+          encryptionManager: _dataStore.encryptionManager,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           aad: _aadForOverflowPage(ref.overflowPartitionNo, pn),
@@ -1331,6 +1339,7 @@ final class OverflowManager {
         final encodedPayload = StorePageCodec.encodePayload(
           freePage.encodePayload(),
           config: _dataStore.config,
+          encryptionManager: _dataStore.encryptionManager,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           aad: _aadForOverflowPage(ref.overflowPartitionNo, pn),
@@ -1482,6 +1491,7 @@ final class OverflowManager {
         }
         final decodedPayload = StorePageCodec.decodePayload(
           parsed.encodedPayload,
+          encryptionManager: _dataStore.encryptionManager,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           aad: _aadForOverflowPage(ref.overflowPartitionNo, pageNo),
@@ -1726,6 +1736,7 @@ final class OverflowManager {
         pageSize: pageSize,
         plainPayloadLen: plainLen,
         config: _dataStore.config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKeyId: encryptionKeyId,
       );
       if (ok) {
@@ -1771,6 +1782,7 @@ final class OverflowManager {
     final encodedPayload = StorePageCodec.encodePayload(
       payload,
       config: _dataStore.config,
+      encryptionManager: _dataStore.encryptionManager,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
       aad: _aadForOverflowPage(partitionNo, 0),
@@ -1803,6 +1815,7 @@ final class OverflowManager {
     }
     final decodedPayload = StorePageCodec.decodePayload(
       parsed.encodedPayload,
+      encryptionManager: _dataStore.encryptionManager,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
       aad: _aadForOverflowPage(partitionNo, 0),
@@ -1832,6 +1845,7 @@ final class OverflowManager {
     final encodedPayload = StorePageCodec.encodePayload(
       payload,
       config: _dataStore.config,
+      encryptionManager: _dataStore.encryptionManager,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
       aad: _aadForOverflowPage(partitionNo, 0),
@@ -1925,6 +1939,7 @@ final class OverflowManager {
         }
         final decodedPayload = StorePageCodec.decodePayload(
           parsed.encodedPayload,
+          encryptionManager: _dataStore.encryptionManager,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           aad: _aadForOverflowPage(partitionNo, head),

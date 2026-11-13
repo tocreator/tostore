@@ -9,44 +9,18 @@ import '../model/result_type.dart';
 import 'aes_gcm.dart';
 import 'chacha20_poly1305.dart';
 
-/// Data encryption is efficient and fast, slightly slower than regular UTF-8 encryption
-/// Protects data privacy by preventing casual viewing of data files
+/// Per-instance data encryption and obfuscation manager.
+///
+/// Holds key material, active keyId, fallback history keys, encryption type/scope,
+/// and instance-scoped key precomputation caches so multiple database instances
+/// and isolate workers never share mutable global encryption state.
 class EncryptionManager {
   /// encryption version
   static const int _encodingVersion = 1;
 
-  // current encryption type
-  static EncryptionType _encryptionType = EncryptionType.xorObfuscation;
-
-  // current encryption scope
-  static EncryptionScope _encryptionScope = EncryptionScope.standard;
-
-  /// Set encryption type (recommended API)
-  static void setEncryptionType(EncryptionType type) {
-    _encryptionType = type;
-  }
-
-  /// Get current encryption type
-  static EncryptionType getEncryptionType() {
-    return _encryptionType;
-  }
-
-  /// Set encryption scope
-  static void setEncryptionScope(EncryptionScope scope) {
-    _encryptionScope = scope;
-  }
-
-  /// Get current encryption scope
-  static EncryptionScope getEncryptionScope() {
-    return _encryptionScope;
-  }
-
   // default xor key
   static final Uint8List _defaultXorKey =
       Uint8List.fromList([42, 127, 89, 13, 71, 240, 23, 190, 119, 63]);
-
-  // current active key
-  static Uint8List _activeKey = _defaultXorKey;
 
   // High-performance encryption: UTF8 encryption with XOR obfuscation (binary data)
   static const String _encodeUtf8Prefix = "ToU8_";
@@ -60,33 +34,127 @@ class EncryptionManager {
   // AES-256-GCM encrypted binary data prefix
   static const String _encodeAesPrefix = "ToAe_";
 
-  // Fallback keys, mapping keyId to the key.
-  static Map<int, Uint8List>? _fallbackKeys;
+  // Instance encryption type
+  EncryptionType _encryptionType;
 
-  static int _currentKeyId = 0;
+  // Instance encryption scope
+  EncryptionScope _encryptionScope;
+
+  // Instance active key
+  Uint8List _activeKey;
+
+  // Fallback keys, mapping keyId to the key.
+  Map<int, Uint8List>? _fallbackKeys;
+
+  int _currentKeyId;
+
+  // Instance-scoped caches for key precomputation and derivation
+  List<int>? _cachedKey;
+  List<int>? _cachedKeyWordCache;
+  Uint8List? _cachedDeriveInputKey;
+  Uint8List? _cachedDerivedKey32;
+  Map<int, Uint8List>? _cachedFallbackMap;
+  List<int>? _cachedSortedFallbackIds;
+
+  EncryptionManager({
+    EncryptionType encryptionType = EncryptionType.xorObfuscation,
+    EncryptionScope encryptionScope = EncryptionScope.standard,
+    Uint8List? activeKey,
+    int keyId = 0,
+    Map<int, Uint8List>? fallbackKeys,
+  })  : _encryptionType = encryptionType,
+        _encryptionScope = encryptionScope,
+        _activeKey = (activeKey != null && activeKey.isNotEmpty)
+            ? Uint8List.fromList(activeKey)
+            : _defaultXorKey,
+        _currentKeyId = keyId,
+        _fallbackKeys = _copyFallbackMap(fallbackKeys);
+
+  factory EncryptionManager.fromConfig(EncoderConfig config) {
+    return EncryptionManager(
+      encryptionType: config.encryptionType,
+      encryptionScope: config.encryptionScope,
+      activeKey: config.activeKey,
+      keyId: config.keyId,
+      fallbackKeys: config.fallbackKeys,
+    );
+  }
+
+  /// Builds an isolated instance from static [DataStoreConfig] only
+  /// (intended for pure in-memory mode where [KeyManager.initialize] does not run
+  /// and there is no persisted key history on disk).
+  factory EncryptionManager.fromDataStoreConfig(DataStoreConfig? config) {
+    final ec = config?.encryptionConfig;
+    if (ec == null || ec.encryptionType == EncryptionType.none) {
+      return EncryptionManager(
+        encryptionType: EncryptionType.none,
+        encryptionScope: ec?.encryptionScope ?? EncryptionScope.standard,
+        activeKey: _defaultXorKey,
+        keyId: 0,
+      );
+    }
+    final activeKey = generateKey(ec.resolveEncodingKey());
+    return EncryptionManager(
+      encryptionType: ec.encryptionType,
+      encryptionScope: ec.encryptionScope,
+      activeKey: activeKey,
+      keyId: 1,
+      fallbackKeys: <int, Uint8List>{1: activeKey},
+    );
+  }
+
+  static Map<int, Uint8List>? _copyFallbackMap(Map<int, Uint8List>? keys) {
+    if (keys == null) return null;
+    if (keys.isEmpty) return const <int, Uint8List>{};
+    return Map<int, Uint8List>.unmodifiable(
+      keys.map((k, v) => MapEntry(k, Uint8List.fromList(v))),
+    );
+  }
+
+  /// Set encryption type (recommended API)
+  void setEncryptionType(EncryptionType type) {
+    _encryptionType = type;
+  }
+
+  /// Get current encryption type
+  EncryptionType getEncryptionType() {
+    return _encryptionType;
+  }
+
+  /// Set encryption scope
+  void setEncryptionScope(EncryptionScope scope) {
+    _encryptionScope = scope;
+  }
+
+  /// Get current encryption scope
+  EncryptionScope getEncryptionScope() {
+    return _encryptionScope;
+  }
 
   /// Sets the fallback keys. This is used to provide older keys for decoding data
   /// that might have been encrypted with a previous key.
-  static void setFallbackKeys(Map<int, Uint8List>? keys) {
-    _fallbackKeys = keys;
+  void setFallbackKeys(Map<int, Uint8List>? keys) {
+    _fallbackKeys = _copyFallbackMap(keys);
+    _cachedFallbackMap = null;
+    _cachedSortedFallbackIds = null;
   }
 
-  static void setCurrentKey(String key, int keyId) {
+  void setCurrentKey(String key, int keyId) {
     _activeKey = generateKey(key);
     _currentKeyId = keyId;
   }
 
   /// The key should be a Uint8List, each byte representing a value (0-255)
-  static void setKey(Uint8List customKey) {
+  void setKey(Uint8List customKey) {
     if (customKey.isNotEmpty) {
-      _activeKey = customKey;
+      _activeKey = Uint8List.fromList(customKey);
     } else {
       _activeKey = _defaultXorKey;
     }
   }
 
   /// Reset to default key
-  static void resetToDefaultKey() {
+  void resetToDefaultKey() {
     _activeKey = _defaultXorKey;
   }
 
@@ -105,23 +173,31 @@ class EncryptionManager {
   }
 
   /// Derive a 32-byte key from a variable-length key for AEAD algorithms
-  static Uint8List _deriveKey32(Uint8List key) {
-    if (key.isEmpty) {
-      key = _defaultXorKey;
+  Uint8List _deriveKey32(Uint8List key) {
+    final effectiveKey = key.isEmpty ? _defaultXorKey : key;
+    if (effectiveKey.length == 32) {
+      return effectiveKey; // Already correct size, no conversion needed!
     }
-    if (key.length == 32) {
-      return key; // Already correct size, no conversion needed!
+
+    final cachedIn = _cachedDeriveInputKey;
+    final cachedOut = _cachedDerivedKey32;
+    if (cachedIn != null &&
+        cachedOut != null &&
+        _bytesEqual(cachedIn, effectiveKey)) {
+      return cachedOut;
     }
 
     // Simple key derivation: repeat and XOR to get 32 bytes
     final result = Uint8List(32);
     for (int i = 0; i < 32; i++) {
-      result[i] = key[i % key.length];
+      result[i] = effectiveKey[i % effectiveKey.length];
       // Add some mixing to avoid simple patterns
       if (i > 0) {
         result[i] ^= result[i - 1];
       }
     }
+    _cachedDeriveInputKey = Uint8List.fromList(effectiveKey);
+    _cachedDerivedKey32 = result;
     return result;
   }
 
@@ -147,7 +223,7 @@ class EncryptionManager {
   /// [aad] - Additional Authenticated Data for AEAD algorithms.
   /// Should include context like partition index, entry seq, etc.
   /// If not provided, only the header will be used as AAD (less secure).
-  static Uint8List encodeBytes(Uint8List input,
+  Uint8List encodeBytes(Uint8List input,
       {Uint8List? customKey,
       int? keyId,
       EncryptionType? encryptionType,
@@ -160,7 +236,7 @@ class EncryptionManager {
     final usedKey = _normalizeCustomKey(customKey) ?? _activeKey;
     final usedKeyId = keyId ?? _currentKeyId;
 
-    // Determine encryption type (priority: parameter > global setting)
+    // Determine encryption type (priority: parameter > instance setting)
     EncryptionType actualType = encryptionType ?? _encryptionType;
 
     String headerStr;
@@ -243,7 +319,7 @@ class EncryptionManager {
   ///
   /// [aad] - Additional Authenticated Data for AEAD algorithms.
   /// Must match the AAD used during encryption.
-  static Uint8List decodeBytes(Uint8List encoded,
+  Uint8List decodeBytes(Uint8List encoded,
       {Uint8List? customKey, int? keyId, Uint8List? aad}) {
     if (encoded.isEmpty) return Uint8List(0);
 
@@ -262,13 +338,19 @@ class EncryptionManager {
     );
   }
 
-  static Uint8List _decryptWithHeaderBytes(
+  Uint8List _decryptWithHeaderBytes(
     Uint8List encoded,
-    ({EncryptionType encType, int headerEndIndex, int? keyId}) parsed, {
+    ({
+      EncryptionType encType,
+      int? version,
+      int headerEndIndex,
+      int? keyId
+    }) parsed, {
     Uint8List? customKey,
     int? keyId,
     Uint8List? aad,
   }) {
+    _validateParsedHeaderVersion(parsed.version, parsed.encType);
     if (parsed.headerEndIndex >= encoded.length) {
       throw DbException([
         GeneralStatus(
@@ -316,7 +398,7 @@ class EncryptionManager {
 
   /// Highest performance encryption: returns UTF-8 bytes, optionally encrypted
   /// Returns complete binary data with header bytes, suitable for direct storage in files or binary dataspaces
-  static Uint8List encode(String input,
+  Uint8List encode(String input,
       {Uint8List? customKey, int? keyId, EncryptionType? encryptionType}) {
     if (_encryptionType == EncryptionType.none && encryptionType == null) {
       return Uint8List.fromList(utf8.encode(input));
@@ -327,7 +409,7 @@ class EncryptionManager {
     final usedKeyId = keyId ?? _currentKeyId;
     final bytes = utf8.encode(input);
 
-    // Determine encryption type (priority: parameter > global setting)
+    // Determine encryption type (priority: parameter > instance setting)
     EncryptionType actualType = encryptionType ?? _encryptionType;
 
     String headerStr;
@@ -403,7 +485,7 @@ class EncryptionManager {
   /// Decode string from binary data with header information.
   ///
   /// Throws [DbException] if decryption, key resolution, or UTF-8 decoding fails.
-  static String decode(Uint8List encoded, {Uint8List? customKey, int? keyId}) {
+  String decode(Uint8List encoded, {Uint8List? customKey, int? keyId}) {
     if (encoded.isEmpty) return '';
 
     final parsed = _tryParseHeader(encoded);
@@ -429,12 +511,18 @@ class EncryptionManager {
     );
   }
 
-  static String _decryptWithHeaderToString(
+  String _decryptWithHeaderToString(
     Uint8List encoded,
-    ({EncryptionType encType, int headerEndIndex, int? keyId}) parsed, {
+    ({
+      EncryptionType encType,
+      int? version,
+      int headerEndIndex,
+      int? keyId
+    }) parsed, {
     Uint8List? customKey,
     int? keyId,
   }) {
+    _validateParsedHeaderVersion(parsed.version, parsed.encType);
     if (parsed.headerEndIndex >= encoded.length) {
       throw DbException([
         GeneralStatus(
@@ -491,7 +579,31 @@ class EncryptionManager {
     );
   }
 
-  static List<Uint8List> _resolveKeyCandidates(
+  static void _validateParsedHeaderVersion(
+      int? version, EncryptionType encType) {
+    if (version != null && version != _encodingVersion) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysInvalidDataFormat,
+          message:
+              'Unsupported encryption header version v$version for ${encType.name} (expected v$_encodingVersion)',
+        ),
+      ]);
+    }
+  }
+
+  List<int> _sortedFallbackIds(Map<int, Uint8List> fb) {
+    final cached = _cachedSortedFallbackIds;
+    if (cached != null && identical(_cachedFallbackMap, fb)) {
+      return cached;
+    }
+    final sorted = fb.keys.toList()..sort();
+    _cachedFallbackMap = fb;
+    _cachedSortedFallbackIds = sorted;
+    return sorted;
+  }
+
+  List<Uint8List> _resolveKeyCandidates(
     EncryptionType encType,
     int? headerKeyId, {
     required Uint8List? customKey,
@@ -499,7 +611,7 @@ class EncryptionManager {
     required bool forUtf8String,
   }) {
     // Explicit standalone customKey override without keyId scope: never fall back
-    // to global keys so callers testing/using a specific key fail cleanly.
+    // to instance keys so callers testing/using a specific key fail cleanly.
     if (customKey != null && keyId == null) {
       return <Uint8List>[customKey];
     }
@@ -555,8 +667,7 @@ class EncryptionManager {
         addCandidate(_activeKey);
         final fb = _fallbackKeys;
         if (fb != null && fb.isNotEmpty) {
-          final sortedIds = fb.keys.toList()..sort();
-          for (final id in sortedIds) {
+          for (final id in _sortedFallbackIds(fb)) {
             addCandidate(fb[id]);
           }
         }
@@ -571,8 +682,7 @@ class EncryptionManager {
       addCandidate(_defaultXorKey);
       final fb = _fallbackKeys;
       if (fb != null && fb.isNotEmpty) {
-        final sortedIds = fb.keys.toList()..sort();
-        for (final id in sortedIds) {
+        for (final id in _sortedFallbackIds(fb)) {
           addCandidate(fb[id]);
         }
       }
@@ -580,7 +690,7 @@ class EncryptionManager {
     return candidates;
   }
 
-  static Uint8List _decryptBytesWithKey(
+  Uint8List _decryptBytesWithKey(
     EncryptionType encType,
     Uint8List headerBytes,
     Uint8List dataBytes,
@@ -678,8 +788,12 @@ class EncryptionManager {
   /// - Standard: `<prefix>v<ver>_k<keyId>_`
   /// - Legacy versioned without keyId: `<prefix>v<ver>_`
   /// - Earliest prefix-only: `<prefix>`
-  static ({EncryptionType encType, int headerEndIndex, int? keyId})?
-      _tryParseHeader(Uint8List bytes) {
+  static ({
+    EncryptionType encType,
+    int? version,
+    int headerEndIndex,
+    int? keyId,
+  })? _tryParseHeader(Uint8List bytes) {
     final encType = _matchHeaderType(bytes);
     if (encType == null) return null;
 
@@ -695,24 +809,31 @@ class EncryptionManager {
           if (key != null) {
             return (
               encType: encType,
+              version: ver.value,
               headerEndIndex: key.nextIndex,
               keyId: key.value,
             );
           }
         }
-        return (encType: encType, headerEndIndex: verEnd, keyId: null);
+        return (
+          encType: encType,
+          version: ver.value,
+          headerEndIndex: verEnd,
+          keyId: null,
+        );
       }
     }
 
-    return (encType: encType, headerEndIndex: pos, keyId: null);
+    return (
+      encType: encType,
+      version: null,
+      headerEndIndex: pos,
+      keyId: null,
+    );
   }
 
-  /* Adding caching logic for key precomputation */
-  static List<int>? _cachedKey;
-  static List<int>? _cachedKeyWordCache;
-
-  /* Further optimized _applyXor implementation using precomputed keyWordCache with caching */
-  static Uint8List _applyXor(List<int> bytes, List<int> key) {
+  /* Further optimized _applyXor implementation using precomputed keyWordCache with instance caching */
+  Uint8List _applyXor(List<int> bytes, List<int> key) {
     final int len = bytes.length;
     final Uint8List result = Uint8List(len);
     _applyXorToDest(bytes, key, result, 0);
@@ -721,8 +842,8 @@ class EncryptionManager {
 
   /// Applies XOR to [bytes] using [key] and writes the result to [destination] starting at [destinationOffset].
   /// This avoids allocating a new buffer if one is already available.
-  static void _applyXorToDest(List<int> bytes, List<int> key,
-      Uint8List destination, int destinationOffset) {
+  void _applyXorToDest(List<int> bytes, List<int> key, Uint8List destination,
+      int destinationOffset) {
     if (key.isEmpty) {
       key = _defaultXorKey;
     }
@@ -739,11 +860,14 @@ class EncryptionManager {
     if (_cachedKey != null &&
         _cachedKeyWordCache != null &&
         _cachedKey!.length == keyLength) {
-      useCache = true;
-      for (int i = 0; i < keyLength; i++) {
-        if (_cachedKey![i] != key[i]) {
-          useCache = false;
-          break;
+      useCache = identical(_cachedKey, key);
+      if (!useCache) {
+        useCache = true;
+        for (int i = 0; i < keyLength; i++) {
+          if (_cachedKey![i] != key[i]) {
+            useCache = false;
+            break;
+          }
         }
       }
     }
@@ -810,7 +934,7 @@ class EncryptionManager {
   }
 
   /// Get key ID
-  static int getCurrentKeyId() {
+  int getCurrentKeyId() {
     return _currentKeyId;
   }
 
@@ -820,26 +944,31 @@ class EncryptionManager {
     return _tryParseHeader(bytes)?.keyId;
   }
 
-  /// Get current complete encryption state, for isolate thread passing
-  static EncoderConfig getCurrentEncodingState() {
+  /// Get current complete encryption state snapshot for isolate/worker passing.
+  EncoderConfig getCurrentEncodingState() {
+    final fb = _fallbackKeys;
     return EncoderConfig(
-      activeKey: _activeKey,
+      activeKey: Uint8List.fromList(_activeKey),
       keyId: _currentKeyId,
-      fallbackKeys: _fallbackKeys,
+      fallbackKeys: _copyFallbackMap(fb),
       encryptionType: _encryptionType,
       encryptionScope: _encryptionScope,
     );
   }
 
-  /// set complete encryption state, for isolate thread passing
-  static void setEncodingState(EncoderConfig config) {
-    _activeKey = config.activeKey;
+  /// Set complete encryption state
+  void setEncodingState(EncoderConfig config) {
+    _activeKey = config.activeKey.isNotEmpty
+        ? Uint8List.fromList(config.activeKey)
+        : _defaultXorKey;
     _currentKeyId = config.keyId;
     _encryptionType = config.encryptionType;
     _encryptionScope = config.encryptionScope;
-    _fallbackKeys = config.fallbackKeys;
+    _fallbackKeys = _copyFallbackMap(config.fallbackKeys);
+    _cachedFallbackMap = null;
+    _cachedSortedFallbackIds = null;
   }
 
   /// Check if encryption is enabled
-  static bool get isEncodingEnabled => _encryptionType != EncryptionType.none;
+  bool get isEncodingEnabled => _encryptionType != EncryptionType.none;
 }

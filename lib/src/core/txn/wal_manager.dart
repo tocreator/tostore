@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:typed_data';
 
-import '../../handler/encryption.dart';
 import '../../handler/logger.dart';
 import '../../handler/platform_handler.dart';
 import '../../model/buffer_entry.dart' show BufferOperationType;
@@ -581,7 +580,11 @@ class WalManager {
             buf.length < 512 * 1024) {
           final qEntry = _dequeueWal();
           inFlight.add(qEntry);
-          FastWalEncoder.encodeEntryIntoBuffer(qEntry.rawEntry!, buf);
+          FastWalEncoder.encodeEntryIntoBuffer(
+            qEntry.rawEntry!,
+            buf,
+            encryptionManager: _dataStore.encryptionManager,
+          );
           lastPartition = qEntry.pointer.partitionIndex;
           lastPointer = qEntry.pointer;
         }
@@ -821,7 +824,10 @@ class WalManager {
           if (await _dataStore.storage.existsFile(metaPath)) {
             final bytes = await _dataStore.storage.readAsBytes(metaPath);
             if (bytes.isNotEmpty) {
-              loaded = WalMetaCodec.decodeFile(bytes);
+              loaded = WalMetaCodec.decodeFile(
+                bytes,
+                encryptionManager: _dataStore.encryptionManager,
+              );
             }
           }
         } catch (e) {
@@ -833,7 +839,10 @@ class WalManager {
             if (await _dataStore.storage.existsFile(tempPath)) {
               final tempBytes = await _dataStore.storage.readAsBytes(tempPath);
               if (tempBytes.isNotEmpty) {
-                loaded = WalMetaCodec.decodeFile(tempBytes);
+                loaded = WalMetaCodec.decodeFile(
+                  tempBytes,
+                  encryptionManager: _dataStore.encryptionManager,
+                );
                 recoveredFromBackup = true;
                 // Self-heal: rewrite valid meta back
                 unawaited(
@@ -857,7 +866,10 @@ class WalManager {
             if (await _dataStore.storage.existsFile(backupPath)) {
               final bytes = await _dataStore.storage.readAsBytes(backupPath);
               if (bytes.isNotEmpty) {
-                loaded = WalMetaCodec.decodeFile(bytes);
+                loaded = WalMetaCodec.decodeFile(
+                  bytes,
+                  encryptionManager: _dataStore.encryptionManager,
+                );
                 recoveredFromBackup = true;
                 Logger.warn(
                     'Recovered WAL meta from backup after primary failure.');
@@ -1203,7 +1215,11 @@ class WalManager {
       try {
         final buf = _directSyncBuffer;
         buf.reset();
-        FastWalEncoder.encodeEntryIntoBuffer(walEntry, buf);
+        FastWalEncoder.encodeEntryIntoBuffer(
+          walEntry,
+          buf,
+          encryptionManager: _dataStore.encryptionManager,
+        );
         final writtenOffset = _dataStore.storage.appendBytesSync(
           path,
           buf.bytesView,
@@ -1328,6 +1344,7 @@ class WalManager {
         buf.reset();
         FastWalEncoder.encodeDirectEntryIntoBuffer(
           buf,
+          encryptionManager: _dataStore.encryptionManager,
           op: operation.index,
           tableUid: table.tableUid,
           data: data,
@@ -1431,6 +1448,7 @@ class WalManager {
     FastWalBatchSession? batchSession;
     if (schema.fields.isNotEmpty) {
       tableSession = FastWalTableSession.create(
+        encryptionManager: _dataStore.encryptionManager,
         op: op,
         tableUid: tableUid,
         tsIso: tsIso,
@@ -1441,6 +1459,7 @@ class WalManager {
       );
     } else {
       batchSession = FastWalBatchSession.create(
+        encryptionManager: _dataStore.encryptionManager,
         op: op,
         tableUid: tableUid,
         tsIso: tsIso,
@@ -2145,7 +2164,10 @@ class WalManager {
               final rawEntries = <Map<String, dynamic>>[
                 for (final q in queued) q.rawEntry!,
               ];
-              combined = FastWalEncoder.encodeBatch(rawEntries);
+              combined = FastWalEncoder.encodeBatch(
+                rawEntries,
+                encryptionManager: _dataStore.encryptionManager,
+              );
               groupRecordCount = rawEntries.length;
             }
 
@@ -2540,7 +2562,11 @@ class WalManager {
       // Efficiently decode only the last entry from the tail (backward scan)
       // decodeLastEntryFromTail scans backwards from the end to find the last
       // complete record, which works correctly even if we only have the tail
-      final lastEntry = WalEncoder.decodeLastEntryFromTail(tailData, pIdx);
+      final lastEntry = WalEncoder.decodeLastEntryFromTail(
+        tailData,
+        pIdx,
+        encryptionManager: _dataStore.encryptionManager,
+      );
       if (lastEntry != null) {
         final p = lastEntry['p'] as int?;
         final seq = (lastEntry['seq'] as num?)?.toInt();
@@ -2560,8 +2586,11 @@ class WalManager {
         final largerTailData = await _dataStore.storage
             .readAsBytesAt(path, largerOffset, length: largerReadSize);
         if (largerTailData.isEmpty) continue;
-        final lastEntryLarger =
-            WalEncoder.decodeLastEntryFromTail(largerTailData, pIdx);
+        final lastEntryLarger = WalEncoder.decodeLastEntryFromTail(
+          largerTailData,
+          pIdx,
+          encryptionManager: _dataStore.encryptionManager,
+        );
         if (lastEntryLarger != null) {
           final p = lastEntryLarger['p'] as int?;
           final seq = (lastEntryLarger['seq'] as num?)?.toInt();
@@ -2577,7 +2606,8 @@ class WalManager {
       if (fullData.isEmpty) {
         return WalPointer(partitionIndex: pIdx, entrySeq: 0);
       }
-      final encoderConfig = EncryptionManager.getCurrentEncodingState();
+      final encoderConfig =
+          _dataStore.encryptionManager.getCurrentEncodingState();
       final allEntries = await WalDecodeBatchRunner.decodeFile(
         fileBytes: fullData,
         partitionIndex: pIdx,
@@ -2847,6 +2877,7 @@ class WalManager {
           final bytes = WalMetaCodec.encodeFile(
             _meta,
             encryptionConfig: _dataStore.config.encryptionConfig,
+            encryptionManager: _dataStore.encryptionManager,
           );
           await _dataStore.storage
               .writeAsBytes(metaPath, bytes, flush: doFlush);

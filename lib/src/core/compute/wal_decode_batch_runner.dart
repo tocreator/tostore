@@ -55,8 +55,12 @@ final class WalDecodeChunkRequest {
 Future<List<Map<String, dynamic>>> decodeWalChunk(
   WalDecodeChunkRequest request,
 ) async {
-  EncryptionManager.setEncodingState(request.encoderConfig);
-  return WalEncoder.decodeFile(request.chunkBytes, request.partitionIndex);
+  final encryptionManager = EncryptionManager.fromConfig(request.encoderConfig);
+  return WalEncoder.decodeFile(
+    request.chunkBytes,
+    request.partitionIndex,
+    encryptionManager: encryptionManager,
+  );
 }
 
 /// Shared dispatcher for large WAL file decoding.
@@ -191,7 +195,12 @@ final class WalDecodeBatchRunner {
     }
 
     if (!plan.useIsolate && plan.ranges.length <= 1) {
-      return WalEncoder.decodeFile(decodeBytes, partitionIndex);
+      final encryptionManager = EncryptionManager.fromConfig(encoderConfig);
+      return WalEncoder.decodeFile(
+        decodeBytes,
+        partitionIndex,
+        encryptionManager: encryptionManager,
+      );
     }
 
     final tasks =

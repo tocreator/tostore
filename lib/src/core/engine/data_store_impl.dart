@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as path;
 
+import '../../handler/encryption.dart';
 import '../../handler/logger.dart';
 import '../../handler/parallel_processor.dart';
 import '../../handler/platform_handler.dart';
@@ -216,6 +217,7 @@ class DataStoreImpl {
   bool _isHighPressure = false;
   bool get isHighPressure => _isHighPressure;
   IntegrityChecker? _integrityChecker;
+  EncryptionManager _encryptionManager = EncryptionManager();
   KeyManager? _keyManager;
   WeightManager? _weightManager;
   late StorageAdapter storage;
@@ -235,6 +237,8 @@ class DataStoreImpl {
   static const Symbol _txnZoneKey = #to_txn_zone;
   // Whether to rollback on DbResult error inside a transaction
   static const Symbol _txnRollbackOnErrorKey = #to_txn_rollback_on_error;
+
+  EncryptionManager get encryptionManager => _encryptionManager;
 
   KeyManager get keyManager {
     if (_keyManager == null) {
@@ -781,6 +785,14 @@ class DataStoreImpl {
 
       _config =
           _config!.copyWith(dbPath: _dbPath, dbName: _dbName ?? config?.dbName);
+      // Disk-backed stores rely exclusively on KeyManager.initialize() (and
+      // upgrade bootstraps) to resolve persisted keyId / history fallbacks from
+      // GlobalConfig; resetting to a clean instance here avoids stale state on
+      // reinitialize without guessing keyId before KeyManager loads history.
+      // Memory mode skips KeyManager.initialize() and has no key history on disk.
+      _encryptionManager = isMemoryMode
+          ? EncryptionManager.fromDataStoreConfig(_config)
+          : EncryptionManager();
 
       // Initialize GlobalIdGenerator with the distributed node id from the config
       GlobalIdGenerator.initialize(_config!.distributedNodeConfig.nodeId);

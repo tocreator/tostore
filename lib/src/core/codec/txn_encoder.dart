@@ -182,9 +182,14 @@ class TxnEncoder {
     TxnLogEvent event,
     int partitionIndex, {
     required TxnTableCodecResolver resolveTable,
+    required EncryptionManager encryptionManager,
   }) async {
-    final entry =
-        await encode(event, partitionIndex, resolveTable: resolveTable);
+    final entry = await encode(
+      event,
+      partitionIndex,
+      resolveTable: resolveTable,
+      encryptionManager: encryptionManager,
+    );
     final result = Uint8List(4 + entry.length);
     ByteData.sublistView(result, 0, 4)
         .setUint32(0, entry.length, Endian.little);
@@ -197,13 +202,14 @@ class TxnEncoder {
     TxnLogEvent event,
     int partitionIndex, {
     required TxnTableCodecResolver resolveTable,
+    required EncryptionManager encryptionManager,
   }) async {
     final body = await _encodeBody(event, resolveTable: resolveTable);
 
     final aadData = ByteData(4);
     aadData.setInt32(0, partitionIndex, Endian.little);
     final encrypted =
-        EncryptionManager.encodeBytes(body, aad: aadData.buffer.asUint8List());
+        encryptionManager.encodeBytes(body, aad: aadData.buffer.asUint8List());
 
     final header = ByteData(9);
     header.setUint32(0, txnMagic, Endian.little);
@@ -221,6 +227,7 @@ class TxnEncoder {
     Uint8List fileBytes,
     int partitionIndex, {
     required TxnTableCodecResolver resolveTable,
+    required EncryptionManager encryptionManager,
   }) async {
     final events = <TxnLogEvent>[];
     int offset = 0;
@@ -238,8 +245,12 @@ class TxnEncoder {
           Uint8List.sublistView(fileBytes, offset, offset + recordLength);
       offset += recordLength;
       try {
-        final ev = await decodeSingle(recordData, partitionIndex,
-            resolveTable: resolveTable);
+        final ev = await decodeSingle(
+          recordData,
+          partitionIndex,
+          resolveTable: resolveTable,
+          encryptionManager: encryptionManager,
+        );
         if (ev != null) events.add(ev);
       } on DbException {
         rethrow;
@@ -255,6 +266,7 @@ class TxnEncoder {
     Uint8List data,
     int partitionIndex, {
     required TxnTableCodecResolver resolveTable,
+    required EncryptionManager encryptionManager,
   }) async {
     if (data.length < 9) return null;
     final header = ByteData.sublistView(data, 0, 9);
@@ -266,7 +278,7 @@ class TxnEncoder {
     final encryptedData = Uint8List.sublistView(data, 9, 9 + dataLen);
     final aadData = ByteData(4);
     aadData.setInt32(0, partitionIndex, Endian.little);
-    final decrypted = EncryptionManager.decodeBytes(
+    final decrypted = encryptionManager.decodeBytes(
       encryptedData,
       aad: aadData.buffer.asUint8List(),
     );

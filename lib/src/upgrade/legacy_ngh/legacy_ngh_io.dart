@@ -56,7 +56,10 @@ final class LegacyNghIo {
           await _dataStore.storage.readAsBytesAt(path, 0, length: pageSize);
       if (raw.isEmpty) return null;
       final parsed = StorePageIO.parsePageBytes(raw);
-      final plain = StorePageCodec.decodePayload(parsed.encodedPayload);
+      final plain = StorePageCodec.decodePayload(
+        parsed.encodedPayload,
+        encryptionManager: _dataStore.encryptionManager,
+      );
       final payload = TreeMetaPagePayload.tryDecodePlainPayload(plain);
       if (payload?.treeGlobalMeta == null) return null;
       final blob = TreeGlobalMetaBlobCodec.decode(payload!.treeGlobalMeta!);
@@ -89,7 +92,10 @@ final class LegacyNghIo {
         try {
           final parsed = StorePageIO.parsePageBytes(bytes);
           final page = NghNavGraphPage.tryDecodePayload(
-            StorePageCodec.decodePayload(parsed.encodedPayload),
+            StorePageCodec.decodePayload(
+              parsed.encodedPayload,
+              encryptionManager: _dataStore.encryptionManager,
+            ),
           );
           if (page != null) return page;
         } catch (_) {}
@@ -124,7 +130,10 @@ final class LegacyNghIo {
       if (raw.isEmpty) return null;
       final parsed = StorePageIO.parsePageBytes(raw);
       final page = NghLeafPage.tryDecodePayload(
-        StorePageCodec.decodePayload(parsed.encodedPayload),
+        StorePageCodec.decodePayload(
+          parsed.encodedPayload,
+          encryptionManager: _dataStore.encryptionManager,
+        ),
       );
       if (page != null && localCache != null) {
         localCache[cacheKey] = page;

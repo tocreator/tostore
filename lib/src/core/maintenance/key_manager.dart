@@ -186,12 +186,13 @@ class KeyManager {
       if (entry.value.isEmpty) continue;
       fallbackKeys[entry.key] = EncryptionManager.generateKey(entry.value);
     }
+    final enc = _dataStore.encryptionManager;
     if (newKey.isNotEmpty && newKeyId > 0) {
       fallbackKeys[newKeyId] = EncryptionManager.generateKey(newKey);
-      EncryptionManager.setCurrentKey(newKey, newKeyId);
+      enc.setCurrentKey(newKey, newKeyId);
     }
     if (fallbackKeys.isNotEmpty) {
-      EncryptionManager.setFallbackKeys(fallbackKeys);
+      enc.setFallbackKeys(fallbackKeys);
     }
 
     Logger.info(
@@ -205,9 +206,10 @@ class KeyManager {
     _getEncodingKey();
     _getEncryptionKey();
 
-    // Set EncoderHandler encryption type and scope
-    EncryptionManager.setEncryptionType(_getEncryptionType());
-    EncryptionManager.setEncryptionScope(_getEncryptionScope());
+    // Set EncoderHandler encryption type and scope on this instance
+    final enc = _dataStore.encryptionManager;
+    enc.setEncryptionType(_getEncryptionType());
+    enc.setEncryptionScope(_getEncryptionScope());
 
     var applied = await _loadOrCreateAppliedEncryption();
 
@@ -297,9 +299,10 @@ class KeyManager {
       fallbackKeys[info.keyId] = EncryptionManager.generateKey(info.key);
     }
 
+    final enc = _dataStore.encryptionManager;
     final encryptionType = _getEncryptionType();
     if (encryptionType == EncryptionType.none) {
-      EncryptionManager.setFallbackKeys(fallbackKeys);
+      enc.setFallbackKeys(fallbackKeys);
       return null;
     }
 
@@ -314,8 +317,8 @@ class KeyManager {
         applied.current.keyId == running.targetKeyId &&
         applied.current.key == newKey) {
       fallbackKeys[running.targetKeyId] = EncryptionManager.generateKey(newKey);
-      EncryptionManager.setFallbackKeys(fallbackKeys);
-      EncryptionManager.setCurrentKey(newKey, running.targetKeyId);
+      enc.setFallbackKeys(fallbackKeys);
+      enc.setCurrentKey(newKey, running.targetKeyId);
       return null;
     }
 
@@ -339,10 +342,10 @@ class KeyManager {
       );
     }
 
-    EncryptionManager.setFallbackKeys(fallbackKeys);
+    enc.setFallbackKeys(fallbackKeys);
 
     if (newKey.isNotEmpty) {
-      EncryptionManager.setCurrentKey(newKey, keyIdToUse);
+      enc.setCurrentKey(newKey, keyIdToUse);
     }
 
     return keyChangeInfo;
@@ -404,9 +407,10 @@ class KeyManager {
     for (final info in applied.getAllKeys()) {
       fallbackKeys[info.keyId] = EncryptionManager.generateKey(info.key);
     }
-    EncryptionManager.setFallbackKeys(fallbackKeys);
+    final enc = _dataStore.encryptionManager;
+    enc.setFallbackKeys(fallbackKeys);
     if (applied.current.key.isNotEmpty) {
-      EncryptionManager.setCurrentKey(
+      enc.setCurrentKey(
         applied.current.key,
         applied.current.keyId,
       );

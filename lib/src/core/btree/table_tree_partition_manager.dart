@@ -669,6 +669,7 @@ final class TableTreePartitionManager {
       if (parsed.type != StorePageType.leaf) return BTreeLeafPage.empty();
       final payload = StorePageCodec.decodePayload(
         parsed.encodedPayload,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(ptr, parsed.type),
@@ -755,6 +756,7 @@ final class TableTreePartitionManager {
       }
       final payload = StorePageCodec.decodePayload(
         parsed.encodedPayload,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(ptr, parsed.type),
@@ -1268,6 +1270,7 @@ final class TableTreePartitionManager {
         pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: leaf.estimatePayloadSize(),
         config: _config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKeyId: encryptionKeyId,
       );
     }
@@ -1277,6 +1280,7 @@ final class TableTreePartitionManager {
         pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: page.estimatePayloadSize(),
         config: _config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKeyId: encryptionKeyId,
       );
     }
@@ -1785,7 +1789,7 @@ final class TableTreePartitionManager {
 
       final int? encTypeIndex = _config.encryptionConfig?.encryptionType.index;
       final EncoderConfig encoderConfig =
-          EncryptionManager.getCurrentEncodingState();
+          _dataStore.encryptionManager.getCurrentEncodingState();
 
       EncryptionType? encType;
       if (encTypeIndex != null) {
@@ -1816,6 +1820,7 @@ final class TableTreePartitionManager {
             pageSize: _dataStore.configuredPageSize,
             plainPayloadLen: plainPayloadLen,
             config: _config,
+            encryptionManager: _dataStore.encryptionManager,
             encryptionKeyId: encryptionKeyId,
           );
 
@@ -2509,6 +2514,7 @@ final class TableTreePartitionManager {
       final enc = StorePageCodec.encodePayload(
         plain,
         config: _config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(p, StorePageType.leaf),
@@ -2525,6 +2531,7 @@ final class TableTreePartitionManager {
       final enc = StorePageCodec.encodePayload(
         plain,
         config: _config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(p, StorePageType.internal),
@@ -2616,6 +2623,7 @@ final class TableTreePartitionManager {
         pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: mergedLeaf.estimatePayloadSize(),
         config: _config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKeyId: encryptionKeyId,
       )) {
         ptr = leaf.next;
@@ -3154,6 +3162,7 @@ final class TableTreePartitionManager {
         }
         final payload = StorePageCodec.decodePayload(
           parsed.encodedPayload,
+          encryptionManager: _dataStore.encryptionManager,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           aad: _aad(ptr, parsed.type),

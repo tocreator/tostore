@@ -176,6 +176,7 @@ final class MetaFormatMigration {
     final bytes = WalMetaCodec.encodeFile(
       meta,
       encryptionConfig: dataStore.config.encryptionConfig,
+      encryptionManager: dataStore.encryptionManager,
     );
     await dataStore.storage.writeAsBytes(tobfPath, bytes, flush: true);
     try {
@@ -235,7 +236,10 @@ final class MetaFormatMigration {
       ]);
     }
     try {
-      WalMetaCodec.decodeFile(bytes);
+      WalMetaCodec.decodeFile(
+        bytes,
+        encryptionManager: dataStore.encryptionManager,
+      );
     } catch (e) {
       Logger.error('MetaFormatMigration: WAL TOBF decode failed', rawError: e);
       throw DbException([
@@ -270,7 +274,9 @@ final class MetaFormatMigration {
     if (hasMainTobf) {
       try {
         final meta = TxnMetaCodec.decodeMainFile(
-            await dataStore.storage.readAsBytes(mainTobf));
+          await dataStore.storage.readAsBytes(mainTobf),
+          encryptionManager: dataStore.encryptionManager,
+        );
         partitionsToCheck.addAll(meta.activePartitions);
         partitionsToCheck.add(meta.currentPartitionIndex);
         if (hasMainJson) {
@@ -363,11 +369,14 @@ final class MetaFormatMigration {
     final bytes = TxnMetaCodec.encodeMainFile(
       meta,
       encryptionConfig: dataStore.config.encryptionConfig,
+      encryptionManager: dataStore.encryptionManager,
     );
     await dataStore.storage.writeAsBytes(mainTobf, bytes, flush: true);
     try {
       TxnMetaCodec.decodeMainFile(
-          await dataStore.storage.readAsBytes(mainTobf));
+        await dataStore.storage.readAsBytes(mainTobf),
+        encryptionManager: dataStore.encryptionManager,
+      );
     } catch (e) {
       Logger.error(
         'MetaFormatMigration: txn main TOBF verify failed for space '
@@ -416,7 +425,10 @@ final class MetaFormatMigration {
       if (hasTobf) {
         try {
           final bytes = await dataStore.storage.readAsBytes(tobf);
-          TxnMetaCodec.decodePartitionFile(bytes);
+          TxnMetaCodec.decodePartitionFile(
+            bytes,
+            encryptionManager: dataStore.encryptionManager,
+          );
           if (hasJson) {
             await _deleteIfExists(dataStore, json);
           }
@@ -470,10 +482,14 @@ final class MetaFormatMigration {
         final bytes = TxnMetaCodec.encodePartitionFile(
           meta,
           encryptionConfig: dataStore.config.encryptionConfig,
+          encryptionManager: dataStore.encryptionManager,
         );
         await dataStore.storage.writeAsBytes(tobf, bytes, flush: true);
         final written = await dataStore.storage.readAsBytes(tobf);
-        TxnMetaCodec.decodePartitionFile(written);
+        TxnMetaCodec.decodePartitionFile(
+          written,
+          encryptionManager: dataStore.encryptionManager,
+        );
         await _deleteIfExists(dataStore, json);
       } catch (e) {
         Logger.error(

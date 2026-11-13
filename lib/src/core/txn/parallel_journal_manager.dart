@@ -4,7 +4,6 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../../handler/encryption.dart';
 import '../../handler/logger.dart';
 import '../../handler/parallel_processor.dart';
 import '../../handler/platform_handler.dart';
@@ -1836,7 +1835,8 @@ class ParallelJournalManager {
               .add(op.cutoff);
         }
       } catch (_) {}
-      final encoderConfig = EncryptionManager.getCurrentEncodingState();
+      final encoderConfig =
+          _dataStore.encryptionManager.getCurrentEncodingState();
       final partitionYieldController = YieldController(
           'ParallelJournalManager._recoverFromWal.partition',
           checkInterval: 1,
@@ -2631,7 +2631,8 @@ class ParallelJournalManager {
         );
       }
       final startN = normalizeWalPartitionIndex(startP, cap);
-      final encoderConfig = EncryptionManager.getCurrentEncodingState();
+      final encoderConfig =
+          _dataStore.encryptionManager.getCurrentEncodingState();
       final partitions = await _walManager.listPartitionsToScan(startP, endP);
       for (final p in partitions) {
         final path = _walManager.partitionLogPath(p);

@@ -71,6 +71,7 @@ class BackupManager {
       final metaBytes = BackupMetadataCodec.encodeFile(
         meta,
         encryptionConfig: _dataStore.config.encryptionConfig,
+        encryptionManager: _dataStore.encryptionManager,
       );
       await _dataStore.storage.writeAsBytes(
         p.join(backupDir, BackupMetadataCodec.fileName),
@@ -186,7 +187,10 @@ class BackupManager {
       try {
         final bytes = await _dataStore.storage.readAsBytes(tobfPath);
         if (bytes.isNotEmpty) {
-          return BackupMetadataCodec.decodeFile(bytes);
+          return BackupMetadataCodec.decodeFile(
+            bytes,
+            encryptionManager: _dataStore.encryptionManager,
+          );
         }
       } catch (e) {
         Logger.warn(

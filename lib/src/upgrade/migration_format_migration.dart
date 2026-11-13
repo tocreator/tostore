@@ -181,6 +181,7 @@ final class MigrationFormatMigration {
     final bytes = MigrationMetaCodec.encodeFile(
       meta,
       encryptionConfig: dataStore.config.encryptionConfig,
+      encryptionManager: dataStore.encryptionManager,
     );
     await dataStore.storage.writeAsBytes(tobfMeta, bytes, flush: true);
     await _tryDecodeMetaTobf(dataStore, tobfMeta);
@@ -390,6 +391,7 @@ final class MigrationFormatMigration {
     final bytes = MigrationTaskCodec.encodeFile(
       task,
       encryptionConfig: dataStore.config.encryptionConfig,
+      encryptionManager: dataStore.encryptionManager,
     );
     await dataStore.storage.writeAsBytes(tobfPath, bytes, flush: true);
     try {
@@ -465,7 +467,10 @@ final class MigrationFormatMigration {
       ]);
     }
     try {
-      return MigrationMetaCodec.decodeFile(bytes);
+      return MigrationMetaCodec.decodeFile(
+        bytes,
+        encryptionManager: dataStore.encryptionManager,
+      );
     } catch (e) {
       Logger.error(
           'MigrationFormatMigration: migration_meta TOBF decode failed',
@@ -502,7 +507,10 @@ final class MigrationFormatMigration {
       ]);
     }
     try {
-      MigrationTaskCodec.decodeFile(bytes);
+      MigrationTaskCodec.decodeFile(
+        bytes,
+        encryptionManager: dataStore.encryptionManager,
+      );
     } catch (e) {
       Logger.error('MigrationFormatMigration: task TOBF decode failed',
           rawError: e);

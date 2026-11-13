@@ -47,9 +47,10 @@ abstract final class MetaFileCodec {
     Uint8List payload, {
     required bool encrypt,
     required Uint8List aad,
+    required EncryptionManager encryptionManager,
   }) {
     final body =
-        encrypt ? EncryptionManager.encodeBytes(payload, aad: aad) : payload;
+        encrypt ? encryptionManager.encodeBytes(payload, aad: aad) : payload;
     return TobfFileCodec.encodeFrame(body, encrypted: encrypt);
   }
 
@@ -57,6 +58,7 @@ abstract final class MetaFileCodec {
   static Uint8List decodeFile(
     Uint8List frameBytes, {
     required Uint8List aad,
+    required EncryptionManager encryptionManager,
     int maxBodyLimit = maxBodyBytes,
   }) {
     final decoded = TobfFileCodec.decodeFrameWithHeader(
@@ -69,7 +71,7 @@ abstract final class MetaFileCodec {
     try {
       // Copy out of the TOBF frame view for AEAD alignment assumptions.
       final cipherBytes = Uint8List.fromList(decoded.body);
-      return EncryptionManager.decodeBytes(cipherBytes, aad: aad);
+      return encryptionManager.decodeBytes(cipherBytes, aad: aad);
     } catch (e) {
       throw DbException([
         GeneralStatus(

@@ -58,11 +58,12 @@ class FastWalEncoder {
   /// RecordLen = 9 + DataLen.
   static Uint8List encodeEntry(
     Map<String, dynamic> walEntry, {
+    required EncryptionManager encryptionManager,
     FastWalBuffer? buffer,
   }) {
     final buf = buffer ?? _sharedBuffer;
     buf.reset();
-    encodeEntryIntoBuffer(walEntry, buf);
+    encodeEntryIntoBuffer(walEntry, buf, encryptionManager: encryptionManager);
     return buf.copyCurrentBytes();
   }
 
@@ -71,11 +72,12 @@ class FastWalEncoder {
   /// Does not clear [buf], allowing multi-entry chaining in a single memory block.
   static void encodeEntryIntoBuffer(
     Map<String, dynamic> walEntry,
-    FastWalBuffer buf,
-  ) {
+    FastWalBuffer buf, {
+    required EncryptionManager encryptionManager,
+  }) {
     final int partitionIndex = (walEntry['p'] as int?) ?? 0;
     final isEncrypted =
-        EncryptionManager.getEncryptionType() != EncryptionType.none;
+        encryptionManager.getEncryptionType() != EncryptionType.none;
 
     if (!isEncrypted) {
       // Direct in-place encode path: write header placeholder, serialize payload, fill header
@@ -100,7 +102,7 @@ class FastWalEncoder {
       _writeWalEnvelope(tempBuf, walEntry);
       final rawPayload = tempBuf.bytesView;
 
-      final encryptedPayload = EncryptionManager.encodeBytes(
+      final encryptedPayload = encryptionManager.encodeBytes(
         rawPayload,
         aad: _partitionAad(partitionIndex),
       );
@@ -118,6 +120,7 @@ class FastWalEncoder {
   /// Encodes a single WAL entry directly appending into [buf] without allocating an intermediate Map.
   static void encodeDirectEntryIntoBuffer(
     FastWalBuffer buf, {
+    required EncryptionManager encryptionManager,
     required int op,
     required String tableUid,
     required Map<String, dynamic> data,
@@ -128,7 +131,7 @@ class FastWalEncoder {
     Map<String, dynamic>? oldValues,
   }) {
     final isEncrypted =
-        EncryptionManager.getEncryptionType() != EncryptionType.none;
+        encryptionManager.getEncryptionType() != EncryptionType.none;
 
     if (!isEncrypted) {
       final int recordStart = buf.length;
@@ -170,7 +173,7 @@ class FastWalEncoder {
       );
       final rawPayload = tempBuf.bytesView;
 
-      final encryptedPayload = EncryptionManager.encodeBytes(
+      final encryptedPayload = encryptionManager.encodeBytes(
         rawPayload,
         aad: _partitionAad(partitionIndex),
       );
@@ -190,6 +193,7 @@ class FastWalEncoder {
   /// Returns the view of the buffer containing all length-prefixed records.
   static Uint8List encodeBatch(
     List<Map<String, dynamic>> walEntries, {
+    required EncryptionManager encryptionManager,
     FastWalBuffer? buffer,
   }) {
     if (walEntries.isEmpty) return Uint8List(0);
@@ -197,7 +201,11 @@ class FastWalEncoder {
     buf.reset();
     final int n = walEntries.length;
     if (n >= 16) {
-      encodeEntryIntoBuffer(walEntries[0], buf);
+      encodeEntryIntoBuffer(
+        walEntries[0],
+        buf,
+        encryptionManager: encryptionManager,
+      );
       final int probed = buf.length;
       buf.reset();
       if (probed > 0) {
@@ -205,7 +213,11 @@ class FastWalEncoder {
       }
     }
     for (int i = 0; i < n; i++) {
-      encodeEntryIntoBuffer(walEntries[i], buf);
+      encodeEntryIntoBuffer(
+        walEntries[i],
+        buf,
+        encryptionManager: encryptionManager,
+      );
     }
     return buf.copyCurrentBytes();
   }
@@ -213,15 +225,21 @@ class FastWalEncoder {
   /// Encodes batch into [buf] without allocating an extra copy.
   static void encodeBatchInto(
     List<Map<String, dynamic>> walEntries,
-    FastWalBuffer buf,
-  ) {
+    FastWalBuffer buf, {
+    required EncryptionManager encryptionManager,
+  }) {
     for (int i = 0; i < walEntries.length; i++) {
-      encodeEntryIntoBuffer(walEntries[i], buf);
+      encodeEntryIntoBuffer(
+        walEntries[i],
+        buf,
+        encryptionManager: encryptionManager,
+      );
     }
   }
 
   /// Creates a [FastWalBatchSession] for streaming direct batch encoding.
   static FastWalBatchSession createBatchSession({
+    required EncryptionManager encryptionManager,
     required int op,
     required String tableUid,
     required String tsIso,
@@ -230,6 +248,7 @@ class FastWalEncoder {
     bool hasOldValues = false,
   }) {
     return FastWalBatchSession.create(
+      encryptionManager: encryptionManager,
       op: op,
       tableUid: tableUid,
       tsIso: tsIso,
@@ -241,6 +260,7 @@ class FastWalEncoder {
 
   /// Creates a [FastWalTableSession] for streaming direct batch encoding using table schema.
   static FastWalTableSession createTableSession({
+    required EncryptionManager encryptionManager,
     required int op,
     required String tableUid,
     required String tsIso,
@@ -250,6 +270,7 @@ class FastWalEncoder {
     bool hasOldValues = false,
   }) {
     return FastWalTableSession.create(
+      encryptionManager: encryptionManager,
       op: op,
       tableUid: tableUid,
       tsIso: tsIso,
@@ -860,6 +881,7 @@ class FastWalBuffer {
 /// into a contiguous byte chunk, avoiding per-record Map allocations, key lookups,
 /// and redundant string/integer encodings.
 class FastWalBatchSession {
+  final EncryptionManager _encryptionManager;
   final Uint8List _staticPrefix;
   final int partitionIndex;
   final bool hasOldValues;
@@ -868,6 +890,7 @@ class FastWalBatchSession {
   FastWalBuffer? _encryptBuf;
 
   FastWalBatchSession._(
+    this._encryptionManager,
     this._staticPrefix,
     this.partitionIndex,
     this.hasOldValues,
@@ -876,6 +899,7 @@ class FastWalBatchSession {
   );
 
   factory FastWalBatchSession.create({
+    required EncryptionManager encryptionManager,
     required int op,
     required String tableUid,
     required String tsIso,
@@ -914,9 +938,10 @@ class FastWalBatchSession {
     }
 
     final isEncrypted =
-        EncryptionManager.getEncryptionType() != EncryptionType.none;
+        encryptionManager.getEncryptionType() != EncryptionType.none;
 
     return FastWalBatchSession._(
+      encryptionManager,
       prefixBuf.copyCurrentBytes(),
       partitionIndex,
       hasOldValues,
@@ -952,7 +977,7 @@ class FastWalBatchSession {
       tempBuf.reset();
       _writePayload(tempBuf, record, seq, oldValues);
 
-      final encryptedPayload = EncryptionManager.encodeBytes(
+      final encryptedPayload = _encryptionManager.encodeBytes(
         tempBuf.bytesView,
         aad: _aad,
       );
@@ -1028,6 +1053,7 @@ class _SchemaWalFieldsDescriptor {
 /// Pre-compiles table schema field MessagePack key tokens and data envelope,
 /// enabling zero-allocation, typed-dispatch serialization of structured records.
 class FastWalTableSession {
+  final EncryptionManager _encryptionManager;
   final Uint8List _staticPrefix;
   final List<FastWalTableField> _fields;
   final int partitionIndex;
@@ -1101,6 +1127,7 @@ class FastWalTableSession {
   }
 
   FastWalTableSession._({
+    required EncryptionManager encryptionManager,
     required Uint8List staticPrefix,
     required List<FastWalTableField> fields,
     required this.partitionIndex,
@@ -1109,7 +1136,8 @@ class FastWalTableSession {
     required int estimatedRecordBytes,
     required List<dynamic> fieldScratch,
     required Uint8List aad,
-  })  : _staticPrefix = staticPrefix,
+  })  : _encryptionManager = encryptionManager,
+        _staticPrefix = staticPrefix,
         _fields = fields,
         _isEncrypted = isEncrypted,
         _estimatedRecordBytes = estimatedRecordBytes,
@@ -1117,6 +1145,7 @@ class FastWalTableSession {
         _aad = aad;
 
   factory FastWalTableSession.create({
+    required EncryptionManager encryptionManager,
     required int op,
     required String tableUid,
     required String tsIso,
@@ -1161,12 +1190,13 @@ class FastWalTableSession {
     final descriptor = _getOrCreateSchemaDescriptor(schema);
 
     final isEncrypted =
-        EncryptionManager.getEncryptionType() != EncryptionType.none;
+        encryptionManager.getEncryptionType() != EncryptionType.none;
 
     final estimatedRecordBytes =
         prefixBuf.length + 40 + descriptor.estimatedFieldsBytes;
 
     return FastWalTableSession._(
+      encryptionManager: encryptionManager,
       staticPrefix: prefixBuf.copyCurrentBytes(),
       fields: descriptor.fields,
       partitionIndex: partitionIndex,
@@ -1228,7 +1258,7 @@ class FastWalTableSession {
       tempBuf.reset();
       _writePayload(tempBuf, record, seq, oldValues);
 
-      final encryptedPayload = EncryptionManager.encodeBytes(
+      final encryptedPayload = _encryptionManager.encodeBytes(
         tempBuf.bytesView,
         aad: _aad,
       );

@@ -428,7 +428,10 @@ class MigrationManager {
         if (!await _dataStore.storage.existsFile(taskPath)) continue;
         final bytes = await _dataStore.storage.readAsBytes(taskPath);
         if (bytes.isEmpty) continue;
-        final task = MigrationTaskCodec.decodeFile(bytes);
+        final task = MigrationTaskCodec.decodeFile(
+          bytes,
+          encryptionManager: _dataStore.encryptionManager,
+        );
         if (task.tableUid != tableUid) continue;
         if (!_isUnfinishedSchemaTask(task)) continue;
         out.add(task);
@@ -3676,7 +3679,7 @@ class MigrationManager {
         // indexes stay index-only (caller owns backfill semantics).
         // Rebuild scope stays limited via specificIndexUids.
         //
-        // Runtime [updateSchema] often omits [targetSchema] — also detect
+        // Runtime [updateSchema] often omits [targetSchema] - also detect
         // sourceField from sibling setTtlConfig / setCapacityConfig ops.
         final field = operation.field;
         if (field != null &&
@@ -3692,8 +3695,8 @@ class MigrationManager {
       if (operation.type == MigrationType.setTableTtlConfig) {
         // Attaching/changing an explicit sourceField must rewrite rows when
         // defaults may be missing (new column, cross-task addField without
-        // materialize, or grandfather → explicit). Same sourceField + ttlMs
-        // only → index/schema metadata, no rewrite.
+        // materialize, or grandfather -> explicit). Same sourceField + ttlMs
+        // only -> index/schema metadata, no rewrite.
         if (_ttlOrCapacitySourceAttachNeedsRewrite(
           newSourceField: operation.ttlConfig?.sourceField,
           oldSourceField: operation.oldTtlConfig?.sourceField ??
@@ -3848,10 +3851,10 @@ class MigrationManager {
 
   /// Whether attaching/changing an explicit [newSourceField] needs row rewrite.
   ///
-  /// - Field absent from old schema / added in this task → rewrite (defaults).
-  /// - First enable or grandfather→explicit / sourceField rename → rewrite
+  /// - Field absent from old schema / added in this task rewrite (defaults).
+  /// - First enable or grandfather-explicit / sourceField rename - rewrite
   ///   (cross-task `addField` without materialize otherwise leaves empty index).
-  /// - Same explicit sourceField already in use → no rewrite.
+  /// - Same explicit sourceField already in use - no rewrite.
   bool _ttlOrCapacitySourceAttachNeedsRewrite({
     required String? newSourceField,
     required String? oldSourceField,
@@ -5041,7 +5044,10 @@ class MigrationManager {
             ),
           ]);
         } else {
-          _migrationMetaCache = MigrationMetaCodec.decodeFile(bytes);
+          _migrationMetaCache = MigrationMetaCodec.decodeFile(
+            bytes,
+            encryptionManager: _dataStore.encryptionManager,
+          );
         }
       }
     } catch (e) {
@@ -5054,7 +5060,10 @@ class MigrationManager {
         if (await _dataStore.storage.existsFile(tempPath)) {
           final tempBytes = await _dataStore.storage.readAsBytes(tempPath);
           if (tempBytes.isNotEmpty) {
-            final recovered = MigrationMetaCodec.decodeFile(tempBytes);
+            final recovered = MigrationMetaCodec.decodeFile(
+              tempBytes,
+              encryptionManager: _dataStore.encryptionManager,
+            );
             _migrationMetaCache = recovered;
             // Self-heal: rewrite valid meta back to primary path
             unawaited(
@@ -5126,6 +5135,7 @@ class MigrationManager {
       final bytes = MigrationMetaCodec.encodeFile(
         meta,
         encryptionConfig: _dataStore.config.encryptionConfig,
+        encryptionManager: _dataStore.encryptionManager,
       );
       await _dataStore.storage.writeAsBytes(metaPath, bytes);
 
@@ -5146,6 +5156,7 @@ class MigrationManager {
     final bytes = MigrationTaskCodec.encodeFile(
       task,
       encryptionConfig: _dataStore.config.encryptionConfig,
+      encryptionManager: _dataStore.encryptionManager,
     );
     // Task body first; crash before mapping update leaves an orphan file (OK).
     await _dataStore.storage.writeAsBytes(taskPath, bytes);
@@ -7425,7 +7436,10 @@ class MigrationManager {
         final taskBytes = await _dataStore.storage.readAsBytes(taskPath);
 
         if (taskBytes.isNotEmpty) {
-          final task = MigrationTaskCodec.decodeFile(taskBytes);
+          final task = MigrationTaskCodec.decodeFile(
+            taskBytes,
+            encryptionManager: _dataStore.encryptionManager,
+          );
 
           // Promote swap may leave pendingMigrationSpaces empty while
           // shadowTableUid is still set (crash between last-space drain and
@@ -7552,7 +7566,10 @@ class MigrationManager {
 
         final content = await _dataStore.storage.readAsBytes(taskPath);
         if (content.isNotEmpty) {
-          final task = MigrationTaskCodec.decodeFile(content);
+          final task = MigrationTaskCodec.decodeFile(
+            content,
+            encryptionManager: _dataStore.encryptionManager,
+          );
           if (!_isUnfinishedSchemaTask(task)) {
             continue;
           }
@@ -7704,7 +7721,10 @@ class MigrationManager {
       }
 
       // parse task information
-      final task = MigrationTaskCodec.decodeFile(taskBytes);
+      final task = MigrationTaskCodec.decodeFile(
+        taskBytes,
+        encryptionManager: _dataStore.encryptionManager,
+      );
 
       // get processed and pending spaces information
       final allSpaces = await _getAllSpaces();
@@ -8224,7 +8244,7 @@ class MigrationManager {
                   .where((fk) => !fk.fields.contains(fieldName))
                   .toList(),
               // Disable TTL / capacity if the source field is removed.
-              // Must use clearTtlConfig — copyWith(ttlConfig: null) is a no-op.
+              // Must use clearTtlConfig - copyWith(ttlConfig: null) is a no-op.
               clearTtlConfig: result.ttlConfig?.sourceField == fieldName,
               clearCapacityConfig:
                   result.capacityConfig?.sourceField == fieldName,

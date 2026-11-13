@@ -196,7 +196,10 @@ class TransactionManager {
         if (await _dataStore.storage.existsFile(path)) {
           final bytes = await _dataStore.storage.readAsBytes(path);
           if (bytes.isNotEmpty) {
-            _mainMetaCache = TxnMetaCodec.decodeMainFile(bytes);
+            _mainMetaCache = TxnMetaCodec.decodeMainFile(
+              bytes,
+              encryptionManager: _dataStore.encryptionManager,
+            );
           }
         }
       }
@@ -443,6 +446,7 @@ class TransactionManager {
         planEvent,
         currentIndex,
         resolveTable: _resolveTxnTableCodec,
+        encryptionManager: _dataStore.encryptionManager,
       );
 
       // Use in-memory size cache to avoid frequent filesystem size calls
@@ -483,6 +487,7 @@ class TransactionManager {
           planEvent,
           nextIndex,
           resolveTable: _resolveTxnTableCodec,
+          encryptionManager: _dataStore.encryptionManager,
         );
         final nextCached = _logSizeCache![nextLogPath];
         final nextBase =
@@ -1345,7 +1350,10 @@ class TransactionManager {
       if (await _dataStore.storage.existsFile(path)) {
         final bytes = await _dataStore.storage.readAsBytes(path);
         if (bytes.isNotEmpty) {
-          meta = TxnMetaCodec.decodePartitionFile(bytes);
+          meta = TxnMetaCodec.decodePartitionFile(
+            bytes,
+            encryptionManager: _dataStore.encryptionManager,
+          );
         } else {
           meta = TransactionPartitionMeta(partitionIndex: partitionIndex);
         }
@@ -1374,6 +1382,7 @@ class TransactionManager {
     final bytes = TxnMetaCodec.encodePartitionFile(
       meta,
       encryptionConfig: _dataStore.config.encryptionConfig,
+      encryptionManager: _dataStore.encryptionManager,
     );
     await _dataStore.storage.writeAsBytes(path, bytes, flush: flush);
     _partitionMetaCache[meta.partitionIndex] = meta;
@@ -1385,6 +1394,7 @@ class TransactionManager {
     final bytes = TxnMetaCodec.encodeMainFile(
       _mainMetaCache!,
       encryptionConfig: _dataStore.config.encryptionConfig,
+      encryptionManager: _dataStore.encryptionManager,
     );
     await _dataStore.storage.writeAsBytes(path, bytes, flush: flush);
   }
@@ -1517,6 +1527,7 @@ class TransactionManager {
       event,
       partitionIndex,
       resolveTable: _resolveTxnTableCodec,
+      encryptionManager: _dataStore.encryptionManager,
     );
     await _dataStore.storage.appendBytes(path, record, flush: false);
     _logSizeCache ??= <String, int>{};
@@ -1542,6 +1553,7 @@ class TransactionManager {
       bytes,
       partitionIndex,
       resolveTable: _resolveTxnTableCodec,
+      encryptionManager: _dataStore.encryptionManager,
     );
   }
 

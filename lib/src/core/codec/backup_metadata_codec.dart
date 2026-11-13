@@ -4,6 +4,7 @@ import '../../model/backup_metadata.dart';
 import '../../model/backup_scope.dart';
 import '../../model/data_store_config.dart';
 import '../../handler/binary_codec.dart';
+import '../../handler/encryption.dart';
 import 'meta_file_codec.dart';
 
 /// Stable field IDs for [BackupMetadata]. Never reuse IDs.
@@ -91,19 +92,25 @@ abstract final class BackupMetadataCodec {
   static Uint8List encodeFile(
     BackupMetadata meta, {
     required EncryptionConfig? encryptionConfig,
+    required EncryptionManager encryptionManager,
   }) {
     return MetaFileCodec.encodeFile(
       encodePayload(meta),
       encrypt: MetaFileCodec.shouldEncrypt(encryptionConfig),
       aad: MetaFileCodec.backupMetaAad,
+      encryptionManager: encryptionManager,
     );
   }
 
-  static BackupMetadata decodeFile(Uint8List frameBytes) {
+  static BackupMetadata decodeFile(
+    Uint8List frameBytes, {
+    required EncryptionManager encryptionManager,
+  }) {
     return decodePayload(
       MetaFileCodec.decodeFile(
         frameBytes,
         aad: MetaFileCodec.backupMetaAad,
+        encryptionManager: encryptionManager,
         maxBodyLimit: MetaFileCodec.maxBodyBytesSmall,
       ),
     );

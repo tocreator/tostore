@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import '../../model/data_store_config.dart';
 import '../../model/transaction_models.dart';
 import '../../handler/binary_codec.dart';
+import '../../handler/encryption.dart';
 import 'meta_file_codec.dart';
 
 /// Stable field IDs for transaction meta. Never reuse IDs.
@@ -117,34 +118,52 @@ final class TxnMetaCodec {
   static Uint8List encodeMainFile(
     TransactionMainMeta meta, {
     required EncryptionConfig? encryptionConfig,
+    required EncryptionManager encryptionManager,
   }) {
     return MetaFileCodec.encodeFile(
       encodeMainPayload(meta),
       encrypt: MetaFileCodec.shouldEncrypt(encryptionConfig),
       aad: MetaFileCodec.txnMetaAad,
+      encryptionManager: encryptionManager,
     );
   }
 
-  static TransactionMainMeta decodeMainFile(Uint8List frameBytes) {
+  static TransactionMainMeta decodeMainFile(
+    Uint8List frameBytes, {
+    required EncryptionManager encryptionManager,
+  }) {
     return decodeMainPayload(
-      MetaFileCodec.decodeFile(frameBytes, aad: MetaFileCodec.txnMetaAad),
+      MetaFileCodec.decodeFile(
+        frameBytes,
+        aad: MetaFileCodec.txnMetaAad,
+        encryptionManager: encryptionManager,
+      ),
     );
   }
 
   static Uint8List encodePartitionFile(
     TransactionPartitionMeta meta, {
     required EncryptionConfig? encryptionConfig,
+    required EncryptionManager encryptionManager,
   }) {
     return MetaFileCodec.encodeFile(
       encodePartitionPayload(meta),
       encrypt: MetaFileCodec.shouldEncrypt(encryptionConfig),
       aad: MetaFileCodec.txnMetaAad,
+      encryptionManager: encryptionManager,
     );
   }
 
-  static TransactionPartitionMeta decodePartitionFile(Uint8List frameBytes) {
+  static TransactionPartitionMeta decodePartitionFile(
+    Uint8List frameBytes, {
+    required EncryptionManager encryptionManager,
+  }) {
     return decodePartitionPayload(
-      MetaFileCodec.decodeFile(frameBytes, aad: MetaFileCodec.txnMetaAad),
+      MetaFileCodec.decodeFile(
+        frameBytes,
+        aad: MetaFileCodec.txnMetaAad,
+        encryptionManager: encryptionManager,
+      ),
     );
   }
 }

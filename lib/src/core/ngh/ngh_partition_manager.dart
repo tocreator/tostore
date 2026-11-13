@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
+import '../../handler/encryption.dart';
 import '../../handler/logger.dart';
 import '../../handler/parallel_processor.dart';
 import '../../handler/platform_byte_data.dart';
@@ -176,6 +177,7 @@ final class NghPartitionManager {
   static const int _maxPartitionIoChunkBytes = 1024 * 1024;
 
   DataStoreConfig get engineConfig => _dataStore.config;
+  EncryptionManager get encryptionManager => _dataStore.encryptionManager;
 
   /// 8MB payload covers a ~1M-key locator tree and a hot slice at 10M+.
   static const int _pkmapBurstCacheMaxBytes = 8 * 1024 * 1024;
@@ -1033,6 +1035,7 @@ final class NghPartitionManager {
       pageSize: pageSize,
       plainPayloadLen: plainPayloadLen,
       config: _dataStore.config,
+      encryptionManager: _dataStore.encryptionManager,
     );
   }
 
@@ -1041,6 +1044,7 @@ final class NghPartitionManager {
       pageSize: pageSize,
       plainPayloadLen: plainPayloadLen,
       config: _dataStore.config,
+      encryptionManager: _dataStore.encryptionManager,
     );
   }
 
@@ -2156,6 +2160,7 @@ final class NghPartitionManager {
       encodedPayload = StorePageCodec.encodePayload(
         payload,
         config: _dataStore.config,
+        encryptionManager: _dataStore.encryptionManager,
       );
     } else {
       encodedPayload = payload;
@@ -2171,6 +2176,7 @@ final class NghPartitionManager {
   Uint8List _decodePayload(Uint8List encodedPayload) {
     return StorePageCodec.decodePayload(
       encodedPayload,
+      encryptionManager: _dataStore.encryptionManager,
     );
   }
 

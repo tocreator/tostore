@@ -4,7 +4,6 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../../handler/encryption.dart';
 import '../../handler/logger.dart';
 import '../../handler/memcomparable.dart';
 import '../../handler/parallel_processor.dart';
@@ -331,6 +330,7 @@ final class IndexTreePartitionManager {
       if (parsed.type != StorePageType.leaf) return BTreeLeafPage.empty();
       final payload = StorePageCodec.decodePayload(
         parsed.encodedPayload,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(ptr, parsed.type),
@@ -409,6 +409,7 @@ final class IndexTreePartitionManager {
       }
       final payload = StorePageCodec.decodePayload(
         parsed.encodedPayload,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(ptr, parsed.type),
@@ -814,6 +815,7 @@ final class IndexTreePartitionManager {
         pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: leaf.estimatePayloadSize(),
         config: _dataStore.config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKeyId: encryptionKeyId,
       );
     }
@@ -823,6 +825,7 @@ final class IndexTreePartitionManager {
         pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: page.estimatePayloadSize(),
         config: _dataStore.config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKeyId: encryptionKeyId,
       );
     }
@@ -1183,7 +1186,7 @@ final class IndexTreePartitionManager {
       final int? encTypeIndex =
           _dataStore.config.encryptionConfig?.encryptionType.index;
       final EncoderConfig encoderConfig =
-          EncryptionManager.getCurrentEncodingState();
+          _dataStore.encryptionManager.getCurrentEncodingState();
 
       EncryptionType? encType;
       if (encTypeIndex != null) {
@@ -1211,6 +1214,7 @@ final class IndexTreePartitionManager {
             pageSize: _dataStore.configuredPageSize,
             plainPayloadLen: plainPayloadLen,
             config: _dataStore.config,
+            encryptionManager: _dataStore.encryptionManager,
             encryptionKeyId: encryptionKeyId,
           );
 
@@ -1877,6 +1881,7 @@ final class IndexTreePartitionManager {
       final enc = StorePageCodec.encodePayload(
         plain,
         config: _dataStore.config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(p, StorePageType.leaf),
@@ -1893,6 +1898,7 @@ final class IndexTreePartitionManager {
       final enc = StorePageCodec.encodePayload(
         plain,
         config: _dataStore.config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(p, StorePageType.internal),
@@ -1983,6 +1989,7 @@ final class IndexTreePartitionManager {
         pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: mergedLeaf.estimatePayloadSize(),
         config: _dataStore.config,
+        encryptionManager: _dataStore.encryptionManager,
         encryptionKeyId: encryptionKeyId,
       )) {
         ptr = leaf.next;

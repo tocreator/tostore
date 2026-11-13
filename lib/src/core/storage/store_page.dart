@@ -1112,13 +1112,14 @@ final class StorePageCodec {
   static Uint8List encodePayload(
     Uint8List payload, {
     required DataStoreConfig config,
+    required EncryptionManager encryptionManager,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     Uint8List? aad,
   }) {
     final ec = config.encryptionConfig;
     if (ec == null) return payload;
-    return EncryptionManager.encodeBytes(
+    return encryptionManager.encodeBytes(
       payload,
       customKey: encryptionKey,
       keyId: encryptionKeyId,
@@ -1130,11 +1131,12 @@ final class StorePageCodec {
   /// Decode an encoded payload; plaintext passes through when unencrypted.
   static Uint8List decodePayload(
     Uint8List encoded, {
+    required EncryptionManager encryptionManager,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     Uint8List? aad,
   }) {
-    return EncryptionManager.decodeBytes(
+    return encryptionManager.decodeBytes(
       encoded,
       customKey: encryptionKey,
       keyId: encryptionKeyId,
@@ -1189,13 +1191,14 @@ final class StorePageSizer {
   static int estimateEncodedPayloadLength(
     int plainPayloadLen, {
     required DataStoreConfig config,
+    required EncryptionManager encryptionManager,
     int? encryptionKeyId,
   }) {
     if (plainPayloadLen <= 0) return 0;
     final ec = config.encryptionConfig;
     if (ec == null) return plainPayloadLen;
 
-    final int keyId = encryptionKeyId ?? EncryptionManager.getCurrentKeyId();
+    final int keyId = encryptionKeyId ?? encryptionManager.getCurrentKeyId();
     final int headerLen = _encoderHeaderLen(keyId);
 
     switch (ec.encryptionType) {
@@ -1216,11 +1219,13 @@ final class StorePageSizer {
     required int pageSize,
     required int plainPayloadLen,
     required DataStoreConfig config,
+    required EncryptionManager encryptionManager,
     int? encryptionKeyId,
   }) {
     final encodedLen = estimateEncodedPayloadLength(
       plainPayloadLen,
       config: config,
+      encryptionManager: encryptionManager,
       encryptionKeyId: encryptionKeyId,
     );
     // Margin covers encoder header / keyId digit variance and AEAD overhead.

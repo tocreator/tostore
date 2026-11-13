@@ -1629,8 +1629,8 @@ class BatchWalEncodeResult {
 /// Batch encode WAL entries
 Future<BatchWalEncodeResult> batchEncodeWal(
     BatchWalEncodeRequest request) async {
-  // 1. Sync encoder state
-  EncryptionManager.setEncodingState(request.encoderConfig);
+  // 1. Construct task-local encoder from snapshot (no shared global state)
+  final encryptionManager = EncryptionManager.fromConfig(request.encoderConfig);
 
   final results = <Uint8List>[];
   final yieldController =
@@ -1641,7 +1641,10 @@ Future<BatchWalEncodeResult> batchEncodeWal(
     final y8 = yieldController.maybeYield();
     if (y8 != null) await y8;
     // WalEncoder.encodeAsLine checks partition 'p' inside the entry
-    final encoded = WalEncoder.encodeAsLine(entry);
+    final encoded = WalEncoder.encodeAsLine(
+      entry,
+      encryptionManager: encryptionManager,
+    );
     results.add(encoded);
   }
 
@@ -1761,8 +1764,8 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
   final pages = request.pages;
   if (pages.isEmpty) return const BatchBTreePageEncodeResult(<Uint8List>[]);
 
-  // Ensure isolate has the same encoder state as main isolate.
-  EncryptionManager.setEncodingState(request.encoderConfig);
+  // Construct task-local encoder from snapshot (no shared global state).
+  final encryptionManager = EncryptionManager.fromConfig(request.encoderConfig);
 
   final int? encTypeIndex = request.encryptionTypeIndex;
   final EncryptionType? encType = encTypeIndex == null
@@ -1806,7 +1809,7 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
       // No encryption config: keep payload as-is (no header).
       encodedPayload = plainPayload;
     } else {
-      encodedPayload = EncryptionManager.encodeBytes(
+      encodedPayload = encryptionManager.encodeBytes(
         plainPayload,
         customKey: request.customKey,
         keyId: request.customKeyId,
@@ -1819,7 +1822,7 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
     final int totalLen = StorePageHeader.size + encodedPayload.length;
     if (totalLen > pageSize) {
       final int keyId =
-          request.customKeyId ?? EncryptionManager.getCurrentKeyId();
+          request.customKeyId ?? encryptionManager.getCurrentKeyId();
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,

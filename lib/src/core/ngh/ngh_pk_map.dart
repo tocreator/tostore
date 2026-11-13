@@ -202,6 +202,7 @@ final class NghPkMapEngine {
         pageSize: _pageSize,
         plainPayloadLen: plainLen,
         config: _config,
+        encryptionManager: _partitions.encryptionManager,
       );
 
   bool _keyFitsLeaf(BTreeLeafPage leaf, Uint8List key) {
