@@ -84,7 +84,7 @@ import 'package:tostore/tostore.dart';
 | `backup({compress, scope})` | `Future<String>` |
 | `restore(String, {deleteAfterRestore, cleanupBeforeRestore})` | `Future<bool>` |
 | `transaction<T>(action, {rollbackOnError, persistRecoveryOnCommit, isolation})` | `Future<TransactionResult>` |
-| `rotateEncryptionKey({oldKey, required newKey})` | `Future<DbResult>` |
+| `rotateEncryptionKey({oldKey, required String? newKey})` | `Future<DbResult>` | `newKey: null` or `""` reverts to engine built-in default KEK |
 | `flush({mode})` | `Future<void>` | `FlushMode`: `recovery`, `recoveryDurable`, `full` (default) |
 | `close({flush, keepActiveSpace})` | `Future<void>` | `flush: false` discards pending buffers (e.g. about to delete DB); `keepActiveSpace: false` clears active space |
 | `deleteDatabase({dbPath, dbName})` | `Future<void>` | Closes with `flush: false`, then deletes DB files |

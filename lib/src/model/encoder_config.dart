@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import '../handler/sha256.dart';
 import 'data_store_config.dart';
 
 class EncoderConfig {
@@ -61,7 +62,31 @@ class EncoderConfig {
 /// Used for engine-default KEK/DEK when the user does not supply keys.
 /// Material is mixed from opaque byte tables + [seed] so the resulting
 /// passphrase is not present as a plaintext string constant in the binary.
+///
+/// Never relies on [String.hashCode], which differs across Dart VM/Wasm vs
+/// dart2js/DDC and is not guaranteed stable across Dart SDK upgrades.
 String deriveBuiltinKey(String seed) {
+  final int initialMix;
+  if (seed == 'encryption_v1') {
+    initialMix = 0xB4;
+  } else if (seed == 'encoding_v1') {
+    initialMix = 0xC8;
+  } else {
+    initialMix = SHA256.stringToBytes(seed)[0];
+  }
+  return _deriveBuiltinKeyWithInitialMix(seed, initialMix);
+}
+
+/// Historical Web JS (`dart2js` / DDC) built-in KEK fallback prior to removing
+/// [String.hashCode] dependency. Used strictly for read fallback + auto-rewrap.
+String historicalJsDefaultEncryptionKey() =>
+    _deriveBuiltinKeyWithInitialMix('encryption_v1', 0xD0);
+
+/// Historical Web JS (`dart2js` / DDC) built-in DEK fallback (if ever needed).
+String historicalJsDefaultEncodingKey() =>
+    _deriveBuiltinKeyWithInitialMix('encoding_v1', 0x0A);
+
+String _deriveBuiltinKeyWithInitialMix(String seed, int initialMix) {
   final parts = <int>[
     0x48,
     0x65,
@@ -103,7 +128,7 @@ String deriveBuiltinKey(String seed) {
   ];
 
   final o = Uint8List(parts.length);
-  int x = seed.hashCode & 0xFF;
+  int x = initialMix & 0xFF;
   for (int i = 0; i < parts.length; i++) {
     o[i] = (parts[i] ^ x ^ (i * 7)) & 0xFF;
     x = ((x << 1) | (x >> 7)) & 0xFF;

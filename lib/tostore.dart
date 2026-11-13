@@ -1334,9 +1334,11 @@ class ToStore implements DataStoreInterface {
   /// Rotate [EncryptionConfig.encryptionKey].
   ///
   /// Use when your security policy requires rotating the master encryption key.
-  /// [oldKey] is the key currently in use; pass `null` to use the engine
-  /// built-in default (first-time move from unset -> explicit key).
-  /// [newKey] takes effect immediately and should be passed on the next [open].
+  /// [oldKey] is the key currently in use; pass `null` or `""` to use the
+  /// engine built-in default (first-time move from unset -> explicit key).
+  /// [newKey] takes effect immediately and should be passed on the next [open];
+  /// pass `null` or `""` to revert to the engine built-in default key
+  /// (whitespace characters are preserved verbatim).
   ///
   /// Does not rewrite table, index, or log data. To rotate the data encryption
   /// key, change [EncryptionConfig.encodingKey] instead -- the engine migrates
@@ -1345,15 +1347,16 @@ class ToStore implements DataStoreInterface {
   /// 轮换 [EncryptionConfig.encryptionKey]。
   ///
   /// 用于按安全策略定期更换主加密密钥。[oldKey] 为当前正在使用的密钥；
-  /// 传 `null` 表示使用引擎内置默认密钥（从未配置 -> 首次配置）。
-  /// [newKey] 立即对本实例生效，并应在下次 [open] 时传入。
+  /// 传 `null` 或 `""` 表示使用引擎内置默认密钥（从未配置 -> 首次配置）。
+  /// [newKey] 立即对本实例生效，并应在下次 [open] 时传入；传 `null` 或 `""`
+  /// 表示切换回引擎内置默认密钥（空格等空白字符按原样保留，不做裁剪）。
   ///
   /// 不会重新加密已有的表、索引与日志数据。若要更换数据加密密钥，
   /// 请修改 [EncryptionConfig.encodingKey]，引擎会自动迁移数据。
   @override
   Future<DbResult> rotateEncryptionKey({
     String? oldKey,
-    required String newKey,
+    required String? newKey,
   }) async {
     final result = await _impl.rotateEncryptionKey(
       oldKey: oldKey,

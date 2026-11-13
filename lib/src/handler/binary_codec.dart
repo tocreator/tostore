@@ -51,26 +51,34 @@ class BinaryWriter {
     writeVarint((fieldId << 3) | wireType);
   }
 
+  static const bool _isJs = identical(0, 0.0);
+
   /// Writes an unsigned Varint (up to 64-bit).
   ///
   /// Uses lo/hi uint32 shifting so dart2js never sees a 64-bit mask literal
   /// (`0xFFFFFFFFFFFFFFFF`) and logical shifts stay well-defined on JS.
   void writeVarint(int value) {
-    _ensureCapacity(10);
     // Split into unsigned 32-bit halves (portable across VM and JS).
-    var lo = value & 0xFFFFFFFF;
-    var hi = identical(0, 0.0)
+    final lo = value & 0xFFFFFFFF;
+    final hi = _isJs
         ? ((value / 0x100000000).floor() & 0xFFFFFFFF)
         : ((value >> 32) & 0xFFFFFFFF);
+    _writeVarintParts(lo, hi);
+  }
+
+  void _writeVarintParts(int lo, int hi) {
+    _ensureCapacity(10);
+    var curLo = lo & 0xFFFFFFFF;
+    var curHi = hi & 0xFFFFFFFF;
     while (true) {
-      if (hi == 0 && (lo & ~0x7F) == 0) {
-        _buf[_len++] = lo;
+      if (curHi == 0 && (curLo & ~0x7F) == 0) {
+        _buf[_len++] = curLo;
         return;
       }
-      _buf[_len++] = (lo & 0x7F) | 0x80;
+      _buf[_len++] = (curLo & 0x7F) | 0x80;
       // Unsigned >> 7 across the 64-bit value.
-      lo = ((lo >>> 7) | ((hi & 0x7F) << 25)) & 0xFFFFFFFF;
-      hi >>>= 7;
+      curLo = ((curLo >>> 7) | ((curHi & 0x7F) << 25)) & 0xFFFFFFFF;
+      curHi >>>= 7;
     }
   }
 
@@ -82,6 +90,16 @@ class BinaryWriter {
 
   /// Writes a signed 64-bit integer using ZigZag encoding.
   void writeZigZag64(int value) {
+    if (_isJs) {
+      final lo = value & 0xFFFFFFFF;
+      final hi = (value / 0x100000000).floor() & 0xFFFFFFFF;
+      final sign = (hi & 0x80000000) != 0 ? 0xFFFFFFFF : 0;
+      final zzLo = (((lo << 1) & 0xFFFFFFFF) ^ sign) & 0xFFFFFFFF;
+      final zzHi =
+          ((((hi << 1) | (lo >>> 31)) & 0xFFFFFFFF) ^ sign) & 0xFFFFFFFF;
+      _writeVarintParts(zzLo, zzHi);
+      return;
+    }
     final zz = (value << 1) ^ (value >> 63);
     writeVarint(zz);
   }
@@ -230,8 +248,14 @@ class BinaryReader {
     return (tag >> 3, tag & 0x07);
   }
 
+  static const bool _isJs = identical(0, 0.0);
+
   /// Reads a Varint with strict 64-bit bounds and overflow prevention.
   int readVarint() {
+    if (_isJs) {
+      final parts = _readVarintPartsJs();
+      return parts.hi * 0x100000000 + parts.lo;
+    }
     int result = 0;
     int shift = 0;
     while (shift < 64) {
@@ -264,6 +288,45 @@ class BinaryReader {
     ]);
   }
 
+  ({int lo, int hi}) _readVarintPartsJs() {
+    var lo = 0;
+    var hi = 0;
+    var shift = 0;
+    while (shift < 64) {
+      _checkLimit(1);
+      final b = _buf[_pos++];
+      if (shift == 63 && (b & ~1) != 0) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'TOBF: Varint 64-bit overflow detected on 10th byte',
+          )
+        ]);
+      }
+
+      final payload = b & 0x7F;
+      if (shift < 28) {
+        lo = (lo | (payload << shift)) & 0xFFFFFFFF;
+      } else if (shift == 28) {
+        lo = (lo | ((payload & 0x0F) << 28)) & 0xFFFFFFFF;
+        hi = (hi | (payload >>> 4)) & 0xFFFFFFFF;
+      } else {
+        hi = (hi | (payload << (shift - 32))) & 0xFFFFFFFF;
+      }
+
+      if ((b & 0x80) == 0) {
+        return (lo: lo & 0xFFFFFFFF, hi: hi & 0xFFFFFFFF);
+      }
+      shift += 7;
+    }
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.engError,
+        message: 'TOBF: Varint overflow (> 10 bytes)',
+      )
+    ]);
+  }
+
   /// Reads a signed 32-bit ZigZag integer with precise truncation.
   int readZigZag32() {
     final raw = readVarint();
@@ -273,6 +336,19 @@ class BinaryReader {
 
   /// Reads a signed 64-bit ZigZag integer with precise truncation.
   int readZigZag64() {
+    if (_isJs) {
+      final parts = _readVarintPartsJs();
+      final lo = parts.lo;
+      final hi = parts.hi;
+      final neg = (lo & 1) != 0 ? 0xFFFFFFFF : 0;
+      final valLo =
+          ((((lo >>> 1) | ((hi & 1) << 31)) & 0xFFFFFFFF) ^ neg) & 0xFFFFFFFF;
+      final valHi = (((hi >>> 1) & 0xFFFFFFFF) ^ neg) & 0xFFFFFFFF;
+      if ((valHi & 0x80000000) != 0) {
+        return (valHi - 0x100000000) * 0x100000000 + valLo;
+      }
+      return valHi * 0x100000000 + valLo;
+    }
     final raw = readVarint();
     final val = (raw >>> 1) ^ -(raw & 1);
     return val.toSigned(64);

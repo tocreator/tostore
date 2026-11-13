@@ -1162,12 +1162,14 @@ class EncryptionConfig {
     EncryptionType? encryptionType,
     String? encodingKey,
     String? encryptionKey,
+    bool clearEncryptionKey = false,
     EncryptionScope? encryptionScope,
   }) {
     return EncryptionConfig(
       encryptionType: encryptionType ?? this.encryptionType,
       encodingKey: encodingKey ?? this.encodingKey,
-      encryptionKey: encryptionKey ?? this.encryptionKey,
+      encryptionKey:
+          clearEncryptionKey ? null : (encryptionKey ?? this.encryptionKey),
       encryptionScope: encryptionScope ?? this.encryptionScope,
     );
   }

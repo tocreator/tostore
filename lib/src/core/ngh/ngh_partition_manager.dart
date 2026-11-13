@@ -5,6 +5,7 @@ import 'package:path/path.dart' as p;
 
 import '../../handler/logger.dart';
 import '../../handler/parallel_processor.dart';
+import '../../handler/platform_byte_data.dart';
 import '../../handler/platform_handler.dart';
 import '../../interface/storage_interface.dart';
 import '../../model/data_store_config.dart';
@@ -1115,23 +1116,50 @@ final class NghPartitionManager {
           continue;
         }
         final pageCount = fileSize ~/ pageSize;
+        final yc = YieldController(
+          'NghPartitionManager.rewriteEncryptedPages',
+          checkInterval: 32,
+          minCheckInterval: 8,
+        );
         for (int pg = 0; pg < pageCount; pg++) {
+          final y = yc.maybeYield();
+          if (y != null) await y;
+          final raw = await _dataStore.storage
+              .readAsBytesAt(path, pg * pageSize, length: pageSize);
+          if (raw.isEmpty) continue;
+          final ({StorePageType type, Uint8List encodedPayload}) parsed;
           try {
-            final raw = await _dataStore.storage
-                .readAsBytesAt(path, pg * pageSize, length: pageSize);
-            if (raw.isEmpty) continue;
-            final parsed = StorePageIO.parsePageBytes(raw);
-            final plain = _decodePayload(parsed.encodedPayload);
-            final rebuilt = _buildPageBytes(
-              parsed.type,
-              plain,
-              pageSize,
-              _dataStore.config.encryptionConfig?.shouldEncryptVectorIndex ??
-                  false,
+            parsed = StorePageIO.parsePageBytes(raw);
+          } catch (e) {
+            // Skip uninitialized zero-filled page slots; propagate corruption.
+            if (StorePageHeader.tryDecode(raw) == null &&
+                _isAllZeroBytes(raw)) {
+              continue;
+            }
+            Logger.error(
+              'Corrupted NGH page during key migration: table=${table.tableName} indexUid=$indexUid partition=$p page=$pg path=$path',
+              rawError: e,
             );
-            await _dataStore.storage
-                .writeAsBytesAt(path, pg * pageSize, rebuilt);
-          } catch (_) {}
+            rethrow;
+          }
+          final Uint8List plain;
+          try {
+            plain = _decodePayload(parsed.encodedPayload);
+          } catch (e) {
+            Logger.error(
+              'Failed to decrypt NGH page during key migration: table=${table.tableName} indexUid=$indexUid partition=$p page=$pg path=$path',
+              rawError: e,
+            );
+            rethrow;
+          }
+          final rebuilt = _buildPageBytes(
+            parsed.type,
+            plain,
+            pageSize,
+            _dataStore.config.encryptionConfig?.shouldEncryptVectorIndex ??
+                false,
+          );
+          await _dataStore.storage.writeAsBytesAt(path, pg * pageSize, rebuilt);
         }
       }
     }
@@ -1139,6 +1167,13 @@ final class NghPartitionManager {
     await rewriteCategory(NghDataCategory.leaf, meta.leafPartitionCount);
     await rewriteCategory(NghDataCategory.nav, meta.navPartitionCount);
     await rewriteCategory(NghDataCategory.pkmap, meta.pkmapPartitionCount);
+  }
+
+  static bool _isAllZeroBytes(Uint8List bytes) {
+    for (int i = 0; i < bytes.length; i++) {
+      if (bytes[i] != 0) return false;
+    }
+    return true;
   }
 
   // =====================================================================
@@ -2090,7 +2125,7 @@ final class NghPartitionManager {
   // =====================================================================
 
   int _cacheKey(int partitionNo, int pageNo) =>
-      (partitionNo << 32) | (pageNo & 0xFFFFFFFF);
+      PlatformByteData.packUint32Pair(partitionNo, pageNo);
 
   /// Build raw page bytes (header + payload + padding).
   ///

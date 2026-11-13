@@ -112,12 +112,12 @@ MUST NOT hardcode production secrets; prefer OS Keychain/Keystore and pass into 
 
 ```dart
 Future<DbResult> rotateEncryptionKey({
-  String? oldKey, // null if previously unset (engine default)
-  required String newKey,
+  String? oldKey, // null or "" if previously unset (engine default)
+  required String? newKey, // null or "" reverts to engine default; whitespace preserved verbatim
 });
 ```
 
-On success, pass the new `encryptionKey` on next `open`. Fails if wrong `oldKey` or encoding migration in progress.
+On success, pass the new `encryptionKey` (or omit / pass `null` if reverted to default) on next `open`. Fails if wrong `oldKey`, effective new key equals effective old key, or encoding migration in progress.
 
 ## ToCrypto (value-level, no db required)
 

@@ -9,6 +9,7 @@ import 'sha256.dart';
 /// Optimized Manual ChaCha20-Poly1305 Implementation
 /// Compliant with RFC 7539
 class ChaCha20Poly1305 {
+  static const bool _isJs = identical(0, 0.0);
   static final Uint8List defaultKey = Uint8List.fromList([
     41,
     66,
@@ -111,11 +112,15 @@ class ChaCha20Poly1305 {
     required Uint8List encryptedData,
     Uint8List? key,
     Uint8List? aad,
+    bool allowLegacyJsMac = false,
+    void Function()? onLegacyJsMacUsed,
   }) {
     final plaintextBytes = decryptBytes(
       encryptedData: encryptedData,
       key: key,
       aad: aad,
+      allowLegacyJsMac: allowLegacyJsMac,
+      onLegacyJsMacUsed: onLegacyJsMacUsed,
     );
     return utf8.decode(plaintextBytes);
   }
@@ -124,6 +129,8 @@ class ChaCha20Poly1305 {
     required Uint8List encryptedData,
     Uint8List? key,
     Uint8List? aad,
+    bool allowLegacyJsMac = false,
+    void Function()? onLegacyJsMacUsed,
   }) {
     key ??= defaultKey;
     if (key.length != 32) {
@@ -167,15 +174,29 @@ class ChaCha20Poly1305 {
     final polyKey = Uint8List(32);
     _chacha20Block0(key, nonce, polyKey);
 
-    // 2. Verify MAC
+    // 2. Verify MAC (fast RFC 7539 path first; fallback only when enabled & mismatched)
     final computedTag = _poly1305Mac(ciphertext, aad, polyKey);
     if (!_constantTimeEqual(tag, computedTag)) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message: 'Authentication failed',
-        )
-      ]);
+      if (allowLegacyJsMac) {
+        final legacyTag = _poly1305MacLegacyJs(ciphertext, aad, polyKey);
+        if (_constantTimeEqual(tag, legacyTag)) {
+          onLegacyJsMacUsed?.call();
+        } else {
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message: 'Authentication failed',
+            )
+          ]);
+        }
+      } else {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Authentication failed',
+          )
+        ]);
+      }
     }
 
     // 3. Decrypt
@@ -738,6 +759,578 @@ class ChaCha20Poly1305 {
   // --- Poly1305 Core (Optimized) ---
 
   static Uint8List _poly1305Mac(Uint8List msg, Uint8List aad, Uint8List key) {
+    if (_isJs) {
+      return _poly1305MacWeb(msg, aad, key);
+    }
+    return _poly1305MacVm(msg, aad, key);
+  }
+
+  /// Portable RFC 7539 Poly1305 using 10x 13-bit limbs for Web JS (`dart2js`/DDC).
+  ///
+  /// All products and sums remain strictly `< 2^34` (well within JS Number's `2^53`
+  /// exact integer range), and carry propagation uses integer division instead of
+  /// `>> 26` so 32-bit JS shifts never truncate upper bits.
+  static Uint8List _poly1305MacWeb(
+      Uint8List msg, Uint8List aad, Uint8List key) {
+    final k = ByteData.sublistView(key);
+    final k0 = k.getUint32(0, Endian.little);
+    final k1 = k.getUint32(4, Endian.little);
+    final k2 = k.getUint32(8, Endian.little);
+    final k3 = k.getUint32(12, Endian.little);
+
+    final r26_0 = k0 & 0x03FFFFFF;
+    final r26_1 = ((k0 >>> 26) | (k1 << 6)) & 0x03FFFF03;
+    final r26_2 = ((k1 >>> 20) | (k2 << 12)) & 0x03FFC0FF;
+    final r26_3 = ((k2 >>> 14) | (k3 << 18)) & 0x03F03FFF;
+    final r26_4 = (k3 >>> 8) & 0x000FFFFF;
+
+    final r0 = r26_0 & 0x1FFF;
+    final r1 = (r26_0 >>> 13) & 0x1FFF;
+    final r2 = r26_1 & 0x1FFF;
+    final r3 = (r26_1 >>> 13) & 0x1FFF;
+    final r4 = r26_2 & 0x1FFF;
+    final r5 = (r26_2 >>> 13) & 0x1FFF;
+    final r6 = r26_3 & 0x1FFF;
+    final r7 = (r26_3 >>> 13) & 0x1FFF;
+    final r8 = r26_4 & 0x1FFF;
+    final r9 = (r26_4 >>> 13) & 0x1FFF;
+
+    final s1 = r1 * 5;
+    final s2 = r2 * 5;
+    final s3 = r3 * 5;
+    final s4 = r4 * 5;
+    final s5 = r5 * 5;
+    final s6 = r6 * 5;
+    final s7 = r7 * 5;
+    final s8 = r8 * 5;
+    final s9 = r9 * 5;
+
+    int h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0;
+    int h5 = 0, h6 = 0, h7 = 0, h8 = 0, h9 = 0;
+
+    void feedBlock(int t0, int t1, int t2, int t3) {
+      final v0 = t0 & 0x03FFFFFF;
+      final v1 = ((t0 >>> 26) | (t1 << 6)) & 0x03FFFFFF;
+      final v2 = ((t1 >>> 20) | (t2 << 12)) & 0x03FFFFFF;
+      final v3 = ((t2 >>> 14) | (t3 << 18)) & 0x03FFFFFF;
+      final v4 = ((t3 >>> 8) | (1 << 24)) & 0x03FFFFFF;
+
+      h0 += v0 & 0x1FFF;
+      h1 += (v0 >>> 13) & 0x1FFF;
+      h2 += v1 & 0x1FFF;
+      h3 += (v1 >>> 13) & 0x1FFF;
+      h4 += v2 & 0x1FFF;
+      h5 += (v2 >>> 13) & 0x1FFF;
+      h6 += v3 & 0x1FFF;
+      h7 += (v3 >>> 13) & 0x1FFF;
+      h8 += v4 & 0x1FFF;
+      h9 += (v4 >>> 13) & 0x1FFF;
+
+      int d = h0 * r0 +
+          h1 * s9 +
+          h2 * s8 +
+          h3 * s7 +
+          h4 * s6 +
+          h5 * s5 +
+          h6 * s4 +
+          h7 * s3 +
+          h8 * s2 +
+          h9 * s1;
+      final nh0 = d & 0x1FFF;
+      int c = d ~/ 8192;
+
+      d = h0 * r1 +
+          h1 * r0 +
+          h2 * s9 +
+          h3 * s8 +
+          h4 * s7 +
+          h5 * s6 +
+          h6 * s5 +
+          h7 * s4 +
+          h8 * s3 +
+          h9 * s2 +
+          c;
+      final nh1 = d & 0x1FFF;
+      c = d ~/ 8192;
+
+      d = h0 * r2 +
+          h1 * r1 +
+          h2 * r0 +
+          h3 * s9 +
+          h4 * s8 +
+          h5 * s7 +
+          h6 * s6 +
+          h7 * s5 +
+          h8 * s4 +
+          h9 * s3 +
+          c;
+      final nh2 = d & 0x1FFF;
+      c = d ~/ 8192;
+
+      d = h0 * r3 +
+          h1 * r2 +
+          h2 * r1 +
+          h3 * r0 +
+          h4 * s9 +
+          h5 * s8 +
+          h6 * s7 +
+          h7 * s6 +
+          h8 * s5 +
+          h9 * s4 +
+          c;
+      final nh3 = d & 0x1FFF;
+      c = d ~/ 8192;
+
+      d = h0 * r4 +
+          h1 * r3 +
+          h2 * r2 +
+          h3 * r1 +
+          h4 * r0 +
+          h5 * s9 +
+          h6 * s8 +
+          h7 * s7 +
+          h8 * s6 +
+          h9 * s5 +
+          c;
+      final nh4 = d & 0x1FFF;
+      c = d ~/ 8192;
+
+      d = h0 * r5 +
+          h1 * r4 +
+          h2 * r3 +
+          h3 * r2 +
+          h4 * r1 +
+          h5 * r0 +
+          h6 * s9 +
+          h7 * s8 +
+          h8 * s7 +
+          h9 * s6 +
+          c;
+      final nh5 = d & 0x1FFF;
+      c = d ~/ 8192;
+
+      d = h0 * r6 +
+          h1 * r5 +
+          h2 * r4 +
+          h3 * r3 +
+          h4 * r2 +
+          h5 * r1 +
+          h6 * r0 +
+          h7 * s9 +
+          h8 * s8 +
+          h9 * s7 +
+          c;
+      final nh6 = d & 0x1FFF;
+      c = d ~/ 8192;
+
+      d = h0 * r7 +
+          h1 * r6 +
+          h2 * r5 +
+          h3 * r4 +
+          h4 * r3 +
+          h5 * r2 +
+          h6 * r1 +
+          h7 * r0 +
+          h8 * s9 +
+          h9 * s8 +
+          c;
+      final nh7 = d & 0x1FFF;
+      c = d ~/ 8192;
+
+      d = h0 * r8 +
+          h1 * r7 +
+          h2 * r6 +
+          h3 * r5 +
+          h4 * r4 +
+          h5 * r3 +
+          h6 * r2 +
+          h7 * r1 +
+          h8 * r0 +
+          h9 * s9 +
+          c;
+      final nh8 = d & 0x1FFF;
+      c = d ~/ 8192;
+
+      d = h0 * r9 +
+          h1 * r8 +
+          h2 * r7 +
+          h3 * r6 +
+          h4 * r5 +
+          h5 * r4 +
+          h6 * r3 +
+          h7 * r2 +
+          h8 * r1 +
+          h9 * r0 +
+          c;
+      h9 = d & 0x1FFF;
+      c = d ~/ 8192;
+
+      h0 = nh0 + c * 5;
+      h1 = nh1 + (h0 ~/ 8192);
+      h0 &= 0x1FFF;
+      h2 = nh2;
+      h3 = nh3;
+      h4 = nh4;
+      h5 = nh5;
+      h6 = nh6;
+      h7 = nh7;
+      h8 = nh8;
+    }
+
+    void feedData(Uint8List data) {
+      int pos = 0;
+      final bd = ByteData.sublistView(data);
+      while (pos < data.length) {
+        final rem = data.length - pos;
+        if (rem >= 16) {
+          feedBlock(
+            bd.getUint32(pos, Endian.little),
+            bd.getUint32(pos + 4, Endian.little),
+            bd.getUint32(pos + 8, Endian.little),
+            bd.getUint32(pos + 12, Endian.little),
+          );
+          pos += 16;
+        } else {
+          final tmp = Uint8List(16);
+          for (int i = 0; i < rem; i++) {
+            tmp[i] = data[pos + i];
+          }
+          final tbd = ByteData.sublistView(tmp);
+          feedBlock(
+            tbd.getUint32(0, Endian.little),
+            tbd.getUint32(4, Endian.little),
+            tbd.getUint32(8, Endian.little),
+            tbd.getUint32(12, Endian.little),
+          );
+          pos += rem;
+        }
+      }
+    }
+
+    feedData(aad);
+    feedData(msg);
+
+    final aadLen = aad.length;
+    final msgLen = msg.length;
+    feedBlock(
+      aadLen & 0xFFFFFFFF,
+      (aadLen / 0x100000000).floor() & 0xFFFFFFFF,
+      msgLen & 0xFFFFFFFF,
+      (msgLen / 0x100000000).floor() & 0xFFFFFFFF,
+    );
+
+    // Final carry propagation into canonical 13-bit limbs
+    h1 += h0 ~/ 8192;
+    h0 &= 0x1FFF;
+    h2 += h1 ~/ 8192;
+    h1 &= 0x1FFF;
+    h3 += h2 ~/ 8192;
+    h2 &= 0x1FFF;
+    h4 += h3 ~/ 8192;
+    h3 &= 0x1FFF;
+    h5 += h4 ~/ 8192;
+    h4 &= 0x1FFF;
+    h6 += h5 ~/ 8192;
+    h5 &= 0x1FFF;
+    h7 += h6 ~/ 8192;
+    h6 &= 0x1FFF;
+    h8 += h7 ~/ 8192;
+    h7 &= 0x1FFF;
+    h9 += h8 ~/ 8192;
+    h8 &= 0x1FFF;
+    h0 += (h9 ~/ 8192) * 5;
+    h9 &= 0x1FFF;
+    h1 += h0 ~/ 8192;
+    h0 &= 0x1FFF;
+
+    // Compute h - p = (h + 5) - 2^130
+    int g0 = h0 + 5;
+    int b = g0 ~/ 8192;
+    g0 &= 0x1FFF;
+    int g1 = h1 + b;
+    b = g1 ~/ 8192;
+    g1 &= 0x1FFF;
+    int g2 = h2 + b;
+    b = g2 ~/ 8192;
+    g2 &= 0x1FFF;
+    int g3 = h3 + b;
+    b = g3 ~/ 8192;
+    g3 &= 0x1FFF;
+    int g4 = h4 + b;
+    b = g4 ~/ 8192;
+    g4 &= 0x1FFF;
+    int g5 = h5 + b;
+    b = g5 ~/ 8192;
+    g5 &= 0x1FFF;
+    int g6 = h6 + b;
+    b = g6 ~/ 8192;
+    g6 &= 0x1FFF;
+    int g7 = h7 + b;
+    b = g7 ~/ 8192;
+    g7 &= 0x1FFF;
+    int g8 = h8 + b;
+    b = g8 ~/ 8192;
+    g8 &= 0x1FFF;
+    int g9 = h9 + b - 8192;
+
+    if (g9 >= 0) {
+      h0 = g0;
+      h1 = g1;
+      h2 = g2;
+      h3 = g3;
+      h4 = g4;
+      h5 = g5;
+      h6 = g6;
+      h7 = g7;
+      h8 = g8;
+      h9 = g9;
+    }
+
+    final f0 = (h0 | (h1 << 13) | ((h2 & 0x3F) << 26)) & 0xFFFFFFFF;
+    final f1 = ((h2 >>> 6) | (h3 << 7) | ((h4 & 0xFFF) << 20)) & 0xFFFFFFFF;
+    final f2 = ((h4 >>> 12) | (h5 << 1) | (h6 << 14) | ((h7 & 0x1F) << 27)) &
+        0xFFFFFFFF;
+    final f3 = ((h7 >>> 5) | (h8 << 8) | ((h9 & 0x7FF) << 21)) & 0xFFFFFFFF;
+
+    final s_0 = k.getUint32(16, Endian.little);
+    final s_1 = k.getUint32(20, Endian.little);
+    final s_2 = k.getUint32(24, Endian.little);
+    final s_3 = k.getUint32(28, Endian.little);
+
+    int sum = f0 + s_0;
+    final r_0 = sum & 0xFFFFFFFF;
+    int carry = sum >= 0x100000000 ? 1 : 0;
+
+    sum = f1 + s_1 + carry;
+    final r_1 = sum & 0xFFFFFFFF;
+    carry = sum >= 0x100000000 ? 1 : 0;
+
+    sum = f2 + s_2 + carry;
+    final r_2 = sum & 0xFFFFFFFF;
+    carry = sum >= 0x100000000 ? 1 : 0;
+
+    sum = f3 + s_3 + carry;
+    final r_3 = sum & 0xFFFFFFFF;
+
+    final tag = Uint8List(16);
+    final tagBd = tag.buffer.asByteData();
+    tagBd.setUint32(0, r_0, Endian.little);
+    tagBd.setUint32(4, r_1, Endian.little);
+    tagBd.setUint32(8, r_2, Endian.little);
+    tagBd.setUint32(12, r_3, Endian.little);
+    return tag;
+  }
+
+  /// Reproduces the pre-fix Web JS (`dart2js`) Poly1305 MAC calculation for
+  /// decrypt-only backward compatibility across JS, Wasm, and Native VM.
+  ///
+  /// Uses IEEE-754 [double] accumulators and explicit low-32-bit shifts (`>>> 26`)
+  /// so VM/Wasm can also decode ciphertexts created by older Web JS builds.
+  static Uint8List _poly1305MacLegacyJs(
+      Uint8List msg, Uint8List aad, Uint8List key) {
+    final k = ByteData.sublistView(key);
+    final k0 = k.getUint32(0, Endian.little);
+    final k1 = k.getUint32(4, Endian.little);
+    final k2 = k.getUint32(8, Endian.little);
+    final k3 = k.getUint32(12, Endian.little);
+
+    final r0 = k0 & 0x03FFFFFF;
+    final r1 = ((k0 >>> 26) | (k1 << 6)) & 0x03FFFF03;
+    final r2 = ((k1 >>> 20) | (k2 << 12)) & 0x03FFC0FF;
+    final r3 = ((k2 >>> 14) | (k3 << 18)) & 0x03F03FFF;
+    final r4 = (k3 >>> 8) & 0x000FFFFF;
+
+    final s1 = r1 * 5;
+    final s2 = r2 * 5;
+    final s3 = r3 * 5;
+    final s4 = r4 * 5;
+
+    int h0 = 0, h1 = 0, h2 = 0, h3 = 0, h4 = 0;
+
+    int jsU32(double v) => v.truncate() & 0xFFFFFFFF;
+
+    void accumWords(int t0, int t1, int t2, int t3) {
+      h0 += t0 & 0x03FFFFFF;
+      h1 += ((t0 >>> 26) | (t1 << 6)) & 0x03FFFFFF;
+      h2 += ((t1 >>> 20) | (t2 << 12)) & 0x03FFFFFF;
+      h3 += ((t2 >>> 14) | (t3 << 18)) & 0x03FFFFFF;
+      h4 += ((t3 >>> 8) | (1 << 24)) & 0xFFFFFFFF;
+
+      final double d0 = h0.toDouble() * r0 +
+          h1.toDouble() * s4 +
+          h2.toDouble() * s3 +
+          h3.toDouble() * s2 +
+          h4.toDouble() * s1;
+      final double d1 = h0.toDouble() * r1 +
+          h1.toDouble() * r0 +
+          h2.toDouble() * s4 +
+          h3.toDouble() * s3 +
+          h4.toDouble() * s2 +
+          (jsU32(d0) >>> 26);
+      final double d2 = h0.toDouble() * r2 +
+          h1.toDouble() * r1 +
+          h2.toDouble() * r0 +
+          h3.toDouble() * s4 +
+          h4.toDouble() * s3 +
+          (jsU32(d1) >>> 26);
+      final nh2 = jsU32(d2) & 0x03FFFFFF;
+      final double d3 = h0.toDouble() * r3 +
+          h1.toDouble() * r2 +
+          h2.toDouble() * r1 +
+          h3.toDouble() * r0 +
+          h4.toDouble() * s4 +
+          (jsU32(d2) >>> 26);
+      final nh3 = jsU32(d3) & 0x03FFFFFF;
+      final double d4 = h0.toDouble() * r4 +
+          h1.toDouble() * r3 +
+          h2.toDouble() * r2 +
+          h3.toDouble() * r1 +
+          h4.toDouble() * r0 +
+          (jsU32(d3) >>> 26);
+      h4 = jsU32(d4) & 0x03FFFFFF;
+      h0 = (jsU32(d0) & 0x03FFFFFF) + (jsU32(d4) >>> 26) * 5;
+      h1 = (jsU32(d1) & 0x03FFFFFF) + ((h0 & 0xFFFFFFFF) >>> 26);
+      h0 &= 0x03FFFFFF;
+      h2 = nh2;
+      h3 = nh3;
+    }
+
+    void accumData(Uint8List data) {
+      int pos = 0;
+      final bd = ByteData.sublistView(data);
+      while (pos < data.length) {
+        final len = data.length - pos;
+        if (len >= 16) {
+          accumWords(
+            bd.getUint32(pos, Endian.little),
+            bd.getUint32(pos + 4, Endian.little),
+            bd.getUint32(pos + 8, Endian.little),
+            bd.getUint32(pos + 12, Endian.little),
+          );
+          pos += 16;
+        } else {
+          final tmp = Uint8List(16);
+          for (int i = 0; i < len; i++) {
+            tmp[i] = data[pos + i];
+          }
+          final tbd = ByteData.sublistView(tmp);
+          accumWords(
+            tbd.getUint32(0, Endian.little),
+            tbd.getUint32(4, Endian.little),
+            tbd.getUint32(8, Endian.little),
+            tbd.getUint32(12, Endian.little),
+          );
+          pos += len;
+        }
+      }
+    }
+
+    accumData(aad);
+    accumData(msg);
+
+    // Lengths block matching dart2js compiled output (lines 3798-3826 of JS output)
+    final aadLen = aad.length;
+    final msgLen = msg.length;
+    final lt0 = aadLen & 0xFFFFFFFF;
+    final lt1 = (aadLen / 0x100000000).floor() & 0xFFFFFFFF;
+    final lt2 = msgLen & 0xFFFFFFFF;
+    final lt3 = (msgLen / 0x100000000).floor() & 0xFFFFFFFF;
+
+    h0 += lt0 & 0x03FFFFFF;
+    h1 += ((lt0 >>> 26) | (lt1 << 6)) & 0x03FFFFFF;
+    h2 += ((lt1 >>> 20) | (lt2 << 12)) & 0x03FFFFFF;
+    h3 += ((lt2 >>> 14) | (lt3 << 18)) & 0x03FFFFFF;
+    h4 += ((lt3 >>> 8) | (1 << 24)) & 0xFFFFFFFF;
+
+    final double ld0 = h0.toDouble() * r0 +
+        h1.toDouble() * s4 +
+        h2.toDouble() * s3 +
+        h3.toDouble() * s2 +
+        h4.toDouble() * s1;
+    final double ld1 = h0.toDouble() * r1 +
+        h1.toDouble() * r0 +
+        h2.toDouble() * s4 +
+        h3.toDouble() * s3 +
+        h4.toDouble() * s2 +
+        (jsU32(ld0) >>> 26);
+    final double ld2 = h0.toDouble() * r2 +
+        h1.toDouble() * r1 +
+        h2.toDouble() * r0 +
+        h3.toDouble() * s4 +
+        h4.toDouble() * s3 +
+        (jsU32(ld1) >>> 26);
+    final double ld3 = h0.toDouble() * r3 +
+        h1.toDouble() * r2 +
+        h2.toDouble() * r1 +
+        h3.toDouble() * r0 +
+        h4.toDouble() * s4 +
+        (jsU32(ld2) >>> 26);
+    final double ld4 = h0.toDouble() * r4 +
+        h1.toDouble() * r3 +
+        h2.toDouble() * r2 +
+        h3.toDouble() * r1 +
+        h4.toDouble() * r0 +
+        (jsU32(ld3) >>> 26);
+
+    h0 = (jsU32(ld0) & 0x03FFFFFF) + (jsU32(ld4) >>> 26) * 5;
+    final h00 = h0 & 0x03FFFFFF;
+    h1 = (jsU32(ld1) & 0x03FFFFFF) + ((h0 & 0xFFFFFFFF) >>> 26) + (h00 >>> 26);
+    h2 = (jsU32(ld2) & 0x03FFFFFF) + ((h1 & 0xFFFFFFFF) >>> 26);
+    h3 = (jsU32(ld3) & 0x03FFFFFF) + ((h2 & 0xFFFFFFFF) >>> 26);
+    h2 &= 0x03FFFFFF;
+    h4 = (jsU32(ld4) & 0x03FFFFFF) + ((h3 & 0xFFFFFFFF) >>> 26);
+    h3 &= 0x03FFFFFF;
+    h0 = h00 + ((h4 & 0xFFFFFFFF) >>> 26) * 5;
+    h4 &= 0x03FFFFFF;
+    h1 = (h1 & 0x03FFFFFF) + ((h0 & 0xFFFFFFFF) >>> 26);
+    h0 &= 0x03FFFFFF;
+
+    final int g0 = h0 + 5;
+    final int g1 = h1 + ((g0 & 0xFFFFFFFF) >>> 26);
+    final int g2 = h2 + ((g1 & 0xFFFFFFFF) >>> 26);
+    final int g3 = h3 + ((g2 & 0xFFFFFFFF) >>> 26);
+    final int g4 = h4 + ((g3 & 0xFFFFFFFF) >>> 26) - (1 << 26);
+
+    final int mask = g4 < 0 ? 0 : 0xFFFFFFFF;
+    final int invMask = ~mask & 0xFFFFFFFF;
+
+    final int fh0 = (h0 & invMask) | (g0 & 0x03FFFFFF & mask);
+    final int fh1 = (h1 & invMask) | (g1 & 0x03FFFFFF & mask);
+    final int fh2 = (h2 & invMask) | (g2 & 0x03FFFFFF & mask);
+    final int fh3 = (h3 & invMask) | (g3 & 0x03FFFFFF & mask);
+    final int fh4 = (h4 & invMask) | (g4 & mask);
+
+    final s_0 = k.getUint32(16, Endian.little);
+    final s_1 = k.getUint32(20, Endian.little);
+    final s_2 = k.getUint32(24, Endian.little);
+    final s_3 = k.getUint32(28, Endian.little);
+
+    final int f0 = (fh0 | (fh1 << 26)) & 0xFFFFFFFF;
+    final int f1 = ((fh1 >>> 6) | (fh2 << 20)) & 0xFFFFFFFF;
+    final int f2 = ((fh2 >>> 12) | (fh3 << 14)) & 0xFFFFFFFF;
+    final int f3 = ((fh3 >>> 18) | (fh4 << 8)) & 0xFFFFFFFF;
+
+    int r_0 = f0 + s_0;
+    int c = (r_0 / 0x100000000).floor();
+    r_0 &= 0xFFFFFFFF;
+    int r_1 = f1 + s_1 + c;
+    c = (r_1 / 0x100000000).floor();
+    r_1 &= 0xFFFFFFFF;
+    int r_2 = f2 + s_2 + c;
+    c = (r_2 / 0x100000000).floor();
+    r_2 &= 0xFFFFFFFF;
+    int r_3 = (f3 + s_3 + c) & 0xFFFFFFFF;
+
+    final tag = Uint8List(16);
+    final tagBd = tag.buffer.asByteData();
+    tagBd.setUint32(0, r_0, Endian.little);
+    tagBd.setUint32(4, r_1, Endian.little);
+    tagBd.setUint32(8, r_2, Endian.little);
+    tagBd.setUint32(12, r_3, Endian.little);
+    return tag;
+  }
+
+  static Uint8List _poly1305MacVm(Uint8List msg, Uint8List aad, Uint8List key) {
     final k = ByteData.sublistView(key);
     int r0 = k.getUint32(0, Endian.little) & 0x03FFFFFF;
     int r1 = ((k.getUint32(0, Endian.little) >> 26) |

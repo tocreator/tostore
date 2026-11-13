@@ -399,12 +399,13 @@ final class GlobalConfigCodec {
     required String encryptionKey,
   }) {
     return _decodeFields(
-      _unwrapAndDecrypt(frameBytes, encryptionKey: encryptionKey),
+      _unwrapAndDecrypt(frameBytes, encryptionKey: encryptionKey).plaintext,
     );
   }
 
-  /// Decode with preferred + fallback KEKs (null->user key auto-migration).
-  static ({GlobalConfig config, String usedKey}) decodeFileWithFallback(
+  /// Decode with preferred + fallback KEKs (null->user key & legacy-format auto-migration).
+  static ({GlobalConfig config, String usedKey, bool usedLegacyFormat})
+      decodeFileWithFallback(
     Uint8List frameBytes, {
     required String preferredKey,
     List<String> fallbackKeys = const [],
@@ -418,9 +419,15 @@ final class GlobalConfigCodec {
     Object? lastError;
     for (final key in candidates) {
       try {
+        final unwrapped = _unwrapAndDecrypt(
+          frameBytes,
+          encryptionKey: key,
+          allowLegacyJsMac: true,
+        );
         return (
-          config: decodeFile(frameBytes, encryptionKey: key),
+          config: _decodeFields(unwrapped.plaintext),
           usedKey: key,
+          usedLegacyFormat: unwrapped.usedLegacyFormat,
         );
       } catch (e) {
         lastError = e;
@@ -438,9 +445,10 @@ final class GlobalConfigCodec {
     ]);
   }
 
-  static Uint8List _unwrapAndDecrypt(
+  static ({Uint8List plaintext, bool usedLegacyFormat}) _unwrapAndDecrypt(
     Uint8List frameBytes, {
     required String encryptionKey,
+    bool allowLegacyJsMac = false,
   }) {
     final decoded = TobfFileCodec.decodeFrameWithHeader(
       frameBytes,
@@ -479,6 +487,7 @@ final class GlobalConfigCodec {
       cipher,
       encryptionKey: encryptionKey,
       algorithm: algorithm,
+      allowLegacyJsMac: allowLegacyJsMac,
     );
   }
 
@@ -507,26 +516,32 @@ final class GlobalConfigCodec {
     }
   }
 
-  static Uint8List _aeadDecrypt(
+  static ({Uint8List plaintext, bool usedLegacyFormat}) _aeadDecrypt(
     Uint8List cipher, {
     required String encryptionKey,
     required ConfigCryptoAlgorithm algorithm,
+    bool allowLegacyJsMac = false,
   }) {
     final key = _key32(encryptionKey);
+    var usedLegacyFormat = false;
     try {
       switch (algorithm) {
         case ConfigCryptoAlgorithm.chacha20Poly1305:
-          return ChaCha20Poly1305.decryptBytes(
+          final plaintext = ChaCha20Poly1305.decryptBytes(
             encryptedData: cipher,
             key: key,
             aad: _aad,
+            allowLegacyJsMac: allowLegacyJsMac,
+            onLegacyJsMacUsed: () => usedLegacyFormat = true,
           );
+          return (plaintext: plaintext, usedLegacyFormat: usedLegacyFormat);
         case ConfigCryptoAlgorithm.aes256Gcm:
-          return AESGCM.decryptBytes(
+          final plaintext = AESGCM.decryptBytes(
             encryptedData: cipher,
             key: key,
             aad: _aad,
           );
+          return (plaintext: plaintext, usedLegacyFormat: false);
       }
     } catch (e) {
       throw DbException([

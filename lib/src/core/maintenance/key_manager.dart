@@ -7,6 +7,7 @@ import '../../model/applied_encryption.dart';
 import '../../model/data_store_config.dart';
 import '../../model/db_exception.dart';
 import '../../model/db_result.dart';
+import '../../model/encoder_config.dart';
 import '../../model/encryption_domain.dart';
 import '../../model/global_config.dart';
 import '../../model/key_migration_info.dart';
@@ -67,29 +68,20 @@ class KeyManager {
 
   /// Rotate the master [encryptionKey] that protects GlobalConfig.
   ///
-  /// Does not rewrite table data. When [oldKey] is null/empty, the engine
-  /// built-in [defaultEncryptionKey] is used (null -> user-key transition).
+  /// Does not rewrite table data. When [oldKey] or [newKey] is `null`/empty,
+  /// the engine built-in [defaultEncryptionKey] is used (whitespace-only or
+  /// padded keys are preserved verbatim without trimming).
   Future<DbResult> rotateEncryptionKey({
     String? oldKey,
-    required String newKey,
+    required String? newKey,
   }) async {
-    final effectiveOld =
-        (oldKey == null || oldKey.isEmpty) ? defaultEncryptionKey : oldKey;
+    final bool oldWasDefault = oldKey == null || oldKey.isEmpty;
+    final effectiveOld = oldWasDefault ? defaultEncryptionKey : oldKey;
 
-    if (newKey.isEmpty) {
-      return DbResult.batch(
-        statuses: [
-          InvalidArgumentStatus(
-            type: ResultType.devInvalidArgumentMissing,
-            message: 'newKey must be non-empty',
-            parameterName: 'newKey',
-            passedValue: newKey,
-          ),
-        ],
-        failedCount: 1,
-      );
-    }
-    if (effectiveOld == newKey) {
+    final bool newIsDefault = newKey == null || newKey.isEmpty;
+    final effectiveNew = newIsDefault ? defaultEncryptionKey : newKey;
+    final String? normalizedNewKey = newIsDefault ? null : newKey;
+    if (effectiveOld == effectiveNew) {
       return DbResult.batch(
         statuses: [
           InvalidArgumentStatus(
@@ -126,13 +118,16 @@ class KeyManager {
       final decoded = GlobalConfigCodec.decodeFileWithFallback(
         bytes,
         preferredKey: effectiveOld,
-        fallbackKeys: [
-          defaultEncryptionKey,
-        ],
+        fallbackKeys: oldWasDefault
+            ? [
+                defaultEncryptionKey,
+                historicalJsDefaultEncryptionKey(),
+              ]
+            : const <String>[],
       );
 
-      _cachedEncryptionKey = newKey;
-      _dataStore.updateEncryptionKeyInConfig(newKey);
+      _cachedEncryptionKey = effectiveNew;
+      _dataStore.updateEncryptionKeyInConfig(normalizedNewKey);
       await _dataStore.saveGlobalConfig(decoded.config, propagateErrors: true);
 
       Logger.info('encryptionKey rotated successfully');
@@ -283,7 +278,19 @@ class KeyManager {
     AppliedEncryption applied, {
     KeyMigrationInfo? runningMigration,
   }) async {
-    final newKey = _getEncodingKey();
+    final encConfig = _getEncryptionConfig();
+    final hasExplicitEncodingKey =
+        encConfig.encodingKey != null && encConfig.encodingKey!.isNotEmpty;
+    final currentPlain =
+        applied.current.key.isNotEmpty ? applied.current.key : null;
+    // If no encodingKey is explicitly configured and disk still uses the legacy
+    // Web JS built-in DEK, keep using it in-place instead of triggering a
+    // full-database migration to the new cross-platform default DEK.
+    final preserveHistoricalJsDefault = !hasExplicitEncodingKey &&
+        currentPlain != null &&
+        currentPlain == historicalJsDefaultEncodingKey();
+    final newKey =
+        preserveHistoricalJsDefault ? currentPlain : _getEncodingKey();
     final fallbackKeys = <int, Uint8List>{};
 
     for (final info in applied.getAllKeys()) {
@@ -311,9 +318,6 @@ class KeyManager {
       EncryptionManager.setCurrentKey(newKey, running.targetKeyId);
       return null;
     }
-
-    final currentPlain =
-        applied.current.key.isNotEmpty ? applied.current.key : null;
 
     final bool keyChanged = currentPlain != newKey;
     int keyIdToUse = applied.current.keyId;

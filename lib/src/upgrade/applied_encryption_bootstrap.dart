@@ -7,6 +7,7 @@ import '../handler/chacha20_poly1305_old.dart';
 import '../handler/logger.dart';
 import '../model/applied_encryption.dart';
 import '../model/data_store_config.dart';
+import '../model/encoder_config.dart';
 import '../model/global_config.dart';
 import 'legacy_model/pre_v3.dart';
 
@@ -124,6 +125,7 @@ abstract final class AppliedEncryptionBootstrap {
     final list = <String>[
       enc.resolveEncryptionKey(),
       defaultEncryptionKey,
+      historicalJsDefaultEncryptionKey(),
       LegacyPathKeyDerivation.historicalV2DefaultEncryptionKey(),
     ];
     final dbPath = dataStore.instancePath ?? dataStore.config.dbPath;
@@ -156,12 +158,14 @@ abstract final class AppliedEncryptionBootstrap {
           encryptedData: raw,
           key: key32,
           aad: aad,
+          allowLegacyJsMac: true,
         );
       } catch (_) {}
       try {
         return ChaCha20Poly1305.decrypt(
           encryptedData: raw,
           key: key32,
+          allowLegacyJsMac: true,
         );
       } catch (_) {}
       if (tryOldCipher) {

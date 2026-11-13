@@ -297,6 +297,7 @@ class ToCrypto {
             encryptedData: payload,
             key: key32,
             aad: aadBytes,
+            allowLegacyJsMac: true,
           );
         case _typeByteAesGcm:
           return AESGCM.decryptBytes(

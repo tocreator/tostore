@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import '../../handler/memcomparable.dart';
+import '../../handler/platform_byte_data.dart';
 import '../../model/data_store_config.dart';
 import '../../model/meta_info.dart';
 import '../../model/ngh_index_meta.dart';
@@ -131,8 +132,8 @@ final class NghPkMapEngine {
           final merged = <NghPkLocator>[
             for (final l in old)
               if ((!filterDirty ||
-                      !dirtyLeafKeys.contains(
-                          (l.partitionNo << 32) | (l.pageNo & 0xFFFFFFFF))) &&
+                      !dirtyLeafKeys.contains(PlatformByteData.packUint32Pair(
+                          l.partitionNo, l.pageNo))) &&
                   (!filterRewrite || !rewrittenIds.contains(l.centroidId)))
                 l,
             ...locs,

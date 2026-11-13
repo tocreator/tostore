@@ -151,7 +151,7 @@ abstract class DataStoreInterface {
   /// Rotate encryption key
   Future<DbResult> rotateEncryptionKey({
     String? oldKey,
-    required String newKey,
+    required String? newKey,
   });
 
   /// Flush pending writes to storage.

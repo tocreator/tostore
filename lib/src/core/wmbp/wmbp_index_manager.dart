@@ -565,6 +565,8 @@ class WmbpIndexManager {
           if (!stillCurrent()) return corpus;
           _volumes[key] = volume;
           corpus.attachSealed(view);
+        } on DbException {
+          rethrow;
         } catch (e) {
           Logger.warn('WMBP page open failed', rawError: e);
         }
@@ -1054,6 +1056,8 @@ class _WmbpStorageVolume implements WmbpPageVolume {
           await store.storage.readAsBytesAt(path, offset, length: length);
       if (bytes.length < length) return null;
       return _openPage(bytes, category);
+    } on DbException {
+      rethrow;
     } catch (_) {
       return null;
     }
@@ -1162,9 +1166,16 @@ class _WmbpStorageVolume implements WmbpPageVolume {
     final path = _path(category, partitionNo);
     if (!await store.storage.existsFile(path)) return;
     final int size = await store.storage.getFileSize(path);
+    final yc = YieldController(
+      'WmbpStorageVolume.rewriteEncryptedPartition',
+      checkInterval: 32,
+      minCheckInterval: 8,
+    );
     for (int offset = 0;
         offset + WmbpConstants.storePageSize <= size;
         offset += WmbpConstants.storePageSize) {
+      final y = yc.maybeYield();
+      if (y != null) await y;
       final page = await readAt(
         category,
         partitionNo,
@@ -1221,7 +1232,7 @@ class _WmbpStorageVolume implements WmbpPageVolume {
   }
 
   Uint8List _openPage(Uint8List page, String category) {
-    if (!_encryptPages || page.length < WmbpConstants.storePageSize) {
+    if (page.length < WmbpConstants.storePageSize) {
       return page;
     }
     final data = ByteData.sublistView(page);

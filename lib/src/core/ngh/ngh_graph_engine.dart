@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import '../../handler/logger.dart';
 import '../../handler/memcomparable.dart';
+import '../../handler/platform_byte_data.dart';
 import '../../model/db_exception.dart';
 import '../../model/global_config.dart';
 import '../../model/ngh_index_meta.dart';
@@ -5507,7 +5508,8 @@ class NghGraphEngine {
         final leaf0 = probeRoot(w.bestRoot0);
         var leafSortKey = -1;
         if (leaf0 != null && !leaf0.isNone) {
-          leafSortKey = (leaf0.partitionNo << 32) | (leaf0.pageNo & 0xffffffff);
+          leafSortKey =
+              PlatformByteData.packUint32Pair(leaf0.partitionNo, leaf0.pageNo);
         }
         if (w.maxScore1 >= w.maxScore0 * dualRatio) {
           probeRoot(w.bestRoot1);
@@ -5701,14 +5703,14 @@ class NghGraphEngine {
     final splitLeafKeys = <int>{
       for (final p in splitLeafPages)
         if (p.category == NghDataCategory.leaf && !p.isNull && p.pageNo > 0)
-          (p.partitionNo << 32) | (p.pageNo & 0xFFFFFFFF),
+          PlatformByteData.packUint32Pair(p.partitionNo, p.pageNo),
     };
     for (final e in appendedPkLocators.entries) {
       final locs = e.value;
       for (final loc in locs) {
         // If the page later split, all its slots are scanned below with updated slot indices
-        if (splitLeafKeys
-            .contains((loc.partitionNo << 32) | (loc.pageNo & 0xFFFFFFFF))) {
+        if (splitLeafKeys.contains(
+            PlatformByteData.packUint32Pair(loc.partitionNo, loc.pageNo))) {
           continue;
         }
         pkLocators.putIfAbsent(e.key, () => []).add(loc);
@@ -5736,7 +5738,7 @@ class NghGraphEngine {
     final dirtyLeafKeys = <int>{
       for (final p in dirtyLeafPages.keys)
         if (p.category == NghDataCategory.leaf && !p.isNull && p.pageNo > 0)
-          (p.partitionNo << 32) | (p.pageNo & 0xFFFFFFFF),
+          PlatformByteData.packUint32Pair(p.partitionNo, p.pageNo),
     };
     final pkEntries = <NghPkMapWrite>[];
     for (final e in pkLocators.entries) {

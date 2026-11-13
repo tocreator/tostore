@@ -9,6 +9,8 @@ import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
+import '../model/encoder_config.dart';
 import '../model/global_config.dart';
 import '../model/table_identity.dart';
 import '../model/table_meta.dart';
@@ -45,19 +47,29 @@ class V2Upgrade {
       await _backupLegacySpaceConfigJson(spaceName);
     }
 
-    // Decrypt legacy current/previous with Old ChaCha, then let KeyManager stash
-    // them into history and mint a fresh current -- must finish before V3's
-    // keyManager.initialize so encoding-key migration is not scheduled.
-    for (final spaceName in spaces) {
-      final root = _dataStore.instancePath;
-      if (root == null) break;
-      final backupPath = '${LegacyConfigPaths.spaceJson(root, spaceName)}.old';
-      final plainById = await _loadLegacyPlainEncodingKeys(backupPath);
-      if (plainById.isEmpty) continue;
-
+    // Decrypt legacy current/previous with Old ChaCha, merge keys across all
+    // spaces (legacy spaces shared global key material), then let KeyManager
+    // stash them into history and mint a fresh current -- must finish before
+    // V3's keyManager.initialize so encoding-key migration is not scheduled.
+    final mergedPlainById = <int, String>{};
+    String? mergedFromSpace;
+    final root = _dataStore.instancePath;
+    if (root != null) {
+      for (final spaceName in spaces) {
+        final backupPath =
+            '${LegacyConfigPaths.spaceJson(root, spaceName)}.old';
+        final plainById = await _loadLegacyPlainEncodingKeys(backupPath);
+        if (plainById.isEmpty) continue;
+        mergedFromSpace ??= spaceName;
+        for (final entry in plainById.entries) {
+          mergedPlainById.putIfAbsent(entry.key, () => entry.value);
+        }
+      }
+    }
+    if (mergedPlainById.isNotEmpty) {
       await _dataStore.keyManager.prepareKeysForV2DataRewrite(
-        spaceName: spaceName,
-        legacyPlainEncodingKeysById: plainById,
+        spaceName: mergedFromSpace ?? 'default',
+        legacyPlainEncodingKeysById: mergedPlainById,
       );
     }
 
@@ -199,6 +211,7 @@ class V2Upgrade {
             _dataStore.config.encryptionConfig!.encryptionKey!.isNotEmpty)
           _dataStore.config.encryptionConfig!.encryptionKey!,
         defaultEncryptionKey,
+        historicalJsDefaultEncryptionKey(),
         LegacyPathKeyDerivation.historicalV2DefaultEncryptionKey(),
       ];
       final dbPath = _dataStore.instancePath ?? _dataStore.config.dbPath;
@@ -474,6 +487,9 @@ class V2Upgrade {
         'Table data upgrade completed for table: $tableName '
         '(uid=${tableUid.value})',
       );
+    } on DbException {
+      Logger.error('Failed to upgrade table data for table $tableName');
+      rethrow;
     } catch (e) {
       Logger.error('Failed to upgrade table data for table $tableName',
           rawError: e);
@@ -627,6 +643,10 @@ class V2Upgrade {
       );
 
       return records;
+    } on DbException {
+      Logger.error(
+          'Failed to decrypt or parse old partition file for table: $tableName');
+      rethrow;
     } catch (e) {
       Logger.error('Failed to parse old partition file', rawError: e);
       return [];

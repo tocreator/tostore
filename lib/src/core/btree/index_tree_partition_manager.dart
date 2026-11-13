@@ -8,6 +8,7 @@ import '../../handler/encryption.dart';
 import '../../handler/logger.dart';
 import '../../handler/memcomparable.dart';
 import '../../handler/parallel_processor.dart';
+import '../../handler/platform_byte_data.dart';
 import '../../interface/storage_interface.dart';
 import '../../model/data_block_entry.dart';
 import '../../model/data_store_config.dart';
@@ -2485,7 +2486,8 @@ final class IndexTreePartitionManager {
     }
 
     final visited = <int>{};
-    int toKey(TreePagePtr p) => (p.partitionNo << 32) | (p.pageNo & 0xFFFFFFFF);
+    int toKey(TreePagePtr p) =>
+        PlatformByteData.packUint32Pair(p.partitionNo, p.pageNo);
 
     BTreeLeafPage? lastValidLeaf;
     TreePagePtr lastValidPtr = TreePagePtr.nullPtr;
@@ -2675,7 +2677,8 @@ final class IndexTreePartitionManager {
     final yc = YieldController('IndexTreePartitionManager.getAllDecodedEntries',
         checkInterval: 50);
     final visited = <int>{};
-    int toKey(TreePagePtr p) => (p.partitionNo << 32) | (p.pageNo & 0xFFFFFFFF);
+    int toKey(TreePagePtr p) =>
+        PlatformByteData.packUint32Pair(p.partitionNo, p.pageNo);
 
     while (!ptr.isNull) {
       final k = toKey(ptr);

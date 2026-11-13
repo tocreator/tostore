@@ -153,4 +153,14 @@ class PlatformByteData {
 
     return hi * 0x100000000 + lo;
   }
+
+  /// Packs a partition/high 32-bit index and a page/low 32-bit index into one
+  /// collision-free integer key across both 64-bit VM/Wasm and Web JS (`dart2js`).
+  static int packUint32Pair(int high, int low) {
+    final lowU32 = low & 0xFFFFFFFF;
+    if (_isWeb) {
+      return high * 0x100000000 + lowU32;
+    }
+    return (high << 32) | lowU32;
+  }
 }

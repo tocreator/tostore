@@ -20,6 +20,7 @@ import '../../model/data_store_config.dart';
 import '../../model/db_exception.dart';
 import '../../model/db_result.dart';
 import '../../model/db_startup_stage.dart';
+import '../../model/encoder_config.dart';
 import '../../model/expr.dart';
 import '../../model/flush_mode.dart';
 import '../../model/foreign_key_operation.dart';
@@ -9465,6 +9466,7 @@ class DataStoreImpl {
             preferredKey: preferred,
             fallbackKeys: [
               defaultEncryptionKey,
+              historicalJsDefaultEncryptionKey(),
             ],
           );
           // Do not clobber a newer in-memory save that won the race.
@@ -9473,8 +9475,8 @@ class DataStoreImpl {
           }
           _globalConfigCache = decoded.config;
 
-          // Auto-rewrap when opened with a newer encryptionKey than on disk.
-          if (decoded.usedKey != preferred) {
+          // Auto-rewrap when opened with a newer encryptionKey or legacy JS format.
+          if (decoded.usedKey != preferred || decoded.usedLegacyFormat) {
             await saveGlobalConfig(decoded.config, propagateErrors: false);
           }
           return decoded.config;
@@ -9494,6 +9496,7 @@ class DataStoreImpl {
               preferredKey: preferred,
               fallbackKeys: [
                 defaultEncryptionKey,
+                historicalJsDefaultEncryptionKey(),
               ],
             );
             if (_globalConfigCache != null) {
@@ -9770,19 +9773,25 @@ class DataStoreImpl {
   }
 
   /// Update in-memory encryption key after [KeyManager.rotateEncryptionKey].
-  void updateEncryptionKeyInConfig(String newKey) {
+  void updateEncryptionKeyInConfig(String? newKey) {
+    final String? normalized =
+        (newKey == null || newKey.isEmpty) ? null : newKey;
     final base = _config?.encryptionConfig ?? const EncryptionConfig();
     _config = _config!.copyWith(
-      encryptionConfig: base.copyWith(encryptionKey: newKey),
+      encryptionConfig: base.copyWith(
+        encryptionKey: normalized,
+        clearEncryptionKey: normalized == null,
+      ),
     );
   }
 
   /// Rotate the master [encryptionKey] that protects GlobalConfig.
   ///
-  /// When [oldKey] is null/empty, the engine built-in default KEK is used.
+  /// When [oldKey] or [newKey] is null/empty, the engine built-in default KEK
+  /// is used (whitespace is preserved verbatim).
   Future<DbResult> rotateEncryptionKey({
     String? oldKey,
-    required String newKey,
+    required String? newKey,
   }) async {
     if (!_isInitialized) {
       await ensureInitialized();

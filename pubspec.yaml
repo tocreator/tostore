@@ -1,6 +1,6 @@
 name: tostore
-description: "Data engine: AI vector & SQL/NoSQL database. Key-value/KV, embeddings, BM25 full-text, hybrid & semantic search for RAG/LLM. Local storage, TTL/LRU cache, offline encrypted."
-version: 3.6.1
+description: "Data engine: AI vector & SQL/NoSQL database. Key-value/KV, embeddings, sparse, BM25 full-text, hybrid & semantic search for RAG/LLM. Local storage, TTL cache, offline encrypted."
+version: 3.6.2
 homepage: https://github.com/tocreator/tostore
 repository: https://github.com/tocreator/tostore
 documentation: https://github.com/tocreator/tostore/blob/main/README.md

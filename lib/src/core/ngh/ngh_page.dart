@@ -968,8 +968,8 @@ final class NghPageId {
 
   bool get isNone => partitionNo < 0 || pageNo <= 0;
 
-  /// Cache / map key (Dart int is arbitrary-width).
-  int get cacheKey => (partitionNo << 32) | (pageNo & 0xFFFFFFFF);
+  /// Cache / map key (portable across VM/Wasm and Web JS).
+  int get cacheKey => PlatformByteData.packUint32Pair(partitionNo, pageNo);
 
   /// Legacy i32 pack used inside v1 leaf `next` fields. Null if unrepresentable.
   int? tryPack() {

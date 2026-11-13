@@ -2,9 +2,12 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/encoder_config.dart';
-import 'chacha20_poly1305.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'aes_gcm.dart';
+import 'chacha20_poly1305.dart';
 
 /// Data encryption is efficient and fast, slightly slower than regular UTF-8 encryption
 /// Protects data privacy by preventing casual viewing of data files
@@ -57,13 +60,6 @@ class EncryptionManager {
   // AES-256-GCM encrypted binary data prefix
   static const String _encodeAesPrefix = "ToAe_";
 
-  // Binary encryption prefixes derived from string prefixes
-  static final List<int> _utf8PrefixBytes = utf8.encode(_encodeUtf8Prefix);
-  static final List<int> _rawPrefixBytes = utf8.encode(_encodeRawPrefix);
-  static final List<int> _chacha20PrefixBytes =
-      utf8.encode(_encodeChaCha20Prefix);
-  static final List<int> _aesPrefixBytes = utf8.encode(_encodeAesPrefix);
-
   // Fallback keys, mapping keyId to the key.
   static Map<int, Uint8List>? _fallbackKeys;
 
@@ -110,6 +106,9 @@ class EncryptionManager {
 
   /// Derive a 32-byte key from a variable-length key for AEAD algorithms
   static Uint8List _deriveKey32(Uint8List key) {
+    if (key.isEmpty) {
+      key = _defaultXorKey;
+    }
     if (key.length == 32) {
       return key; // Already correct size, no conversion needed!
     }
@@ -124,6 +123,21 @@ class EncryptionManager {
       }
     }
     return result;
+  }
+
+  static Uint8List? _normalizeCustomKey(Uint8List? customKey) {
+    if (customKey == null || customKey.isEmpty) return null;
+    return customKey;
+  }
+
+  static Uint8List _buildAad(Uint8List headerBytes, Uint8List? aad) {
+    if (aad == null || aad.isEmpty) {
+      return headerBytes;
+    }
+    final combined = Uint8List(headerBytes.length + aad.length);
+    combined.setAll(0, headerBytes);
+    combined.setAll(headerBytes.length, aad);
+    return combined;
   }
 
   /// Encode binary data directly (without string conversion)
@@ -143,7 +157,7 @@ class EncryptionManager {
     }
 
     if (input.isEmpty) return Uint8List(0);
-    final usedKey = customKey ?? _activeKey;
+    final usedKey = _normalizeCustomKey(customKey) ?? _activeKey;
     final usedKeyId = keyId ?? _currentKeyId;
 
     // Determine encryption type (priority: parameter > global setting)
@@ -188,10 +202,7 @@ class EncryptionManager {
       case EncryptionType.chacha20Poly1305:
         // ChaCha20-Poly1305 AEAD encryption
         final key32 = _deriveKey32(usedKey);
-        // Combine header and additional context as AAD for stronger integrity
-        final aadBytes = aad != null
-            ? Uint8List.fromList([...headerBytes, ...aad])
-            : headerBytes;
+        final aadBytes = _buildAad(headerBytes, aad);
         final encrypted = ChaCha20Poly1305.encryptBytes(
           plaintext: input,
           key: key32,
@@ -206,10 +217,7 @@ class EncryptionManager {
       case EncryptionType.aes256Gcm:
         // AES-256-GCM AEAD encryption
         final key32 = _deriveKey32(usedKey);
-        // Combine header and additional context as AAD for stronger integrity
-        final aadBytes = aad != null
-            ? Uint8List.fromList([...headerBytes, ...aad])
-            : headerBytes;
+        final aadBytes = _buildAad(headerBytes, aad);
         final encrypted = AESGCM.encryptBytes(
           plaintext: input,
           key: key32,
@@ -225,8 +233,13 @@ class EncryptionManager {
     return result;
   }
 
-  /// Decode binary data (reverse of encodeBytes)
-  /// Returns: decrypted binary data (without header)
+  /// Decode binary data (reverse of encodeBytes).
+  /// Returns decrypted binary data (without header), or passes through raw
+  /// unencrypted bytes when no recognized encryption header prefix is present.
+  ///
+  /// Throws [DbException] on decryption, authentication, key lookup, or
+  /// malformed/truncated encrypted payload failures (never returns ciphertext or
+  /// silent empty bytes for headered data).
   ///
   /// [aad] - Additional Authenticated Data for AEAD algorithms.
   /// Must match the AAD used during encryption.
@@ -234,110 +247,71 @@ class EncryptionManager {
       {Uint8List? customKey, int? keyId, Uint8List? aad}) {
     if (encoded.isEmpty) return Uint8List(0);
 
-    try {
-      // Check for prefixes
-      if (_hasPrefix(encoded, _utf8PrefixBytes)) {
-        return _decodeBytesWithHeader(
-            encoded, _utf8PrefixBytes, EncryptionType.xorObfuscation,
-            customKey: customKey, keyId: keyId, aad: aad);
-      } else if (_hasPrefix(encoded, _rawPrefixBytes)) {
-        return _decodeBytesWithHeader(
-            encoded, _rawPrefixBytes, EncryptionType.none,
-            customKey: customKey, keyId: keyId, aad: aad);
-      } else if (_hasPrefix(encoded, _chacha20PrefixBytes)) {
-        return _decodeBytesWithHeader(
-            encoded, _chacha20PrefixBytes, EncryptionType.chacha20Poly1305,
-            customKey: customKey, keyId: keyId, aad: aad);
-      } else if (_hasPrefix(encoded, _aesPrefixBytes)) {
-        return _decodeBytesWithHeader(
-            encoded, _aesPrefixBytes, EncryptionType.aes256Gcm,
-            customKey: customKey, keyId: keyId, aad: aad);
-      } else {
-        // No header, return as-is
-        return encoded;
-      }
-    } catch (e) {
-      return Uint8List(0);
-    }
-  }
-
-  static Uint8List _decodeBytesWithHeader(
-      Uint8List encoded, List<int> prefixBytes, EncryptionType encType,
-      {Uint8List? customKey, int? keyId, Uint8List? aad}) {
-    // Find end of header
-    int underscoreCount = 0;
-    int headerEndIndex = -1;
-
-    for (int i = prefixBytes.length; i < encoded.length; i++) {
-      if (encoded[i] == 95) {
-        // '_'
-        underscoreCount++;
-        if (underscoreCount == 2) {
-          headerEndIndex = i + 1;
-          break;
-        }
-      }
-    }
-
-    if (headerEndIndex == -1) {
+    final parsed = _tryParseHeader(encoded);
+    if (parsed == null) {
+      // No encryption header, return unencrypted payload as-is.
       return encoded;
     }
 
-    final headerBytes = encoded.sublist(0, headerEndIndex);
-    final headerStr = utf8.decode(headerBytes);
-    final dataBytes = encoded.sublist(headerEndIndex);
+    return _decryptWithHeaderBytes(
+      encoded,
+      parsed,
+      customKey: _normalizeCustomKey(customKey),
+      keyId: keyId,
+      aad: aad,
+    );
+  }
 
-    Uint8List key = customKey ?? _activeKey;
-    final keyIdMatch = RegExp(r'_k(\d+)_').firstMatch(headerStr);
-    int headerKeyId = keyIdMatch != null ? int.parse(keyIdMatch.group(1)!) : 0;
+  static Uint8List _decryptWithHeaderBytes(
+    Uint8List encoded,
+    ({EncryptionType encType, int headerEndIndex, int? keyId}) parsed, {
+    Uint8List? customKey,
+    int? keyId,
+    Uint8List? aad,
+  }) {
+    if (parsed.headerEndIndex >= encoded.length) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoDataCorrupted,
+          message:
+              'Encrypted binary payload is empty or truncated (encType=${parsed.encType.name})',
+        ),
+      ]);
+    }
 
-    if (headerKeyId != (keyId ?? _currentKeyId)) {
-      if (headerKeyId == 0) {
-        key = _defaultXorKey;
-      } else if (_fallbackKeys?.containsKey(headerKeyId) ?? false) {
-        key = _fallbackKeys![headerKeyId] ?? key;
+    if (parsed.encType == EncryptionType.none) {
+      return encoded.sublist(parsed.headerEndIndex);
+    }
+
+    final headerView = Uint8List.sublistView(encoded, 0, parsed.headerEndIndex);
+    final dataView = Uint8List.sublistView(encoded, parsed.headerEndIndex);
+    final candidates = _resolveKeyCandidates(
+      parsed.encType,
+      parsed.keyId,
+      customKey: customKey,
+      keyId: keyId,
+      forUtf8String: false,
+    );
+
+    Object? lastError;
+    for (int i = 0; i < candidates.length; i++) {
+      try {
+        return _decryptBytesWithKey(
+          parsed.encType,
+          headerView,
+          dataView,
+          candidates[i],
+          aad,
+        );
+      } catch (e) {
+        lastError = e;
       }
     }
 
-    switch (encType) {
-      case EncryptionType.none:
-        return dataBytes;
-
-      case EncryptionType.xorObfuscation:
-        return _applyXor(dataBytes, key);
-
-      case EncryptionType.chacha20Poly1305:
-        final key32 = _deriveKey32(key);
-        try {
-          // Combine header and additional context as AAD for verification
-          final aadBytes = aad != null
-              ? Uint8List.fromList([...headerBytes, ...aad])
-              : headerBytes;
-          return ChaCha20Poly1305.decryptBytes(
-            encryptedData: dataBytes,
-            key: key32,
-            aad: aadBytes,
-          );
-        } catch (e) {
-          return dataBytes;
-        }
-
-      case EncryptionType.aes256Gcm:
-        final key32 = _deriveKey32(key);
-        try {
-          // Combine header and additional context as AAD for verification
-          final aadBytes = aad != null
-              ? Uint8List.fromList([...headerBytes, ...aad])
-              : headerBytes;
-          return AESGCM.decryptBytes(
-            encryptedData: dataBytes,
-            key: key32,
-            aad: aadBytes,
-          );
-        } catch (e) {
-          return dataBytes;
-        }
-    }
+    throw _wrapDecryptionError(
+      lastError,
+      'Failed to decrypt payload (encType=${parsed.encType.name}, headerKeyId=${parsed.keyId})',
+    );
   }
 
   /// Highest performance encryption: returns UTF-8 bytes, optionally encrypted
@@ -349,7 +323,7 @@ class EncryptionManager {
     }
 
     if (input.isEmpty) return Uint8List(0);
-    final usedKey = customKey ?? _activeKey;
+    final usedKey = _normalizeCustomKey(customKey) ?? _activeKey;
     final usedKeyId = keyId ?? _currentKeyId;
     final bytes = utf8.encode(input);
 
@@ -426,127 +400,311 @@ class EncryptionManager {
     return result;
   }
 
-  /// Decode string from binary data with header information
+  /// Decode string from binary data with header information.
+  ///
+  /// Throws [DbException] if decryption, key resolution, or UTF-8 decoding fails.
   static String decode(Uint8List encoded, {Uint8List? customKey, int? keyId}) {
     if (encoded.isEmpty) return '';
 
-    try {
-      // Check for prefixes directly on bytes to avoid expensive utf8.decode on the whole buffer
-      if (_hasPrefix(encoded, _utf8PrefixBytes)) {
-        return _decodeWithHeader(
-            encoded, _utf8PrefixBytes, EncryptionType.xorObfuscation,
-            customKey: customKey, keyId: keyId);
-      } else if (_hasPrefix(encoded, _rawPrefixBytes)) {
-        return _decodeWithHeader(encoded, _rawPrefixBytes, EncryptionType.none,
-            customKey: customKey, keyId: keyId);
-      } else if (_hasPrefix(encoded, _chacha20PrefixBytes)) {
-        return _decodeWithHeader(
-            encoded, _chacha20PrefixBytes, EncryptionType.chacha20Poly1305,
-            customKey: customKey, keyId: keyId);
-      } else if (_hasPrefix(encoded, _aesPrefixBytes)) {
-        return _decodeWithHeader(
-            encoded, _aesPrefixBytes, EncryptionType.aes256Gcm,
-            customKey: customKey, keyId: keyId);
-      } else {
-        // Fallback for legacy files or plain text
-        return utf8.decode(encoded);
+    final parsed = _tryParseHeader(encoded);
+    if (parsed == null) {
+      // Fallback for legacy unencrypted plain UTF-8 files
+      try {
+        return utf8.decode(encoded, allowMalformed: false);
+      } catch (e) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysInvalidDataFormat,
+            message: 'Failed to decode plain UTF-8 data: $e',
+          ),
+        ]);
       }
-    } catch (e) {
-      return '';
     }
+
+    return _decryptWithHeaderToString(
+      encoded,
+      parsed,
+      customKey: _normalizeCustomKey(customKey),
+      keyId: keyId,
+    );
   }
 
-  static String _decodeWithHeader(
-      Uint8List encoded, List<int> prefixBytes, EncryptionType encType,
-      {Uint8List? customKey, int? keyId}) {
-    // Find end of header: prefix + v<ver>_k<id>_
-    // We scan for the third underscore.
-    // Prefix format: ToU8_ or ToUr_ (ends with _)
-    // Header format: ToU8_v1_k0_
+  static String _decryptWithHeaderToString(
+    Uint8List encoded,
+    ({EncryptionType encType, int headerEndIndex, int? keyId}) parsed, {
+    Uint8List? customKey,
+    int? keyId,
+  }) {
+    if (parsed.headerEndIndex >= encoded.length) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoDataCorrupted,
+          message:
+              'Encrypted string payload is empty or truncated (encType=${parsed.encType.name})',
+        ),
+      ]);
+    }
 
-    int underscoreCount = 0;
-    int headerEndIndex = -1;
+    final headerView = Uint8List.sublistView(encoded, 0, parsed.headerEndIndex);
+    final dataView = Uint8List.sublistView(encoded, parsed.headerEndIndex);
 
-    // Start scanning from prefix length
-    for (int i = prefixBytes.length; i < encoded.length; i++) {
-      if (encoded[i] == 95) {
-        // 95 is '_'
-        underscoreCount++;
-        if (underscoreCount == 2) {
-          headerEndIndex = i + 1;
-          break;
+    if (parsed.encType == EncryptionType.none) {
+      try {
+        return utf8.decode(dataView, allowMalformed: false);
+      } catch (e) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysInvalidDataFormat,
+            message: 'Failed to decode raw headered UTF-8 payload: $e',
+          ),
+        ]);
+      }
+    }
+
+    final candidates = _resolveKeyCandidates(
+      parsed.encType,
+      parsed.keyId,
+      customKey: customKey,
+      keyId: keyId,
+      forUtf8String: true,
+    );
+
+    Object? lastError;
+    for (int i = 0; i < candidates.length; i++) {
+      try {
+        final plainBytes = _decryptBytesWithKey(
+          parsed.encType,
+          headerView,
+          dataView,
+          candidates[i],
+          null,
+        );
+        return utf8.decode(plainBytes, allowMalformed: false);
+      } catch (e) {
+        lastError = e;
+      }
+    }
+
+    throw _wrapDecryptionError(
+      lastError,
+      'Failed to decrypt string payload (encType=${parsed.encType.name}, headerKeyId=${parsed.keyId})',
+    );
+  }
+
+  static List<Uint8List> _resolveKeyCandidates(
+    EncryptionType encType,
+    int? headerKeyId, {
+    required Uint8List? customKey,
+    required int? keyId,
+    required bool forUtf8String,
+  }) {
+    // Explicit standalone customKey override without keyId scope: never fall back
+    // to global keys so callers testing/using a specific key fail cleanly.
+    if (customKey != null && keyId == null) {
+      return <Uint8List>[customKey];
+    }
+
+    final int expectedKeyId = keyId ?? _currentKeyId;
+    final candidates = <Uint8List>[];
+
+    void addCandidate(Uint8List? k) {
+      if (k == null || k.isEmpty) return;
+      for (int i = 0; i < candidates.length; i++) {
+        if (_bytesEqual(candidates[i], k)) return;
+      }
+      candidates.add(k);
+    }
+
+    if (headerKeyId != null) {
+      if (headerKeyId == expectedKeyId) {
+        addCandidate(customKey ?? _activeKey);
+        if (customKey == null &&
+            headerKeyId == 0 &&
+            (encType == EncryptionType.chacha20Poly1305 ||
+                encType == EncryptionType.aes256Gcm)) {
+          addCandidate(_fallbackKeys?[0]);
+          addCandidate(_defaultXorKey);
+        }
+      } else {
+        final fallback = _fallbackKeys?[headerKeyId];
+        if (fallback != null) {
+          addCandidate(fallback);
+        } else if (headerKeyId == 0) {
+          addCandidate(_defaultXorKey);
+        } else {
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.sysIoDataCorrupted,
+              message:
+                  'Missing decryption key for keyId=$headerKeyId (expectedKeyId=$expectedKeyId)',
+            ),
+          ]);
+        }
+      }
+      return candidates;
+    }
+
+    // Legacy header without keyId (e.g. ToU8_v1_<payload> or ToU8_<payload>).
+    if (encType == EncryptionType.xorObfuscation) {
+      final preferred = customKey ??
+          _fallbackKeys?[0] ??
+          (_currentKeyId == 0 ? _activeKey : _defaultXorKey);
+      addCandidate(preferred);
+      if (forUtf8String && customKey == null) {
+        addCandidate(_defaultXorKey);
+        addCandidate(_activeKey);
+        final fb = _fallbackKeys;
+        if (fb != null && fb.isNotEmpty) {
+          final sortedIds = fb.keys.toList()..sort();
+          for (final id in sortedIds) {
+            addCandidate(fb[id]);
+          }
+        }
+      }
+      return candidates;
+    }
+
+    // AEAD without keyId: MAC prevents false positives, so try active then history.
+    addCandidate(customKey ?? _activeKey);
+    if (customKey == null) {
+      addCandidate(_fallbackKeys?[0]);
+      addCandidate(_defaultXorKey);
+      final fb = _fallbackKeys;
+      if (fb != null && fb.isNotEmpty) {
+        final sortedIds = fb.keys.toList()..sort();
+        for (final id in sortedIds) {
+          addCandidate(fb[id]);
         }
       }
     }
+    return candidates;
+  }
 
-    if (headerEndIndex == -1) {
-      // Malformed header, try fallback
-      return utf8.decode(encoded);
-    }
-
-    final headerBytes = encoded.sublist(0, headerEndIndex);
-    final headerStr = utf8.decode(headerBytes);
-    final dataBytes = encoded.sublist(headerEndIndex);
-
-    Uint8List key = customKey ?? _activeKey;
-    // Extract keyId from header using regex pattern '_k<number>_'
-    final keyIdMatch = RegExp(r'_k(\d+)_').firstMatch(headerStr);
-    int headerKeyId = keyIdMatch != null ? int.parse(keyIdMatch.group(1)!) : 0;
-
-    // If an expected keyId is provided and doesn't match header keyId, try to retrieve the proper key
-    if (headerKeyId != (keyId ?? _currentKeyId)) {
-      if (headerKeyId == 0) {
-        key = _defaultXorKey;
-      } else if (_fallbackKeys?.containsKey(headerKeyId) ?? false) {
-        key = _fallbackKeys![headerKeyId] ?? key;
-      }
-    }
-
+  static Uint8List _decryptBytesWithKey(
+    EncryptionType encType,
+    Uint8List headerBytes,
+    Uint8List dataBytes,
+    Uint8List key,
+    Uint8List? aad,
+  ) {
     switch (encType) {
       case EncryptionType.none:
-        return utf8.decode(dataBytes);
+        return dataBytes;
 
       case EncryptionType.xorObfuscation:
-        final restored = _applyXor(dataBytes, key);
-        return utf8.decode(restored);
+        return _applyXor(dataBytes, key);
 
       case EncryptionType.chacha20Poly1305:
         final key32 = _deriveKey32(key);
-        try {
-          return ChaCha20Poly1305.decrypt(
-            encryptedData: dataBytes,
-            key: key32,
-            aad: headerBytes,
-          );
-        } catch (e) {
-          // Fallback to plain decode if decryption fails
-          return utf8.decode(dataBytes);
-        }
+        final aadBytes = _buildAad(headerBytes, aad);
+        return ChaCha20Poly1305.decryptBytes(
+          encryptedData: dataBytes,
+          key: key32,
+          aad: aadBytes,
+          allowLegacyJsMac: true,
+        );
 
       case EncryptionType.aes256Gcm:
         final key32 = _deriveKey32(key);
-        try {
-          return AESGCM.decrypt(
-            encryptedData: dataBytes,
-            key: key32,
-            aad: headerBytes,
-          );
-        } catch (e) {
-          // Fallback to plain decode if decryption fails
-          return utf8.decode(dataBytes);
-        }
+        final aadBytes = _buildAad(headerBytes, aad);
+        return AESGCM.decryptBytes(
+          encryptedData: dataBytes,
+          key: key32,
+          aad: aadBytes,
+        );
     }
   }
 
-  /// Internal method: check if binary data has a specified prefix
-  static bool _hasPrefix(Uint8List data, List<int> prefix) {
-    if (data.length < prefix.length) return false;
+  static DbException _wrapDecryptionError(Object? error, String context) {
+    if (error is DbException) {
+      return error;
+    }
+    return DbException([
+      GeneralStatus(
+        type: ResultType.sysIoDataCorrupted,
+        message: error == null ? context : '$context: $error',
+      ),
+    ]);
+  }
 
-    for (int i = 0; i < prefix.length; i++) {
-      if (data[i] != prefix[i]) return false;
+  static bool _bytesEqual(Uint8List a, Uint8List b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  static EncryptionType? _matchHeaderType(Uint8List bytes) {
+    if (bytes.length < 5 ||
+        bytes[0] != 84 ||
+        bytes[1] != 111 ||
+        bytes[4] != 95) {
+      return null;
+    }
+    final int b2 = bytes[2];
+    final int b3 = bytes[3];
+    if (b2 == 85 && b3 == 56) return EncryptionType.xorObfuscation; // ToU8_
+    if (b2 == 85 && b3 == 114) return EncryptionType.none; // ToUr_
+    if (b2 == 67 && b3 == 104) return EncryptionType.chacha20Poly1305; // ToCh_
+    if (b2 == 65 && b3 == 101) return EncryptionType.aes256Gcm; // ToAe_
+    return null;
+  }
+
+  /// Parse `<digits>_` right at [start] (bounded by [maxDigits]).
+  static ({int value, int nextIndex})? _tryParseTaggedUint(
+    Uint8List bytes,
+    int start,
+    int maxDigits,
+  ) {
+    int value = 0;
+    int digits = 0;
+    int i = start;
+    while (i < bytes.length && digits < maxDigits) {
+      final int b = bytes[i];
+      if (b < 48 || b > 57) break;
+      value = value * 10 + (b - 48);
+      digits++;
+      i++;
+    }
+    if (digits == 0 || i >= bytes.length || bytes[i] != 95) {
+      return null;
+    }
+    return (value: value, nextIndex: i + 1);
+  }
+
+  /// Parse header at offset 0:
+  /// - Standard: `<prefix>v<ver>_k<keyId>_`
+  /// - Legacy versioned without keyId: `<prefix>v<ver>_`
+  /// - Earliest prefix-only: `<prefix>`
+  static ({EncryptionType encType, int headerEndIndex, int? keyId})?
+      _tryParseHeader(Uint8List bytes) {
+    final encType = _matchHeaderType(bytes);
+    if (encType == null) return null;
+
+    int pos = 5;
+    if (pos + 2 < bytes.length && bytes[pos] == 118) {
+      // 'v'
+      final ver = _tryParseTaggedUint(bytes, pos + 1, 4);
+      if (ver != null) {
+        final int verEnd = ver.nextIndex;
+        if (verEnd + 2 < bytes.length && bytes[verEnd] == 107) {
+          // 'k'
+          final key = _tryParseTaggedUint(bytes, verEnd + 1, 10);
+          if (key != null) {
+            return (
+              encType: encType,
+              headerEndIndex: key.nextIndex,
+              keyId: key.value,
+            );
+          }
+        }
+        return (encType: encType, headerEndIndex: verEnd, keyId: null);
+      }
     }
 
-    return true;
+    return (encType: encType, headerEndIndex: pos, keyId: null);
   }
 
   /* Adding caching logic for key precomputation */
@@ -565,6 +723,9 @@ class EncryptionManager {
   /// This avoids allocating a new buffer if one is already available.
   static void _applyXorToDest(List<int> bytes, List<int> key,
       Uint8List destination, int destinationOffset) {
+    if (key.isEmpty) {
+      key = _defaultXorKey;
+    }
     final int keyLength = key.length;
     final int len = bytes.length;
     final Uint8List inBytes =
@@ -638,12 +799,9 @@ class EncryptionManager {
     }
   }
 
-  /// Check if utf8 data is encoded with our method
+  /// Check if data carries one of our recognized encryption header prefixes.
   static bool isEncoded(Uint8List bytes) {
-    return _hasPrefix(bytes, _utf8PrefixBytes) ||
-        _hasPrefix(bytes, _rawPrefixBytes) ||
-        _hasPrefix(bytes, _chacha20PrefixBytes) ||
-        _hasPrefix(bytes, _aesPrefixBytes);
+    return _matchHeaderType(bytes) != null;
   }
 
   // encryption method, encryption version, keyId, for example 'ToB64_v1_k0_'
@@ -657,50 +815,9 @@ class EncryptionManager {
   }
 
   /// Parse the keyId from encoded bytes header.
-  /// Returns null if the data is not encoded with any of our methods, or the header is malformed.
+  /// Returns null if the data is not encoded with any of our methods, or has no keyId (e.g. legacy header).
   static int? parseKeyId(Uint8List bytes) {
-    if (bytes.isEmpty) return null;
-
-    List<int>? prefixBytes;
-    if (_hasPrefix(bytes, _utf8PrefixBytes)) {
-      prefixBytes = _utf8PrefixBytes;
-    } else if (_hasPrefix(bytes, _rawPrefixBytes)) {
-      prefixBytes = _rawPrefixBytes;
-    } else if (_hasPrefix(bytes, _chacha20PrefixBytes)) {
-      prefixBytes = _chacha20PrefixBytes;
-    } else if (_hasPrefix(bytes, _aesPrefixBytes)) {
-      prefixBytes = _aesPrefixBytes;
-    }
-
-    if (prefixBytes == null) return null;
-
-    int underscoreCount = 0;
-    int headerEndIndex = -1;
-
-    for (int i = prefixBytes.length; i < bytes.length; i++) {
-      if (bytes[i] == 95) {
-        // 95 is '_'
-        underscoreCount++;
-        if (underscoreCount == 2) {
-          headerEndIndex = i + 1;
-          break;
-        }
-      }
-    }
-
-    if (headerEndIndex == -1) return null;
-
-    try {
-      final headerBytes = bytes.sublist(0, headerEndIndex);
-      final headerStr = utf8.decode(headerBytes);
-      final keyIdMatch = RegExp(r'_k(\d+)_').firstMatch(headerStr);
-      if (keyIdMatch != null) {
-        return int.parse(keyIdMatch.group(1)!);
-      }
-    } catch (_) {
-      // Ignore decoding or parsing errors
-    }
-    return null;
+    return _tryParseHeader(bytes)?.keyId;
   }
 
   /// Get current complete encryption state, for isolate thread passing
@@ -720,9 +837,7 @@ class EncryptionManager {
     _currentKeyId = config.keyId;
     _encryptionType = config.encryptionType;
     _encryptionScope = config.encryptionScope;
-    if (config.fallbackKeys != null) {
-      _fallbackKeys = config.fallbackKeys;
-    }
+    _fallbackKeys = config.fallbackKeys;
   }
 
   /// Check if encryption is enabled
