@@ -2930,6 +2930,14 @@ class DataStoreImpl {
             }
           }
         }
+        final Set<String> oldValueIndexFields = <String>{...staticIndexFields};
+        final wmbpIndexesForOldValues =
+            tableMetaManager?.getWmbpIndexesFor(schema);
+        if (wmbpIndexesForOldValues != null) {
+          for (final idx in wmbpIndexesForOldValues) {
+            oldValueIndexFields.addAll(idx.fields);
+          }
+        }
 
         // Non-PK updates
         final List<Map<String, dynamic>> recordsToCommit = [];
@@ -3422,7 +3430,7 @@ class DataStoreImpl {
           }
 
           final Map<String, dynamic> oldValues = {};
-          for (final k in staticIndexFields) {
+          for (final k in oldValueIndexFields) {
             if (record.containsKey(k)) {
               oldValues[k] = record[k];
             }

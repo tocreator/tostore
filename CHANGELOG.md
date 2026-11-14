@@ -6,6 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 - `db.rotateEncryptionKey` now takes `required String? newKey`. Pass `null` or `""` to switch back to the engine built-in encryption key. Whitespace is kept as entered and is not treated as empty.
+- Optimized full-text tokenization.
 
 ### Fixed
 - Encrypted databases now open normally when switching between Wasm and non-Wasm web builds.

@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import '../../model/sparse_vector_data.dart';
+import '../../model/table_schema.dart';
 import '../../model/text_query.dart';
 import '../../model/wal_pointer.dart';
 import '../compute/yield_controller.dart';
@@ -150,12 +151,6 @@ class WmbpCorpus implements WmbpPostingSource {
       remove(primaryKey);
       return;
     }
-    final units = text.codeUnits;
-    final int len = units.length;
-    var wordStart = -1;
-    var hasUpper = false;
-    // Streaming CJK: emit unigram/bigram per char (O(1) scratch).
-    var prevCjk = -1;
 
     _docHashStamp++;
     if (_docHashStamp >= 0x7FFFFFFF) {
@@ -200,66 +195,7 @@ class WmbpCorpus implements WmbpPostingSource {
       slots[docTermCount++] = slot;
     }
 
-    void emitCjk(int cu) {
-      addTerm(String.fromCharCode(cu));
-      if (prevCjk >= 0) {
-        addTerm(String.fromCharCodes(<int>[prevCjk, cu]));
-      }
-      prevCjk = cu;
-    }
-
-    for (int i = 0; i < len; i++) {
-      final int cu = units[i];
-      if (cu > 0x7F) {
-        if (WmbpTokenizer.isCjk(cu)) {
-          if (wordStart >= 0) {
-            final w = text.substring(wordStart, i);
-            addTerm(hasUpper ? w.toLowerCase() : w);
-            wordStart = -1;
-            hasUpper = false;
-          }
-          emitCjk(cu);
-          continue;
-        }
-        prevCjk = -1;
-        if (WmbpTokenizer.isWordUnit(cu)) {
-          if (wordStart < 0) {
-            wordStart = i;
-            hasUpper = false;
-          }
-        } else if (wordStart >= 0) {
-          final w = text.substring(wordStart, i);
-          addTerm(hasUpper ? w.toLowerCase() : w);
-          wordStart = -1;
-          hasUpper = false;
-        }
-        continue;
-      }
-
-      // Fast ASCII path — breaks any open CJK bigram chain.
-      prevCjk = -1;
-      final bool isWord = (cu >= 0x30 && cu <= 0x39) ||
-          (cu >= 0x41 && cu <= 0x5A) ||
-          (cu >= 0x61 && cu <= 0x7A) ||
-          (cu == 0x5F);
-      if (isWord) {
-        if (wordStart < 0) {
-          wordStart = i;
-          hasUpper = cu >= 0x41 && cu <= 0x5A;
-        } else if (cu >= 0x41 && cu <= 0x5A) {
-          hasUpper = true;
-        }
-      } else if (wordStart >= 0) {
-        final w = text.substring(wordStart, i);
-        addTerm(hasUpper ? w.toLowerCase() : w);
-        wordStart = -1;
-        hasUpper = false;
-      }
-    }
-    if (wordStart >= 0) {
-      final w = text.substring(wordStart, len);
-      addTerm(hasUpper ? w.toLowerCase() : w);
-    }
+    WmbpTokenizer.scanTokens(text, addTerm);
 
     if (docTermCount == 0) {
       remove(primaryKey);
@@ -279,7 +215,7 @@ class WmbpCorpus implements WmbpPostingSource {
       impacts[id] = q;
       sig = (sig * 31 + id * 101 + q) & 0x7FFFFFFF;
     }
-    _upsertWithSig(primaryKey, impacts, sig);
+    _upsertWithSig(primaryKey, impacts, sig, rawValue: text);
   }
 
   void upsertWeightedTerms(String primaryKey, Map<String, double> terms) {
@@ -314,13 +250,24 @@ class WmbpCorpus implements WmbpPostingSource {
     // Sparse dimensions are raw termIds; keep nextTermId above the high-water
     // so meta / allocation bounds stay consistent across flushes.
     if (maxDim >= _nextTermId) _nextTermId = maxDim + 1;
-    _upsert(primaryKey, impacts);
+    // Snapshot typed arrays so later in-place caller mutations cannot silently
+    // match the stored pending overlay via identical/shared storage.
+    final snapshot = SparseVectorData(
+      Uint32List.fromList(data.indices),
+      Float32List.fromList(data.values),
+    );
+    _upsertWithSig(
+      primaryKey,
+      impacts,
+      _signature(impacts),
+      rawValue: snapshot,
+    );
   }
 
   void remove(String primaryKey) {
     final int? docId = _pkToDoc.remove(primaryKey);
-    if (docId == null) return;
     _pkSig.remove(primaryKey);
+    if (docId == null) return;
     final doc = _docs.remove(docId);
     _pending.remove(docId);
     if (doc == null) return;
@@ -443,17 +390,137 @@ class WmbpCorpus implements WmbpPostingSource {
     return hits;
   }
 
+  /// Coerces a stored or incoming sparse field value into [SparseVectorData].
+  static SparseVectorData? coerceSparseVector(dynamic value) {
+    if (value is SparseVectorData) return value;
+    if (value is Map) {
+      try {
+        return SparseVectorData.fromMap(
+          value.map((key, item) => MapEntry(key as Object, item as num)),
+        );
+      } catch (_) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  static bool _sparseEquals(SparseVectorData a, SparseVectorData b) {
+    final int n = a.nnz;
+    if (n != b.nnz) return false;
+    for (int i = 0; i < n; i++) {
+      if (a.indices[i] != b.indices[i] || a.values[i] != b.values[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool _rawValueEquals(Object? a, Object? b) {
+    if (a == null || b == null) return false;
+    if (a is String && b is String) return identical(a, b) || a == b;
+    if (a is SparseVectorData && b is SparseVectorData) {
+      return _sparseEquals(a, b);
+    }
+    return false;
+  }
+
+  /// True when [primaryKey] already has an unsealed local overlay generated
+  /// from the exact same [newValue] (avoids redundant re-tokenization at flush).
+  bool hasMatchingLocalOverlay(
+    String primaryKey,
+    IndexType type,
+    dynamic newValue,
+  ) {
+    final int? docId = _pkToDoc[primaryKey];
+    if (docId == null) return false;
+    final _Doc? doc = _docs[docId];
+    if (doc == null || doc.sealed) return false;
+    final Object? stored = doc.rawValue;
+    if (stored == null) return false;
+    if (type == IndexType.text) {
+      return stored is String &&
+          newValue is String &&
+          newValue.isNotEmpty &&
+          (identical(stored, newValue) || stored == newValue);
+    }
+    if (stored is! SparseVectorData) return false;
+    final SparseVectorData? incoming = coerceSparseVector(newValue);
+    if (incoming == null || incoming.nnz == 0) return false;
+    return _sparseEquals(stored, incoming);
+  }
+
+  /// True when an update leaves the indexed [field] unchanged relative to either
+  /// the live local overlay or known [oldValues].
+  bool isIndexedFieldUnchanged({
+    required String primaryKey,
+    required IndexType type,
+    required String field,
+    required Map<String, dynamic>? oldValues,
+    required Map<String, dynamic> newValues,
+  }) {
+    final dynamic newVal = newValues[field];
+    if (_pkToDoc.containsKey(primaryKey)) {
+      return hasMatchingLocalOverlay(primaryKey, type, newVal);
+    }
+    if (_removedPks.contains(primaryKey) ||
+        _pendingDeactivatePks.containsKey(primaryKey)) {
+      return false;
+    }
+    if (oldValues == null) return false;
+    final dynamic oldVal = oldValues[field];
+    if (type == IndexType.text) {
+      final bool oldEmpty =
+          oldVal == null || (oldVal is String && oldVal.isEmpty);
+      final bool newEmpty =
+          newVal == null || (newVal is String && newVal.isEmpty);
+      if (oldEmpty && newEmpty) return true;
+      return oldVal is String &&
+          newVal is String &&
+          (identical(oldVal, newVal) || oldVal == newVal);
+    }
+    final SparseVectorData? oldSparse = coerceSparseVector(oldVal);
+    final SparseVectorData? newSparse = coerceSparseVector(newVal);
+    final bool oldEmpty = oldSparse == null || oldSparse.nnz == 0;
+    final bool newEmpty = newSparse == null || newSparse.nnz == 0;
+    if (oldEmpty && newEmpty) return true;
+    if (oldEmpty || newEmpty) return false;
+    return identical(oldSparse, newSparse) ||
+        _sparseEquals(oldSparse, newSparse);
+  }
+
   bool hasLocalPk(String primaryKey) => _pkToDoc.containsKey(primaryKey);
+
+  void _markSealedInactive(
+    int docId,
+    String primaryKey,
+    WalPointer? flushedAt,
+  ) {
+    if (docId < 0) return;
+    final bool newlyInactive = _inactive.add(docId);
+    if (newlyInactive) {
+      final int windowId = WmbpConstants.windowIdOf(docId);
+      _inactiveWindows[windowId] = (_inactiveWindows[windowId] ?? 0) + 1;
+    }
+    if (newlyInactive || !_deleteMarks.containsKey(docId)) {
+      _inactivePkByDoc[docId] = primaryKey;
+      _deleteMarks[docId] =
+          flushedAt ?? WalPointer(partitionIndex: 0, entrySeq: _deleteSeq++);
+    }
+    if (!_pkToDoc.containsKey(primaryKey)) {
+      _removedPks.add(primaryKey);
+    }
+  }
 
   Future<void> deactivatePrimaryKey(
     String primaryKey, {
     WalPointer? flushedAt,
+    bool removeLocal = true,
   }) async {
-    // Drop any local/pending doc first, then still retire the sealed reverse
-    // mapping. A prior upsert-without-deactivate can leave the old sealed
-    // docId live while `_pkToDoc` already points at a newer local docId;
-    // returning early here used to strand that ghost posting.
-    if (_pkToDoc.containsKey(primaryKey)) {
+    // Drop any local/pending doc first (unless preserving a matching local
+    // overlay), then retire the sealed reverse mapping so older sealed docIds
+    // cannot stay live as ghosts.
+    if (removeLocal && _pkToDoc.containsKey(primaryKey)) {
       remove(primaryKey);
     }
     final sealed = _sealed;
@@ -462,13 +529,28 @@ class WmbpCorpus implements WmbpPostingSource {
     if (docId == WmbpSealedView.revLookupNeedsIo) {
       docId = await sealed.lookupPk(primaryKey) ?? -1;
     }
-    if (docId < 0 || !_inactive.add(docId)) return;
-    _inactivePkByDoc[docId] = primaryKey;
-    _deleteMarks[docId] =
-        flushedAt ?? WalPointer(partitionIndex: 0, entrySeq: _deleteSeq++);
-    final int windowId = WmbpConstants.windowIdOf(docId);
-    _inactiveWindows[windowId] = (_inactiveWindows[windowId] ?? 0) + 1;
-    _removedPks.add(primaryKey);
+    _markSealedInactive(docId, primaryKey, flushedAt);
+  }
+
+  /// Resident-only fast path to retire the older sealed docId for [primaryKey]
+  /// without removing a matching local overlay doc. Cold rev misses are
+  /// recorded in [_pendingDeactivatePks] so DML never awaits.
+  bool tryDeactivateSealedPrimaryKeySync(
+    String primaryKey, {
+    WalPointer? flushedAt,
+  }) {
+    final sealed = _sealed;
+    if (sealed == null) return true;
+    final int docId = sealed.lookupPkResident(primaryKey);
+    if (docId == WmbpSealedView.revLookupNeedsIo) {
+      _pendingDeactivatePks[primaryKey] = flushedAt;
+      if (!_pkToDoc.containsKey(primaryKey)) {
+        _removedPks.add(primaryKey);
+      }
+      return true;
+    }
+    _markSealedInactive(docId, primaryKey, flushedAt);
+    return true;
   }
 
   /// Resident-only fast path for [deactivatePrimaryKey]. Returns `true` when
@@ -489,14 +571,7 @@ class WmbpCorpus implements WmbpPostingSource {
       _removedPks.add(primaryKey);
       return true;
     }
-    if (docId >= 0 && _inactive.add(docId)) {
-      _inactivePkByDoc[docId] = primaryKey;
-      _deleteMarks[docId] =
-          flushedAt ?? WalPointer(partitionIndex: 0, entrySeq: _deleteSeq++);
-      final int windowId = WmbpConstants.windowIdOf(docId);
-      _inactiveWindows[windowId] = (_inactiveWindows[windowId] ?? 0) + 1;
-      _removedPks.add(primaryKey);
-    }
+    _markSealedInactive(docId, primaryKey, flushedAt);
     return true;
   }
 
@@ -529,9 +604,13 @@ class WmbpCorpus implements WmbpPostingSource {
     for (final entry in pending.entries) {
       final y = yc.maybeYield();
       if (y != null) await y;
-      // A live local upsert for this PK already superseded the queued retire.
-      if (_pkToDoc.containsKey(entry.key)) continue;
-      await deactivatePrimaryKey(entry.key, flushedAt: entry.value);
+      // Preserve any live local overlay while retiring the old sealed docId
+      // on disk so it cannot linger in ActiveMask or resurface during flush.
+      await deactivatePrimaryKey(
+        entry.key,
+        flushedAt: entry.value,
+        removeLocal: false,
+      );
     }
   }
 
@@ -877,7 +956,8 @@ class WmbpCorpus implements WmbpPostingSource {
     for (final entry in weightedTerms.entries) {
       final double weight = entry.value;
       if (weight <= 0) continue;
-      final String term = entry.key;
+      final String term = WmbpTokenizer.normalizeTerm(entry.key);
+      if (term.isEmpty) continue;
       if (WmbpTokenizer.isLongPureCjk(term)) {
         local.clear();
         WmbpTokenizer.addOverlappingCjkBigrams(term, local);
@@ -969,29 +1049,46 @@ class WmbpCorpus implements WmbpPostingSource {
     return false;
   }
 
-  void _upsert(String primaryKey, Map<int, int> impacts) {
-    _upsertWithSig(primaryKey, impacts, _signature(impacts));
+  void _upsert(String primaryKey, Map<int, int> impacts, {Object? rawValue}) {
+    _upsertWithSig(
+      primaryKey,
+      impacts,
+      _signature(impacts),
+      rawValue: rawValue,
+    );
   }
 
-  void _upsertWithSig(String primaryKey, Map<int, int> impacts, int sig) {
+  void _upsertWithSig(
+    String primaryKey,
+    Map<int, int> impacts,
+    int sig, {
+    Object? rawValue,
+  }) {
     final oldDocId = _pkToDoc[primaryKey];
     if (oldDocId != null) {
-      if (_pkSig[primaryKey] == sig) return;
+      if (_pkSig[primaryKey] == sig) {
+        final existing = _docs[oldDocId];
+        if (existing != null &&
+            !existing.sealed &&
+            _rawValueEquals(existing.rawValue, rawValue)) {
+          return;
+        }
+      }
       remove(primaryKey);
     }
     if (impacts.isEmpty) return;
     // Update path: deactivatePrimaryKey then upsert same PK. Cancel the pending
     // rev-map delete so a later seal of a *different* PK cannot forget this one.
-    // Also drop cold-rev [_pendingDeactivatePks]: tryDeactivatePrimaryKeySync may
-    // have queued this PK on a cache miss *before* the upsert; resolving that at
-    // seal would remove(primaryKey) and empty the commit batch (doc lost).
+    // Keep cold-rev [_pendingDeactivatePks] until seal or search resolution so
+    // the superseded sealed docId still gets retired with [removeLocal: false]
+    // instead of remaining active when ActiveMask is warm.
     _removedPks.remove(primaryKey);
-    _pendingDeactivatePks.remove(primaryKey);
     final int docId = _nextDocId++;
     final doc = _Doc(
       docId: docId,
       primaryKey: primaryKey,
       impacts: impacts,
+      rawValue: rawValue,
       sealed: false,
     );
     _docs[docId] = doc;
@@ -1008,6 +1105,7 @@ class WmbpCorpus implements WmbpPostingSource {
 
   void _installSealed(_Doc doc) {
     doc.sealed = true;
+    doc.rawValue = null;
     final int windowId = WmbpConstants.windowIdOf(doc.docId);
     final int offset = WmbpConstants.docOffsetOf(doc.docId);
     _activeCount[windowId] = (_activeCount[windowId] ?? 0) + 1;
@@ -1849,6 +1947,13 @@ class WmbpCorpus implements WmbpPostingSource {
     if (pk != null) {
       final int? current = _pkToDoc[pk];
       if (current != null && current != docId) return false;
+      if (_docs[docId] == null) {
+        if (_pendingDeactivatePks.containsKey(pk) || _removedPks.contains(pk)) {
+          return false;
+        }
+        final int? sealedDoc = sealedDocIdOfSync(pk);
+        if (sealedDoc != null && sealedDoc != docId) return false;
+      }
     }
     final doc = _docs[docId];
     if (doc != null && !doc.sealed) return true;
@@ -1860,6 +1965,20 @@ class WmbpCorpus implements WmbpPostingSource {
     }
     // Sealed-only: null means ActiveMask page not in cache yet.
     return _sealed?.loadedActiveBit(docId);
+  }
+
+  @override
+  void noteSupersededSealedDoc(int docId, String primaryKey) {
+    if (docId < 0) return;
+    final doc = _docs[docId];
+    if (doc != null && !doc.sealed) return;
+    // Only retire this specific superseded docId in [_inactive]; never add
+    // [primaryKey] to [_removedPks] or [_deleteMarks], which would hide a
+    // newer live sealed doc for the same PK or delete it on the next flush.
+    if (_inactive.add(docId)) {
+      final int windowId = WmbpConstants.windowIdOf(docId);
+      _inactiveWindows[windowId] = (_inactiveWindows[windowId] ?? 0) + 1;
+    }
   }
 
   @override
@@ -1923,12 +2042,14 @@ class _Doc {
   final int docId;
   final String primaryKey;
   final Map<int, int> impacts;
+  Object? rawValue;
   bool sealed;
 
   _Doc({
     required this.docId,
     required this.primaryKey,
     required this.impacts,
+    this.rawValue,
     required this.sealed,
   });
 }

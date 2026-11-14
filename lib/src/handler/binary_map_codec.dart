@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/sparse_vector_data.dart';
 import '../model/table_schema.dart' show VectorData;
 import 'platform_byte_data.dart';
 
@@ -33,6 +34,7 @@ class BinaryMapCodec {
   // MessagePack ext types
   static const int _extTypeBigInt = 1;
   static const int _extTypeVector = 2;
+  static const int _extTypeSparseVector = 4;
 
   /// String header matching released [WalEncoder] / [BinaryMapCodec]:
   /// fixstr if UTF-8 length &lt; 32, otherwise str32.
@@ -240,6 +242,11 @@ class BinaryMapCodec {
       return;
     }
 
+    if (value is SparseVectorData) {
+      _writeSparseVectorExt(b, value);
+      return;
+    }
+
     if (value is DateTime) {
       _writeString(b, value.toIso8601String());
       return;
@@ -336,6 +343,15 @@ class BinaryMapCodec {
     b.addByte(0xC9); // ext 32
     _writeU32be(b, len);
     b.addByte(_extTypeVector);
+    b.add(payload);
+  }
+
+  static void _writeSparseVectorExt(BytesBuilder b, SparseVectorData v) {
+    final payload = v.toBytes();
+    final int len = payload.length;
+    b.addByte(0xC9); // ext 32
+    _writeU32be(b, len);
+    b.addByte(_extTypeSparseVector);
     b.add(payload);
   }
 
@@ -528,6 +544,13 @@ class BinaryMapCodec {
     if (type == _extTypeVector) {
       try {
         return VectorData.fromBytes(payload);
+      } catch (_) {
+        return null;
+      }
+    }
+    if (type == _extTypeSparseVector) {
+      try {
+        return SparseVectorData.fromBytes(payload);
       } catch (_) {
         return null;
       }

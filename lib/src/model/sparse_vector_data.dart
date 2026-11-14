@@ -126,6 +126,47 @@ class SparseVectorData {
     return sum;
   }
 
+  /// Encodes this sparse vector into compact binary layout (`nnz * 8` bytes):
+  /// `nnz` little-endian uint32 indices followed by `nnz` little-endian float32 values.
+  Uint8List toBytes() {
+    final int n = indices.length;
+    final out = Uint8List(n * 8);
+    if (n == 0) return out;
+    final bd = ByteData.sublistView(out);
+    final int valBase = n * 4;
+    for (int i = 0; i < n; i++) {
+      bd.setUint32(i * 4, indices[i], Endian.little);
+      bd.setFloat32(valBase + i * 4, values[i], Endian.little);
+    }
+    return out;
+  }
+
+  /// Decodes a sparse vector from compact binary bytes produced by [toBytes].
+  factory SparseVectorData.fromBytes(Uint8List bytes) {
+    if ((bytes.length & 7) != 0) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentFormat,
+          message:
+              'Invalid byte length for SparseVectorData: ${bytes.length} (must be a multiple of 8)',
+          parameterName: 'bytes',
+          passedValue: bytes.length,
+        ),
+      ]);
+    }
+    final int n = bytes.length >> 3;
+    final idx = Uint32List(n);
+    final val = Float32List(n);
+    if (n == 0) return SparseVectorData(idx, val);
+    final bd = ByteData.sublistView(bytes);
+    final int valBase = n * 4;
+    for (int i = 0; i < n; i++) {
+      idx[i] = bd.getUint32(i * 4, Endian.little);
+      val[i] = bd.getFloat32(valBase + i * 4, Endian.little);
+    }
+    return SparseVectorData(idx, val);
+  }
+
   Map<String, dynamic> toJson() {
     return {
       'indices': indices.toList(growable: false),

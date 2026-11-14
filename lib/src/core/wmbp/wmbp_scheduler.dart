@@ -161,6 +161,10 @@ abstract class WmbpPostingSource {
   /// True when [primaryKey] has a cold-rev pending deactivation.
   bool isPkPendingRemoval(String primaryKey);
 
+  /// Records that a sealed [docId] for [primaryKey] is superseded or removed
+  /// so subsequent queries reject it immediately from [_inactive].
+  void noteSupersededSealedDoc(int docId, String primaryKey) {}
+
   int impactOf(int docId, int termId);
 
   Iterable<WmbpPendingView> get pendingDocs;
@@ -304,6 +308,7 @@ class _WmbpSearchContext {
   final List<int> survivingMacrosScratch = <int>[];
   final List<int> expandedWindowsScratch = <int>[];
   final Set<int> seenWindowsScratch = <int>{};
+  final Set<int> countedTermsScratch = <int>{};
 
   int nextStamp() {
     var stamp = ++seenStamp;
@@ -324,6 +329,7 @@ class _WmbpSearchContext {
     survivingMacrosScratch.clear();
     expandedWindowsScratch.clear();
     seenWindowsScratch.clear();
+    countedTermsScratch.clear();
   }
 }
 
@@ -344,6 +350,7 @@ class _WmbpSearchContextPool {
     ctx.survivingMacrosScratch.clear();
     ctx.expandedWindowsScratch.clear();
     ctx.seenWindowsScratch.clear();
+    ctx.countedTermsScratch.clear();
     if (_free.length < 8) _free.add(ctx);
   }
 }
@@ -397,189 +404,216 @@ List<WmbpHit> wmbpSearchTopK({
 
     final heap = ctx.heap;
     var stamp = ctx.nextStamp();
-    final seen = ctx.seen;
     final considered = ctx.considered;
-    int theta = 0;
-    var coldWindowMiss = false;
+    Set<int>? rejected;
 
-    void consider(int docId, int score) {
-      if (considered.contains(docId)) return;
-      if (score <= 0) return;
-      if (heap.length == topK) {
-        final worst = heap.worstScore;
-        if (score < worst) return;
-        if (score == worst && docId >= heap.worstDocId) return;
+    const int maxRefillPasses = 8;
+    for (int pass = 0; pass < maxRefillPasses; pass++) {
+      if (pass > 0) {
+        heap.reset(topK);
+        considered.clear();
+        ctx.windowBounds.clear();
+        ctx.survivingMacrosScratch.clear();
+        ctx.expandedWindowsScratch.clear();
+        ctx.seenWindowsScratch.clear();
+        stamp = ctx.nextStamp();
       }
-      final bool? active = source.isDocActiveKnown(docId);
-      if (active == false) {
+      int theta = 0;
+      var coldWindowMiss = false;
+
+      void consider(int docId, int score) {
+        if (considered.contains(docId)) return;
+        if (rejected != null && rejected.contains(docId)) return;
+        if (score <= 0) return;
+        if (heap.length == topK) {
+          final worst = heap.worstScore;
+          if (score < worst) return;
+          if (score == worst && docId >= heap.worstDocId) return;
+        }
+        final bool? active = source.isDocActiveKnown(docId);
+        if (active == false) {
+          considered.add(docId);
+          stats?.ghostPrevented++;
+          return;
+        }
+        // Cold ActiveMask: do not pin — window scan re-evaluates after load.
+        if (active == null) return;
         considered.add(docId);
-        stats?.ghostPrevented++;
-        return;
+        heap.upsert(docId, score);
+        if (heap.length == topK) theta = heap.worstScore;
       }
-      // Cold ActiveMask: do not pin — window scan re-evaluates after load.
-      if (active == null) return;
-      considered.add(docId);
-      heap.upsert(docId, score);
-      if (heap.length == topK) theta = heap.worstScore;
-    }
 
-    int scoreDoc(int docId) => _scoreDocGrouped(
-          source: source,
-          compiled: compiled,
-          docId: docId,
-          conjunctive: conjunctive,
-          hasGroups: groupMeta.hasGroups,
-          groupFailed: groupFailed,
-        );
+      int scoreDoc(int docId) => _scoreDocGrouped(
+            source: source,
+            compiled: compiled,
+            docId: docId,
+            conjunctive: conjunctive,
+            hasGroups: groupMeta.hasGroups,
+            hasDuplicateTerms: groupMeta.hasDuplicateTerms,
+            groupFailed: groupFailed,
+            countedScratch: ctx.countedTermsScratch,
+          );
 
-    // Champion Prefix: exact lower-bound warm without requiring window bodies.
-    for (final term in compiled) {
-      final champions = source.championOf(term.termId);
-      for (int c = 0; c < champions.length; c++) {
-        final posting = champions[c];
-        final int partial = posting.q8 * term.unit;
-        if (heap.length == topK && partial < theta) break;
-        final int windowId = WmbpConstants.windowIdOf(posting.docId);
-        final bool? active = source.isDocActiveKnown(posting.docId);
-        if (active != true) {
-          // false = ghost; null = cold mask — never raise θ without a
-          // confirmed live bit (WMBP iron rule: no Ghost θ).
-          if (active == false) stats?.ghostPrevented++;
-          continue;
-        }
-        final bool fullReady = source.windowOf(term.termId, windowId) != null &&
-            _scoreWindowsReady(source, compiled, windowId);
-        if (fullReady) {
-          consider(posting.docId, scoreDoc(posting.docId));
-        } else if (partial > 0 && term.groupId == 0) {
-          // Soft raise θ with a proven lower bound; do not pin [considered]
-          // so a later full multi-term score can still replace it.
-          // Grouped terms skip soft raise — a single member is not a bound.
-          heap.upsert(posting.docId, partial);
-          if (heap.length == topK) theta = heap.worstScore;
-        }
-      }
-    }
-
-    Set<int>? pendingWindows;
-    for (final pending in source.pendingDocs) {
-      (pendingWindows ??= <int>{}).add(WmbpConstants.windowIdOf(pending.docId));
-      consider(pending.docId, scoreDoc(pending.docId));
-    }
-
-    final survivingMacros = _survivingMacros(
-      source: source,
-      compiled: compiled,
-      heap: heap,
-      theta: theta,
-      conjunctive: conjunctive,
-      stats: stats,
-      out: ctx.survivingMacrosScratch,
-    );
-    if (ensureMacroSync != null) {
-      for (final macroId in survivingMacros) {
-        for (final term in compiled) {
-          if (source.macroMaxImpactOf(term.termId, macroId) <= 0) continue;
-          if (!ensureMacroSync(term.termId, macroId)) {
-            coldWindowMiss = true;
-            break;
+      // Champion Prefix: exact lower-bound warm without requiring window bodies.
+      for (final term in compiled) {
+        final champions = source.championOf(term.termId);
+        for (int c = 0; c < champions.length; c++) {
+          final posting = champions[c];
+          if (rejected != null && rejected.contains(posting.docId)) continue;
+          final int partial = posting.q8 * term.unit;
+          if (heap.length == topK && partial < theta) break;
+          final int windowId = WmbpConstants.windowIdOf(posting.docId);
+          final bool? active = source.isDocActiveKnown(posting.docId);
+          if (active != true) {
+            // false = ghost; null = cold mask — never raise θ without a
+            // confirmed live bit (WMBP iron rule: no Ghost θ).
+            if (active == false) stats?.ghostPrevented++;
+            continue;
+          }
+          final bool fullReady =
+              source.windowOf(term.termId, windowId) != null &&
+                  _scoreWindowsReady(source, compiled, windowId);
+          if (fullReady) {
+            consider(posting.docId, scoreDoc(posting.docId));
+          } else if (partial > 0 && term.groupId == 0) {
+            // Soft raise θ with a proven lower bound; do not pin [considered]
+            // so a later full multi-term score can still replace it.
+            // Grouped terms skip soft raise — a single member is not a bound.
+            heap.upsert(posting.docId, partial);
+            if (heap.length == topK) theta = heap.worstScore;
           }
         }
-        if (coldWindowMiss) break;
       }
-    }
-    if (coldWindowMiss) {
-      stats?.coldPrimaryKeyMisses++;
-      return const <WmbpHit>[];
-    }
 
-    final windows = _expandWindowsViaMacroLeap(
-      source: source,
-      compiled: compiled,
-      pendingWindows: pendingWindows,
-      heap: heap,
-      theta: theta,
-      conjunctive: conjunctive,
-      stats: stats,
-      prefilteredMacros: survivingMacros,
-      out: ctx.expandedWindowsScratch,
-      seenScratch: ctx.seenWindowsScratch,
-    );
-
-    _collectWindowBounds(
-      source: source,
-      compiled: compiled,
-      windows: windows,
-      pendingWindows: pendingWindows,
-      heap: heap,
-      theta: theta,
-      conjunctive: conjunctive,
-      stats: stats,
-      out: ctx.windowBounds,
-    );
-
-    for (final item in ctx.windowBounds) {
-      final int windowId = item.windowId;
-      final int bound = item.bound;
-      if (heap.length == topK && bound < theta) {
-        stats?.superWindowSkips++;
-        continue;
+      Set<int>? pendingWindows;
+      for (final pending in source.pendingDocs) {
+        (pendingWindows ??= <int>{})
+            .add(WmbpConstants.windowIdOf(pending.docId));
+        consider(pending.docId, scoreDoc(pending.docId));
       }
-      if (ensureWindowSync != null) {
-        for (final term in compiled) {
-          if (source.maxImpact(term.termId, windowId) <= 0) continue;
-          if (!ensureWindowSync(term.termId, windowId)) {
-            coldWindowMiss = true;
-            break;
-          }
-        }
-        if (coldWindowMiss) {
-          stats?.coldPrimaryKeyMisses++;
-          break;
-        }
-      }
-      _scanWindow(
-        ctx: ctx,
+
+      final survivingMacros = _survivingMacros(
         source: source,
         compiled: compiled,
-        windowId: windowId,
-        bound: bound,
-        theta: heap.length == topK ? theta : 0,
-        stamp: stamp,
-        stats: stats,
-        consider: consider,
-        scoreDoc: scoreDoc,
+        heap: heap,
+        theta: theta,
         conjunctive: conjunctive,
+        stats: stats,
+        out: ctx.survivingMacrosScratch,
       );
-      stamp++;
-      if (stamp == 0xFFFFFFFF) {
-        seen.fillRange(0, seen.length, 0);
-        stamp = 1;
-        ctx.seenStamp = 1;
+      if (ensureMacroSync != null) {
+        for (final macroId in survivingMacros) {
+          for (final term in compiled) {
+            if (source.macroMaxImpactOf(term.termId, macroId) <= 0) continue;
+            if (!ensureMacroSync(term.termId, macroId)) {
+              coldWindowMiss = true;
+              break;
+            }
+          }
+          if (coldWindowMiss) break;
+        }
       }
-    }
-
-    heap.sortDescending();
-    final int count = heap.count;
-    if (count == 0) return const <WmbpHit>[];
-    final hits = <WmbpHit>[];
-    for (int i = 0; i < count; i++) {
-      final docId = heap.docIds[i];
-      final score = heap.scores[i];
-      final pk = source.primaryKeyOf(docId);
-      if (pk == null || pk.isEmpty) {
+      if (coldWindowMiss) {
         stats?.coldPrimaryKeyMisses++;
-        continue;
+        return const <WmbpHit>[];
       }
-      if (!_isLiveDocIdSync(source, pk, docId)) continue;
-      hits.add(WmbpHit(
-        primaryKey: pk,
-        docId: docId,
-        rawUnits: score,
-        score: 0,
-      ));
+
+      final windows = _expandWindowsViaMacroLeap(
+        source: source,
+        compiled: compiled,
+        pendingWindows: pendingWindows,
+        heap: heap,
+        theta: theta,
+        conjunctive: conjunctive,
+        stats: stats,
+        prefilteredMacros: survivingMacros,
+        out: ctx.expandedWindowsScratch,
+        seenScratch: ctx.seenWindowsScratch,
+      );
+
+      _collectWindowBounds(
+        source: source,
+        compiled: compiled,
+        windows: windows,
+        pendingWindows: pendingWindows,
+        heap: heap,
+        theta: theta,
+        conjunctive: conjunctive,
+        stats: stats,
+        out: ctx.windowBounds,
+      );
+
+      for (final item in ctx.windowBounds) {
+        final int windowId = item.windowId;
+        final int bound = item.bound;
+        if (heap.length == topK && bound < theta) {
+          stats?.superWindowSkips++;
+          continue;
+        }
+        if (ensureWindowSync != null) {
+          for (final term in compiled) {
+            if (source.maxImpact(term.termId, windowId) <= 0) continue;
+            if (!ensureWindowSync(term.termId, windowId)) {
+              coldWindowMiss = true;
+              break;
+            }
+          }
+          if (coldWindowMiss) {
+            stats?.coldPrimaryKeyMisses++;
+            break;
+          }
+        }
+        _scanWindow(
+          ctx: ctx,
+          source: source,
+          compiled: compiled,
+          windowId: windowId,
+          bound: bound,
+          theta: heap.length == topK ? theta : 0,
+          stamp: stamp,
+          stats: stats,
+          consider: consider,
+          scoreDoc: scoreDoc,
+          conjunctive: conjunctive,
+        );
+        stamp = ctx.nextStamp();
+      }
+
+      heap.sortDescending();
+      final int count = heap.count;
+      if (count == 0) return const <WmbpHit>[];
+      final hits = <WmbpHit>[];
+      var evicted = 0;
+      for (int i = 0; i < count; i++) {
+        final docId = heap.docIds[i];
+        final score = heap.scores[i];
+        final pk = source.primaryKeyOf(docId);
+        if (pk == null || pk.isEmpty) {
+          stats?.coldPrimaryKeyMisses++;
+          continue;
+        }
+        if (!_isLiveDocIdSync(source, pk, docId)) {
+          (rejected ??= <int>{}).add(docId);
+          evicted++;
+          continue;
+        }
+        hits.add(WmbpHit(
+          primaryKey: pk,
+          docId: docId,
+          rawUnits: score,
+          score: 0,
+        ));
+      }
+      if (evicted == 0 ||
+          coldWindowMiss ||
+          count < topK ||
+          hits.length >= topK ||
+          pass + 1 >= maxRefillPasses ||
+          (stats != null && stats.coldPrimaryKeyMisses > 0)) {
+        return _collapseHitsByPrimaryKey(hits);
+      }
     }
-    return _collapseHitsByPrimaryKey(hits);
+    return const <WmbpHit>[];
   } finally {
     _WmbpSearchContextPool.release(ctx);
   }
@@ -644,204 +678,241 @@ Future<List<WmbpHit>> wmbpSearchTopKPaged({
 
     final heap = ctx.heap;
     var stamp = ctx.nextStamp();
-    final seen = ctx.seen;
     final considered = ctx.considered;
-    int theta = 0;
+    Set<int>? rejected;
 
-    void consider(int docId, int score) {
-      if (considered.contains(docId)) return;
-      if (score <= 0) return;
-      if (heap.length == topK) {
-        final worst = heap.worstScore;
-        if (score < worst) return;
-        if (score == worst && docId >= heap.worstDocId) return;
+    const int maxRefillPasses = 8;
+    for (int pass = 0; pass < maxRefillPasses; pass++) {
+      if (pass > 0) {
+        heap.reset(topK);
+        considered.clear();
+        ctx.windowBounds.clear();
+        ctx.survivingMacrosScratch.clear();
+        ctx.expandedWindowsScratch.clear();
+        ctx.seenWindowsScratch.clear();
+        stamp = ctx.nextStamp();
       }
-      final bool? active = source.isDocActiveKnown(docId);
-      if (active == false) {
+      int theta = 0;
+
+      void consider(int docId, int score) {
+        if (considered.contains(docId)) return;
+        if (rejected != null && rejected.contains(docId)) return;
+        if (score <= 0) return;
+        if (heap.length == topK) {
+          final worst = heap.worstScore;
+          if (score < worst) return;
+          if (score == worst && docId >= heap.worstDocId) return;
+        }
+        final bool? active = source.isDocActiveKnown(docId);
+        if (active == false) {
+          considered.add(docId);
+          stats?.ghostPrevented++;
+          return;
+        }
+        // Cold ActiveMask: do not pin — ensureWindow below loads mask then scan.
+        if (active == null) return;
         considered.add(docId);
-        stats?.ghostPrevented++;
-        return;
+        heap.upsert(docId, score);
+        if (heap.length == topK) theta = heap.worstScore;
       }
-      // Cold ActiveMask: do not pin — ensureWindow below loads mask then scan.
-      if (active == null) return;
-      considered.add(docId);
-      heap.upsert(docId, score);
-      if (heap.length == topK) theta = heap.worstScore;
-    }
 
-    int scoreDoc(int docId) => _scoreDocGrouped(
-          source: source,
-          compiled: compiled,
-          docId: docId,
-          conjunctive: conjunctive,
-          hasGroups: groupMeta.hasGroups,
-          groupFailed: groupFailed,
-        );
+      int scoreDoc(int docId) => _scoreDocGrouped(
+            source: source,
+            compiled: compiled,
+            docId: docId,
+            conjunctive: conjunctive,
+            hasGroups: groupMeta.hasGroups,
+            hasDuplicateTerms: groupMeta.hasDuplicateTerms,
+            groupFailed: groupFailed,
+            countedScratch: ctx.countedTermsScratch,
+          );
 
-    for (final term in compiled) {
-      for (final posting in source.championOf(term.termId)) {
-        final int partial = posting.q8 * term.unit;
-        if (heap.length == topK && partial < theta) break;
-        final int windowId = WmbpConstants.windowIdOf(posting.docId);
-        final bool? active = source.isDocActiveKnown(posting.docId);
-        if (active != true) {
-          if (active == false) stats?.ghostPrevented++;
-          continue;
-        }
-        final bool fullReady = source.windowOf(term.termId, windowId) != null &&
-            _scoreWindowsReady(source, compiled, windowId);
-        if (fullReady) {
-          consider(posting.docId, scoreDoc(posting.docId));
-        } else if (partial > 0 && term.groupId == 0) {
-          heap.upsert(posting.docId, partial);
-          if (heap.length == topK) theta = heap.worstScore;
-        }
-      }
-    }
-
-    final pendingWindows = <int>{};
-    for (final pending in source.pendingDocs) {
-      pendingWindows.add(WmbpConstants.windowIdOf(pending.docId));
-      consider(pending.docId, scoreDoc(pending.docId));
-    }
-
-    // Stage-2a: leap macros using Root macroMaxImpact (no chunk I/O).
-    final survivingMacros = _survivingMacros(
-      source: source,
-      compiled: compiled,
-      heap: heap,
-      theta: theta,
-      conjunctive: conjunctive,
-      stats: stats,
-      out: ctx.survivingMacrosScratch,
-    );
-    // Stage-2b: load only surviving macro chunks (sync first, then bounded
-    // parallel async). Cap in-flight I/O so seal/search share the disk without
-    // unbounded fan-out; yield between batches for UI.
-    if (ensureMacro != null && survivingMacros.isNotEmpty) {
-      final jobs = <(int termId, int macroId)>[];
-      for (final macroId in survivingMacros) {
-        for (final term in compiled) {
-          if (source.macroMaxImpactOf(term.termId, macroId) <= 0) continue;
-          if (ensureMacroSync != null &&
-              ensureMacroSync(term.termId, macroId)) {
+      for (final term in compiled) {
+        for (final posting in source.championOf(term.termId)) {
+          if (rejected != null && rejected.contains(posting.docId)) continue;
+          final int partial = posting.q8 * term.unit;
+          if (heap.length == topK && partial < theta) break;
+          final int windowId = WmbpConstants.windowIdOf(posting.docId);
+          final bool? active = source.isDocActiveKnown(posting.docId);
+          if (active != true) {
+            if (active == false) stats?.ghostPrevented++;
             continue;
           }
-          jobs.add((term.termId, macroId));
-        }
-      }
-      if (jobs.isNotEmpty) {
-        const batch = 8;
-        final yc = YieldController(
-          'wmbp_ensure_macro_batches',
-          checkInterval: 1,
-          minCheckInterval: 1,
-        );
-        for (int i = 0; i < jobs.length; i += batch) {
-          final end = i + batch < jobs.length ? i + batch : jobs.length;
-          await Future.wait([
-            for (int j = i; j < end; j++) ensureMacro(jobs[j].$1, jobs[j].$2),
-          ]);
-          final y = yc.maybeYield();
-          if (y != null) await y;
-        }
-      }
-    }
-    final windows = _expandWindowsViaMacroLeap(
-      source: source,
-      compiled: compiled,
-      pendingWindows: pendingWindows,
-      heap: heap,
-      theta: theta,
-      conjunctive: conjunctive,
-      stats: stats,
-      prefilteredMacros: survivingMacros,
-      out: ctx.expandedWindowsScratch,
-      seenScratch: ctx.seenWindowsScratch,
-    );
-    _collectWindowBounds(
-      source: source,
-      compiled: compiled,
-      windows: windows,
-      pendingWindows: pendingWindows,
-      heap: heap,
-      theta: theta,
-      conjunctive: conjunctive,
-      stats: stats,
-      out: ctx.windowBounds,
-    );
-
-    // Coarse yield: cache-hit scans have no await; keep UI responsive on
-    // long sparse leaps without yielding every posting.
-    final windowYc = YieldController(
-      'wmbp_search_window_bounds',
-      checkInterval: 16,
-      minCheckInterval: 8,
-    );
-    for (final item in ctx.windowBounds) {
-      final y = windowYc.maybeYield();
-      if (y != null) await y;
-      final int windowId = item.windowId;
-      final int bound = item.bound;
-      if (heap.length == topK && bound < theta) {
-        stats?.superWindowSkips++;
-        continue;
-      }
-      for (final term in compiled) {
-        if (source.maxImpact(term.termId, windowId) <= 0) continue;
-        if (ensureWindowSync == null ||
-            !ensureWindowSync(term.termId, windowId)) {
-          await ensureWindow(term.termId, windowId);
+          final bool fullReady =
+              source.windowOf(term.termId, windowId) != null &&
+                  _scoreWindowsReady(source, compiled, windowId);
+          if (fullReady) {
+            consider(posting.docId, scoreDoc(posting.docId));
+          } else if (partial > 0 && term.groupId == 0) {
+            heap.upsert(posting.docId, partial);
+            if (heap.length == topK) theta = heap.worstScore;
+          }
         }
       }
 
-      _scanWindow(
-        ctx: ctx,
+      final pendingWindows = <int>{};
+      for (final pending in source.pendingDocs) {
+        pendingWindows.add(WmbpConstants.windowIdOf(pending.docId));
+        consider(pending.docId, scoreDoc(pending.docId));
+      }
+
+      // Stage-2a: leap macros using Root macroMaxImpact (no chunk I/O).
+      final survivingMacros = _survivingMacros(
         source: source,
         compiled: compiled,
-        windowId: windowId,
-        bound: bound,
-        theta: heap.length == topK ? theta : 0,
-        stamp: stamp,
-        stats: stats,
-        consider: consider,
-        scoreDoc: scoreDoc,
+        heap: heap,
+        theta: theta,
         conjunctive: conjunctive,
+        stats: stats,
+        out: ctx.survivingMacrosScratch,
       );
-      stamp++;
-      if (stamp == 0xFFFFFFFF) {
-        seen.fillRange(0, seen.length, 0);
-        stamp = 1;
-        ctx.seenStamp = 1;
+      // Stage-2b: load only surviving macro chunks (sync first, then bounded
+      // parallel async). Cap in-flight I/O so seal/search share the disk without
+      // unbounded fan-out; yield between batches for UI.
+      if (ensureMacro != null && survivingMacros.isNotEmpty) {
+        final jobs = <(int termId, int macroId)>[];
+        for (final macroId in survivingMacros) {
+          for (final term in compiled) {
+            if (source.macroMaxImpactOf(term.termId, macroId) <= 0) continue;
+            if (ensureMacroSync != null &&
+                ensureMacroSync(term.termId, macroId)) {
+              continue;
+            }
+            jobs.add((term.termId, macroId));
+          }
+        }
+        if (jobs.isNotEmpty) {
+          const batch = 8;
+          final yc = YieldController(
+            'wmbp_ensure_macro_batches',
+            checkInterval: 1,
+            minCheckInterval: 1,
+          );
+          for (int i = 0; i < jobs.length; i += batch) {
+            final end = i + batch < jobs.length ? i + batch : jobs.length;
+            await Future.wait([
+              for (int j = i; j < end; j++) ensureMacro(jobs[j].$1, jobs[j].$2),
+            ]);
+            final y = yc.maybeYield();
+            if (y != null) await y;
+          }
+        }
       }
-    }
+      final windows = _expandWindowsViaMacroLeap(
+        source: source,
+        compiled: compiled,
+        pendingWindows: pendingWindows,
+        heap: heap,
+        theta: theta,
+        conjunctive: conjunctive,
+        stats: stats,
+        prefilteredMacros: survivingMacros,
+        out: ctx.expandedWindowsScratch,
+        seenScratch: ctx.seenWindowsScratch,
+      );
+      _collectWindowBounds(
+        source: source,
+        compiled: compiled,
+        windows: windows,
+        pendingWindows: pendingWindows,
+        heap: heap,
+        theta: theta,
+        conjunctive: conjunctive,
+        stats: stats,
+        out: ctx.windowBounds,
+      );
 
-    heap.sortDescending();
-    final int count = heap.count;
-    if (count == 0) return const <WmbpHit>[];
-    final hits = <WmbpHit>[];
-    for (int i = 0; i < count; i++) {
-      final docId = heap.docIds[i];
-      final score = heap.scores[i];
-      var pk = source.primaryKeyOf(docId);
-      if (pk == null || pk.isEmpty) {
-        pk = await source.primaryKeyOfAsync(docId);
+      // Coarse yield: cache-hit scans have no await; keep UI responsive on
+      // long sparse leaps without yielding every posting.
+      final windowYc = YieldController(
+        'wmbp_search_window_bounds',
+        checkInterval: 16,
+        minCheckInterval: 8,
+      );
+      for (final item in ctx.windowBounds) {
+        final y = windowYc.maybeYield();
+        if (y != null) await y;
+        final int windowId = item.windowId;
+        final int bound = item.bound;
+        if (heap.length == topK && bound < theta) {
+          stats?.superWindowSkips++;
+          continue;
+        }
+        for (final term in compiled) {
+          if (source.maxImpact(term.termId, windowId) <= 0) continue;
+          if (ensureWindowSync == null ||
+              !ensureWindowSync(term.termId, windowId)) {
+            await ensureWindow(term.termId, windowId);
+          }
+        }
+
+        _scanWindow(
+          ctx: ctx,
+          source: source,
+          compiled: compiled,
+          windowId: windowId,
+          bound: bound,
+          theta: heap.length == topK ? theta : 0,
+          stamp: stamp,
+          stats: stats,
+          consider: consider,
+          scoreDoc: scoreDoc,
+          conjunctive: conjunctive,
+        );
+        stamp = ctx.nextStamp();
       }
-      if (pk == null || pk.isEmpty) {
-        continue;
+
+      heap.sortDescending();
+      final int count = heap.count;
+      if (count == 0) return const <WmbpHit>[];
+      final hits = <WmbpHit>[];
+      var evicted = 0;
+      for (int i = 0; i < count; i++) {
+        final docId = heap.docIds[i];
+        final score = heap.scores[i];
+        var pk = source.primaryKeyOf(docId);
+        if (pk == null || pk.isEmpty) {
+          pk = await source.primaryKeyOfAsync(docId);
+        }
+        if (pk == null || pk.isEmpty) {
+          rejected ??= <int>{};
+          rejected.add(docId);
+          evicted++;
+          continue;
+        }
+        if (!await _isLiveDocId(source, pk, docId)) {
+          rejected ??= <int>{};
+          rejected.add(docId);
+          evicted++;
+          continue;
+        }
+        hits.add(WmbpHit(
+          primaryKey: pk,
+          docId: docId,
+          rawUnits: score,
+          score: 0,
+        ));
       }
-      if (!await _isLiveDocId(source, pk, docId)) continue;
-      hits.add(WmbpHit(
-        primaryKey: pk,
-        docId: docId,
-        rawUnits: score,
-        score: 0,
-      ));
+      if (evicted == 0 ||
+          count < topK ||
+          hits.length >= topK ||
+          pass + 1 >= maxRefillPasses) {
+        return _collapseHitsByPrimaryKey(hits);
+      }
     }
-    return _collapseHitsByPrimaryKey(hits);
+    return const <WmbpHit>[];
   } finally {
     _WmbpSearchContextPool.release(ctx);
   }
+}
+
+bool _rejectSupersededGhost(
+  WmbpPostingSource source,
+  String pk,
+  int docId,
+) {
+  source.noteSupersededSealedDoc(docId, pk);
+  return false;
 }
 
 /// Drops superseded sealed docIds when the live mapping is already known.
@@ -849,11 +920,17 @@ Future<List<WmbpHit>> wmbpSearchTopKPaged({
 /// When the sealed reverse-map cache misses, returns true so the sync search
 /// path can escalate to async verification instead of dropping live hits.
 bool _isLiveDocIdSync(WmbpPostingSource source, String pk, int docId) {
-  if (source.isPkPendingRemoval(pk)) return false;
   final int? local = source.currentDocIdOf(pk);
-  if (local != null) return local == docId;
+  if (local != null) {
+    return local == docId ? true : _rejectSupersededGhost(source, pk, docId);
+  }
+  if (source.isPkPendingRemoval(pk)) {
+    return _rejectSupersededGhost(source, pk, docId);
+  }
   final int? sealed = source.sealedDocIdOfSync(pk);
-  if (sealed != null) return sealed == docId;
+  if (sealed != null) {
+    return sealed == docId ? true : _rejectSupersededGhost(source, pk, docId);
+  }
   return true;
 }
 
@@ -862,23 +939,30 @@ Future<bool> _isLiveDocId(
   String pk,
   int docId,
 ) async {
-  if (source.isPkPendingRemoval(pk)) return false;
   final int? local = source.currentDocIdOf(pk);
-  if (local != null) return local == docId;
+  if (local != null) {
+    return local == docId ? true : _rejectSupersededGhost(source, pk, docId);
+  }
+  if (source.isPkPendingRemoval(pk)) {
+    return _rejectSupersededGhost(source, pk, docId);
+  }
   // Bitmap-first: when no local overlay / pending removal and ActiveMask says
   // live, skip cold reverse-tree I/O.
-  if (local == null &&
-      !source.isPkPendingRemoval(pk) &&
-      source.isDocActiveKnown(docId) == true) {
+  if (source.isDocActiveKnown(docId) == true) {
     final int? sealedSync = source.sealedDocIdOfSync(pk);
     if (sealedSync == null) return true;
-    return sealedSync == docId;
+    return sealedSync == docId
+        ? true
+        : _rejectSupersededGhost(source, pk, docId);
   }
   final int? sealed =
       source.sealedDocIdOfSync(pk) ?? await source.sealedDocIdOf(pk);
-  if (sealed != null) return sealed == docId;
+  if (sealed != null) {
+    return sealed == docId ? true : _rejectSupersededGhost(source, pk, docId);
+  }
   // No reverse-map entry and not a local/pending doc → orphan sealed ghost.
-  return source.isLocalDoc(docId);
+  if (source.isLocalDoc(docId)) return true;
+  return _rejectSupersededGhost(source, pk, docId);
 }
 
 /// Keeps the highest-[rawUnits] hit per primary key (docId churn on upsert).
@@ -954,7 +1038,9 @@ int _scoreDocGrouped({
   required int docId,
   required bool conjunctive,
   required bool hasGroups,
+  required bool hasDuplicateTerms,
   required Uint8List groupFailed,
+  required Set<int> countedScratch,
 }) {
   if (!hasGroups) {
     var sum = 0;
@@ -981,16 +1067,15 @@ int _scoreDocGrouped({
   }
 
   var sum = 0;
-  // termId → already added (avoid double-count when shared across groups).
-  // Compact stamp table sized by compiled length is enough via slot walk.
-  final counted = <int>{};
+  final Set<int>? counted =
+      hasDuplicateTerms ? (countedScratch..clear()) : null;
   for (final term in compiled) {
     if (term.groupId != 0 &&
         term.groupId < groupFailed.length &&
         groupFailed[term.groupId] != 0) {
       continue;
     }
-    if (!counted.add(term.termId)) continue;
+    if (counted != null && !counted.add(term.termId)) continue;
     final int q = source.impactOf(docId, term.termId);
     if (q <= 0) {
       if (conjunctive) return 0;
@@ -1001,12 +1086,30 @@ int _scoreDocGrouped({
   return sum;
 }
 
-({int maxGroupId, bool hasGroups}) _groupMeta(List<_CompiledTerm> compiled) {
+({int maxGroupId, bool hasGroups, bool hasDuplicateTerms}) _groupMeta(
+  List<_CompiledTerm> compiled,
+) {
   var maxGroupId = 0;
-  for (final term in compiled) {
+  var hasDuplicateTerms = false;
+  final int n = compiled.length;
+  for (int i = 0; i < n; i++) {
+    final term = compiled[i];
     if (term.groupId > maxGroupId) maxGroupId = term.groupId;
+    if (!hasDuplicateTerms) {
+      final int id = term.termId;
+      for (int j = 0; j < i; j++) {
+        if (compiled[j].termId == id) {
+          hasDuplicateTerms = true;
+          break;
+        }
+      }
+    }
   }
-  return (maxGroupId: maxGroupId, hasGroups: maxGroupId > 0);
+  return (
+    maxGroupId: maxGroupId,
+    hasGroups: maxGroupId > 0,
+    hasDuplicateTerms: hasDuplicateTerms,
+  );
 }
 
 /// Drops AND-groups that lost members to df==0 filters.

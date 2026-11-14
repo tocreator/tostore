@@ -152,6 +152,15 @@ class WmbpIndexManager {
       for (final update in updates) {
         final pk = update.primaryKey?.toString() ?? '';
         if (pk.isEmpty) continue;
+        if (corpus.isIndexedFieldUnchanged(
+          primaryKey: pk,
+          type: index.type,
+          field: field,
+          oldValues: update.oldValues,
+          newValues: update.newValues,
+        )) {
+          continue;
+        }
         if (corpus.prefersPagedSearch &&
             !corpus.tryDeactivatePrimaryKeySync(pk)) {
           return false;
@@ -210,14 +219,11 @@ class WmbpIndexManager {
         if (y != null) await y;
         final pk = row[pkName]?.toString() ?? '';
         if (sealPks != null && pk.isNotEmpty) sealPks.add(pk);
-        // If this record was already ingested into the pending read cache by
-        // [applyChangesSync] when it entered the write buffer, reuse the
-        // tokenized impacts directly and avoid deactivating + re-tokenizing.
-        if (pk.isNotEmpty && corpus.hasLocalPk(pk)) {
+        if (pk.isNotEmpty &&
+            corpus.hasMatchingLocalOverlay(pk, index.type, row[field])) {
+          await _deactivateSealedForOverlay(corpus, pk);
           continue;
         }
-        // Inserts can replace an existing sealed PK (upsert / rewrite). Always
-        // deactivate prior local + sealed docIds before assigning a new one.
         if (pk.isNotEmpty &&
             corpus.prefersPagedSearch &&
             !corpus.tryDeactivatePrimaryKeySync(pk)) {
@@ -230,9 +236,22 @@ class WmbpIndexManager {
         if (y != null) await y;
         final pk = update.primaryKey?.toString() ?? '';
         if (pk.isEmpty) continue;
+        if (corpus.hasMatchingLocalOverlay(
+            pk, index.type, update.newValues[field])) {
+          sealPks?.add(pk);
+          await _deactivateSealedForOverlay(corpus, pk);
+          continue;
+        }
+        if (corpus.isIndexedFieldUnchanged(
+          primaryKey: pk,
+          type: index.type,
+          field: field,
+          oldValues: update.oldValues,
+          newValues: update.newValues,
+        )) {
+          continue;
+        }
         sealPks?.add(pk);
-        // Always deactivate when sealed pages exist — including when a local
-        // overlay doc is present — so older sealed docIds cannot keep matching.
         if (corpus.prefersPagedSearch &&
             !corpus.tryDeactivatePrimaryKeySync(pk)) {
           await corpus.deactivatePrimaryKey(pk);
@@ -582,6 +601,16 @@ class WmbpIndexManager {
     }
   }
 
+  Future<void> _deactivateSealedForOverlay(
+    WmbpCorpus corpus,
+    String pk,
+  ) async {
+    if (corpus.prefersPagedSearch &&
+        !corpus.tryDeactivateSealedPrimaryKeySync(pk)) {
+      await corpus.deactivatePrimaryKey(pk, removeLocal: false);
+    }
+  }
+
   /// Hint for freezing `densePagesPerPartition` on first seal (win/fwd only).
   int _pagesPerPartition() {
     final int pages =
@@ -699,19 +728,8 @@ class WmbpIndexManager {
     corpus.upsertSparse(id, sparse);
   }
 
-  SparseVectorData? _asSparse(dynamic value) {
-    if (value is SparseVectorData) return value;
-    if (value is Map) {
-      try {
-        return SparseVectorData.fromMap(value.map(
-          (key, item) => MapEntry(key as Object, item as num),
-        ));
-      } catch (_) {
-        return null;
-      }
-    }
-    return null;
-  }
+  SparseVectorData? _asSparse(dynamic value) =>
+      WmbpCorpus.coerceSparseVector(value);
 
   void clearTable(TableUid tableUid) {
     final prefix = '${tableUid.value}/';

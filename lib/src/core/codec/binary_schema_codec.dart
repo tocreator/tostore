@@ -6,6 +6,7 @@ import '../../handler/platform_byte_data.dart';
 import '../../model/db_exception.dart';
 import '../../model/result_status.dart';
 import '../../model/result_type.dart';
+import '../../model/sparse_vector_data.dart';
 import '../../model/table_schema.dart' show VectorData;
 import '../../model/value_ref.dart';
 
@@ -283,6 +284,12 @@ class BinarySchemaCodec {
     if (value is VectorData) {
       final f64 = Float64List.fromList(value.values);
       _writeBinary(b, f64.buffer.asUint8List());
+      return;
+    }
+
+    // 7b. SparseVectorData: encode as binary (uint32 indices + float32 values).
+    if (value is SparseVectorData) {
+      _writeBinary(b, value.toBytes());
       return;
     }
 
@@ -616,7 +623,8 @@ class BinarySchemaCodec {
   ///
   /// DataType enum indices (from model/table_schema.dart):
   ///   0: integer, 1: bigInt, 2: double, 3: text, 4: blob,
-  ///   5: boolean, 6: datetime, 7: array, 8: vector, 9: json.
+  ///   5: boolean, 6: datetime, 7: array, 8: vector, 9: json,
+  ///   10: dynamic, 11: sparse.
   static dynamic _coerceByTypeIndex(int typeIndex, dynamic value) {
     switch (typeIndex) {
       // DataType.integer
@@ -655,6 +663,14 @@ class BinarySchemaCodec {
           return VectorData.fromBytes(value);
         }
         if (value is VectorData) return value;
+        return value;
+
+      // DataType.sparse
+      case 11:
+        if (value is Uint8List) {
+          return SparseVectorData.fromBytes(value);
+        }
+        if (value is SparseVectorData) return value;
         return value;
 
       default:

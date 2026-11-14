@@ -378,13 +378,24 @@ class BufferTreeStore {
           entry.operation == BufferOperationType.update) {
         final merged = Map<String, dynamic>.from(prior.data)
           ..addAll(entry.data);
+        final Map<String, dynamic>? mergedOldValues;
+        if (prior.oldValues == null) {
+          mergedOldValues = entry.oldValues;
+        } else if (entry.oldValues == null) {
+          mergedOldValues = prior.oldValues;
+        } else {
+          mergedOldValues = <String, dynamic>{
+            ...entry.oldValues!,
+            ...prior.oldValues!,
+          };
+        }
         effective = BufferEntry(
           data: merged,
           operation: BufferOperationType.update,
           timestamp: entry.timestamp,
           walPointer: entry.walPointer ?? prior.walPointer,
           transactionId: prior.transactionId ?? entry.transactionId,
-          oldValues: prior.oldValues ?? entry.oldValues,
+          oldValues: mergedOldValues,
           schemaVersion: entry.schemaVersion,
         );
       } else if (prior.operation == BufferOperationType.update &&

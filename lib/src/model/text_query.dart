@@ -1,3 +1,4 @@
+import '../core/wmbp/wmbp_tokenizer.dart';
 import 'db_exception.dart';
 import 'result_status.dart';
 import 'result_type.dart';
@@ -29,15 +30,16 @@ class TextTerm {
 ///
 /// Use [TextQuery.text] for raw text (the engine tokenizes it).
 /// Use [TextQuery.terms] or [TextQuery.termsWeighted] when terms are already
-/// split. Pre-tokenized terms are matched as given — built-in indexing stores
-/// Latin tokens in lowercase, so `Kernel` does not match `kernel`.
+/// split. Pre-tokenized terms are trimmed and ASCII-lowercased (`ToStore` →
+/// `tostore`) to match indexed casing without splitting compound terms or
+/// remapping fullwidth characters.
 class TextQuery {
   /// Raw text. Null when [weightedTerms] is set.
   final String? text;
 
   /// Pre-tokenized term weights. Null when [text] is set.
   ///
-  /// Duplicate terms are summed.
+  /// Duplicate terms (after normalization) are summed.
   final Map<String, double>? weightedTerms;
   final int _hashCode;
 
@@ -49,7 +51,8 @@ class TextQuery {
 
   /// Pre-tokenized terms, each with weight 1.
   ///
-  /// Repeated strings add weight.
+  /// Terms are trimmed and ASCII-lowercased to match indexed casing; repeated
+  /// terms add weight.
   factory TextQuery.terms(List<String> terms) => TextQuery._(
         null,
         _normalize(terms.map((term) => TextTerm(term))),
@@ -57,7 +60,8 @@ class TextQuery {
 
   /// Pre-tokenized terms with explicit weights.
   ///
-  /// Weights of the same [TextTerm.term] are summed.
+  /// Terms are trimmed and ASCII-lowercased to match indexed casing; weights of
+  /// equivalent normalized terms are summed.
   factory TextQuery.termsWeighted(List<TextTerm> terms) =>
       TextQuery._(null, _normalize(terms));
 
@@ -67,7 +71,8 @@ class TextQuery {
   static Map<String, double> _normalize(Iterable<TextTerm> terms) {
     final weights = <String, double>{};
     for (final item in terms) {
-      if (item.term.trim().isEmpty) {
+      final normalized = WmbpTokenizer.normalizeTerm(item.term);
+      if (normalized.isEmpty) {
         throw DbException([
           InvalidArgumentStatus(
             type: ResultType.devInvalidArgumentFormat,
@@ -88,7 +93,7 @@ class TextQuery {
           ),
         ]);
       }
-      weights[item.term] = (weights[item.term] ?? 0) + item.weight;
+      weights[normalized] = (weights[normalized] ?? 0) + item.weight;
     }
     return Map<String, double>.unmodifiable(weights);
   }

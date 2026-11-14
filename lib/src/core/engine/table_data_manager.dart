@@ -16,6 +16,7 @@ import '../../model/query_aggregation.dart';
 import '../../model/result_status.dart';
 import '../../model/result_type.dart';
 import '../../model/space_stats.dart';
+import '../../model/sparse_vector_data.dart';
 import '../../model/system_table.dart';
 import '../../model/table_context.dart';
 import '../../model/table_identity.dart';
@@ -740,6 +741,7 @@ class TableDataManager {
     if (v is String) return v.length * 2;
     // VectorData on-disk / heap estimate: Float64 payload + small header.
     if (v is VectorData) return 24 + v.dimensions * 8;
+    if (v is SparseVectorData) return 24 + v.nnz * 8;
 
     // Bound recursion depth to avoid pathological nested structures.
     if (depth >= 2) return 32;

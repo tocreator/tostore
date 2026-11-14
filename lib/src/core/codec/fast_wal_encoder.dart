@@ -5,6 +5,7 @@ import '../../model/data_store_config.dart';
 import '../../model/db_exception.dart';
 import '../../model/result_status.dart';
 import '../../model/result_type.dart';
+import '../../model/sparse_vector_data.dart';
 import '../../model/table_schema.dart'
     show VectorData, TableSchema, DataType, PrimaryKeyType;
 import '../../handler/binary_map_codec.dart';
@@ -23,6 +24,7 @@ class FastWalEncoder {
   // Ext types compatible with BinaryMapCodec
   static const int _extTypeBigInt = 1;
   static const int _extTypeVector = 2;
+  static const int _extTypeSparseVector = 4;
 
   // Pre-compiled MessagePack fixstr tokens for top-level WAL envelope keys
   // "op" -> len 2: 0xA2, 'o', 'p'
@@ -515,6 +517,16 @@ class FastWalEncoder {
       buf.writeUint8(0xC9); // ext32
       buf.writeUint32BE(len);
       buf.writeUint8(_extTypeVector);
+      buf.writeBytes(payload);
+      return;
+    }
+
+    if (value is SparseVectorData) {
+      final payload = value.toBytes();
+      final int len = payload.length;
+      buf.writeUint8(0xC9); // ext32
+      buf.writeUint32BE(len);
+      buf.writeUint8(_extTypeSparseVector);
       buf.writeBytes(payload);
       return;
     }

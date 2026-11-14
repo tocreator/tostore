@@ -5790,7 +5790,7 @@ class DatabaseTester {
         ok &= _expect('strong text score not forced to 1.0', s == 1.0, false);
       }
 
-      // Pre-tokenized terms: case-sensitive exact match.
+      // Pre-tokenized terms: ASCII case-insensitive match.
       final lower = await db
           .query(table.name)
           .select(['id'])
@@ -5807,9 +5807,9 @@ class DatabaseTester {
           .matchText(textField, TextQuery.terms(['Kernel']))
           .limit(5);
       ok &= _expect(
-        'terms Kernel (capital K) misses indexed kernel',
+        'terms Kernel (capital K) hits indexed kernel',
         upper.data.any((r) => r['id']?.toString() == pkLatin),
-        false,
+        true,
       );
 
       // Repeated terms raise weight vs single.

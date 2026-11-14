@@ -2433,7 +2433,21 @@ class FieldSchema {
       case DataType.dynamic:
         return value;
       case DataType.sparse:
-        if (value is SparseVectorData) return value;
+        if (value is SparseVectorData) {
+          // Copy typed lists so caller-side in-place mutations after insert/flush
+          // cannot silently alias tableRecordCache snapshots.
+          return SparseVectorData(
+            Uint32List.fromList(value.indices),
+            Float32List.fromList(value.values),
+          );
+        }
+        if (value is Uint8List) {
+          try {
+            return SparseVectorData.fromBytes(value);
+          } catch (_) {
+            return null;
+          }
+        }
         if (value is Map) {
           try {
             return SparseVectorData.fromMap(value.map(
@@ -2792,7 +2806,7 @@ class FieldSchema {
             (value is List && value.every((v) => v is num)) ||
             value is Uint8List;
       case DataType.sparse:
-        return value is SparseVectorData || value is Map;
+        return value is SparseVectorData || value is Map || value is Uint8List;
       case DataType.json:
         return value is Map;
       case DataType.dynamic:
