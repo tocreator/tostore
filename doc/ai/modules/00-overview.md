@@ -45,7 +45,7 @@ ToStore is a distributed data engine for applications, servers, and Agents.
 
 ```yaml
 dependencies:
-  tostore: ^3.6.1
+  tostore: ^3.6.2
 ```
 
 ## Human docs (optional)

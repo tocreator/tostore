@@ -1087,13 +1087,27 @@ class ToStoreExample {
       ..writeln('Hits ${preview.data.length}/$k in $timeLabel'
           '${minScore == null ? "" : " (filtered by minScore; discarded below floor)"}');
     final entries = preview.retrieval?.entries ?? const <RetrievalEntry>[];
+    final bool isRrf =
+        preview.retrieval?.fusionMethod == RetrievalFusionMethod.rrf;
     var belowRag = 0;
     for (var i = 0; i < preview.data.length; i++) {
       final record = preview.data[i];
       final entry = i < entries.length ? entries[i] : null;
       final scoreText = entry == null ? '-' : entry.score.toStringAsFixed(4);
-      final band = entry == null ? '-' : relevanceBand(entry.score);
-      if (entry != null && entry.score < 0.40) belowRag++;
+      final double? relScore = isRrf
+          ? (entry?.meta?['relevanceScore'] as num?)?.toDouble()
+          : entry?.score;
+      final String band;
+      if (entry == null) {
+        band = '-';
+      } else if (isRrf) {
+        band = relScore == null
+            ? 'RRF'
+            : 'RRF rel=${relScore.toStringAsFixed(4)} ${relevanceBand(relScore)}';
+      } else {
+        band = relevanceBand(entry.score);
+      }
+      if (relScore != null && relScore < 0.40) belowRag++;
       final channel = entry?.channel.name ?? '-';
       final headline = record['headline'] ?? record['title'];
       report.write(

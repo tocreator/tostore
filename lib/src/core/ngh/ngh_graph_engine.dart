@@ -3536,7 +3536,18 @@ class NghGraphEngine {
 
     final hasPending = pendingDeletePks != null;
     final hasThreshold = distanceThreshold != null;
-    final threshold = distanceThreshold ?? 0.0;
+    final bool isL2 = !isCosine && !isIP;
+    final double threshold;
+    if (!hasThreshold) {
+      threshold = 0.0;
+    } else if (isL2) {
+      // Public L2 distanceThreshold is Euclidean; internal heap dist is squared L2.
+      threshold = distanceThreshold < 0.0
+          ? -1.0
+          : distanceThreshold * distanceThreshold;
+    } else {
+      threshold = distanceThreshold;
+    }
 
     for (int i = 1; i <= scratch.slotHeap.size; i++) {
       final slot = scratch.slotHeap.slots[i]!;
@@ -6872,6 +6883,7 @@ class _FixedHeap {
     String? pkString,
     double slotSqNorm = 0.0,
   ]) {
+    if (capacity <= 0) return;
     if (_size < capacity) {
       final i = _size;
       _ids[i] = id;

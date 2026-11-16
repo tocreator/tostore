@@ -217,6 +217,28 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
     return this;
   }
 
+  /// Rename the primary key field without changing its key generation type or ordering.
+  SchemaBuilder renamePrimaryKey(String newName) {
+    if (_operations
+        .any((op) => op.type == MigrationType.promoteFieldToPrimaryKey)) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devInvalidSchemaPrimaryKey,
+          message:
+              'Cannot call renamePrimaryKey together with promoteFieldToPrimaryKey '
+              'on table "$_tableName".',
+          tableName: _tableName,
+          field: newName,
+        ),
+      ]);
+    }
+    _operations.add(MigrationOperation(
+      type: MigrationType.setPrimaryKeyConfig,
+      newName: newName,
+    ));
+    return this;
+  }
+
   /// Promote a unique non-null field to primary key via async shadow-table rewrite.
   ///
   /// Does not require [allowAfterDataMigration] -- promote itself declares data migration.

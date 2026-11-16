@@ -47,6 +47,7 @@ class WmbpIndexManager {
     required int topK,
     TextMatchOperator operator = TextMatchOperator.or,
   }) {
+    if (topK <= 0) return const <WmbpHit>[];
     final index = _findIndex(table.schema, fieldName, IndexType.text);
     if (index == null) return const <WmbpHit>[];
     final key = _key(table, index);
@@ -62,6 +63,7 @@ class WmbpIndexManager {
     required int topK,
     TextMatchOperator operator = TextMatchOperator.or,
   }) {
+    if (topK <= 0) return Future.value(const <WmbpHit>[]);
     final index = _findIndex(table.schema, fieldName, IndexType.text);
     if (index == null) return Future.value(const <WmbpHit>[]);
     final key = _key(table, index);
@@ -92,6 +94,7 @@ class WmbpIndexManager {
     required SparseVectorData query,
     required int topK,
   }) {
+    if (topK <= 0) return const <WmbpHit>[];
     final index = _findIndex(table.schema, fieldName, IndexType.sparse);
     if (index == null) return const <WmbpHit>[];
     final key = _key(table, index);
@@ -106,6 +109,7 @@ class WmbpIndexManager {
     required SparseVectorData query,
     required int topK,
   }) {
+    if (topK <= 0) return Future.value(const <WmbpHit>[]);
     return _search(
       table: table,
       fieldName: fieldName,

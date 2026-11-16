@@ -365,7 +365,11 @@ class RetrievalEntry {
   /// - [RetrievalChannel.vector]: physical metric (`cosine` / IP / Euclidean);
   ///   normalized relevance is [score]; ANN distance in `meta['distance']`.
   ///
-  /// Multi-way: same value as [score] (absolute relevance or relative RRF).
+  /// Multi-way:
+  /// - [RetrievalFusionMethod.weightedScore]: physical metric value when matched
+  ///   by a single retrieval channel, or `null` when fused across multiple
+  ///   channels (per-channel values are in `meta['channelContributions']`).
+  /// - [RetrievalFusionMethod.rrf]: same value as [score] (raw RRF sum).
   final double? rawScore;
 
   /// Optional extended channel metadata (e.g. distanceMetric, channelScores, matchedTerms).

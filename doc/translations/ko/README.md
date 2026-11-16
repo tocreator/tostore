@@ -89,7 +89,7 @@ ToStore는 AGI 시대와 엣지 인텔리전스 시나리오를 위해 설계된
 
 ```yaml
 dependencies:
-  tostore: ^3.6.1
+  tostore: ^3.6.2
 ```
 
 ### For AI Coding Assistants

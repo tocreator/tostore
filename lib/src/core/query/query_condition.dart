@@ -21,6 +21,7 @@ class QueryCondition {
   // Memoized single equality fast-path cache
   ({String field, dynamic value})? _cachedSingleEq;
   bool _hasCalculatedSingleEq = false;
+  bool _pendingOrConnector = false;
 
   void _invalidateSingleEqCache() {
     _hasCalculatedSingleEq = false;
@@ -186,6 +187,8 @@ class QueryCondition {
     copy._fastSingleEqVal = _fastSingleEqVal;
     copy._singleOp = _singleOp;
     copy._isNormalized = _isNormalized;
+    copy._retrievalFlags = _retrievalFlags;
+    copy._pendingOrConnector = _pendingOrConnector;
 
     if (_root != null) {
       copy._root = _root!.clone();
@@ -228,6 +231,8 @@ class QueryCondition {
 
   /// Add a basic condition
   QueryCondition where(String field, dynamic operator, dynamic value) {
+    final bool explicitOr = _pendingOrConnector;
+    _pendingOrConnector = false;
     _conditionCount++;
     _invalidateSingleEqCache();
     final cleanField = field.contains('.') ? field.split('.').last : field;
@@ -254,14 +259,18 @@ class QueryCondition {
       // Skip map/tree retrieval scans when this builder has no retrieval flags.
       if (hasRetrievalMatch) {
         final bool incomingRetrieval = _mapContainsRetrieval(condition);
-        // A structured predicate after a retrieval OR filters every arm.
-        // Example: matchVector().orMatchText().whereEqual(...) is
-        // (vector OR text) AND field = value, not vector OR (text AND field).
-        if (!incomingRetrieval && _nodeContainsRetrieval(_current!)) {
+        final bool currentHasRetrieval = _nodeContainsRetrieval(_current!);
+        // A structured predicate after a retrieval OR (without an explicit
+        // .or()/.orWhere()) filters every arm: (vector OR text) AND field = v.
+        // Likewise, a retrieval predicate after a structured-only OR without
+        // .or() becomes (a OR b) AND retrieval.
+        if (!explicitOr &&
+            ((!incomingRetrieval && currentHasRetrieval) ||
+                (incomingRetrieval && !currentHasRetrieval))) {
           _andBesideOr(_current!, condition);
           return this;
         }
-        if (incomingRetrieval) {
+        if (explicitOr || incomingRetrieval) {
           _current!.children.add(
             ConditionNode(type: NodeType.leaf, condition: condition),
           );
@@ -390,8 +399,36 @@ class QueryCondition {
   /// Start an OR condition
   QueryCondition or() {
     _ensureTreeInitialized();
+    _pendingOrConnector = true;
     // If the current node is already an OR node, keep using that node
     if (_current!.type == NodeType.or) {
+      return this;
+    }
+
+    // If the current node is an AND node with retrieval + structured siblings,
+    // pair only the immediately preceding child into an OR group so earlier
+    // AND siblings (e.g. retrieval in `matchSparse().whereBetween().orWhere()`,
+    // or global filter in `whereEqual().matchVector().orWhere()`) stay in AND.
+    if (_current!.type == NodeType.and &&
+        hasRetrievalMatch &&
+        _current!.children.length >= 2) {
+      final last = _current!.children.last;
+      if (last.type == NodeType.or) {
+        _current = last;
+        return this;
+      }
+      _current!.children.removeLast();
+      final orNode = ConditionNode(type: NodeType.or);
+      orNode.children.add(last);
+      _current!.children.add(orNode);
+      _current = orNode;
+      return this;
+    }
+
+    if (_current!.type == NodeType.and &&
+        _current!.children.length == 1 &&
+        _current!.children.first.type == NodeType.or) {
+      _current = _current!.children.first;
       return this;
     }
 
@@ -483,6 +520,10 @@ class QueryCondition {
   /// Add another condition as an AND condition
   QueryCondition condition(QueryCondition other) {
     if (other.isEmpty) return this;
+    final bool explicitOr = _pendingOrConnector;
+    _pendingOrConnector = false;
+    _conditionCount++;
+    _invalidateSingleEqCache();
     _retrievalFlags |= other._retrievalFlags;
     _ensureTreeInitialized();
     other._ensureTreeInitialized();
@@ -502,6 +543,37 @@ class QueryCondition {
 
     // If the current node is an OR node, special handling is needed
     if (_current!.type == NodeType.or) {
+      if (!explicitOr &&
+          hasRetrievalMatch &&
+          !other.hasRetrievalMatch &&
+          _nodeContainsRetrieval(_current!)) {
+        final parent = _findParent(_root!, _current!);
+        final wrapped = (otherRoot.children.length == 1 &&
+                otherRoot.children[0].type == NodeType.and)
+            ? otherRoot.children[0]
+            : otherRoot;
+        if (parent != null && parent.type == NodeType.and) {
+          parent.children.add(wrapped);
+          _current = parent;
+        } else {
+          final andNode = ConditionNode(type: NodeType.and);
+          andNode.children.add(_current!);
+          andNode.children.add(wrapped);
+          if (parent == null || _current == _root) {
+            _root = andNode;
+          } else {
+            final index = parent.children.indexOf(_current!);
+            if (index >= 0) {
+              parent.children[index] = andNode;
+            } else {
+              parent.children.add(andNode);
+            }
+          }
+          _current = andNode;
+        }
+        return this;
+      }
+
       // Create a new AND node
       final andNode = ConditionNode(type: NodeType.and);
 
@@ -602,6 +674,9 @@ class QueryCondition {
       _current = orNode;
     }
 
+    _pendingOrConnector = false;
+    _conditionCount++;
+    _invalidateSingleEqCache();
     return this;
   }
 
@@ -1428,7 +1503,7 @@ class QueryCondition {
     final vec = payload['vector'];
     if (vec is! VectorData) return null;
     return (
-      field: field,
+      field: field.contains('.') ? field.split('.').last : field,
       vector: vec,
       weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
       searchDepth: payload['searchDepth'] as int?,
@@ -1459,7 +1534,7 @@ class QueryCondition {
     final opName = payload['operator'] as String? ?? 'or';
     final op = opName == 'and' ? TextMatchOperator.and : TextMatchOperator.or;
     return (
-      field: field,
+      field: field.contains('.') ? field.split('.').last : field,
       query: q,
       operator: op,
       weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
@@ -1488,7 +1563,7 @@ class QueryCondition {
     final q = payload['query'];
     if (q is! SparseVectorData) return null;
     return (
-      field: field,
+      field: field.contains('.') ? field.split('.').last : field,
       query: q,
       weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
       minScore: (payload['minScore'] as num?)?.toDouble(),
@@ -1512,11 +1587,11 @@ class QueryCondition {
       if (minScore != null) 'minScore': minScore,
     };
 
+    final cleanField = field.contains('.') ? field.split('.').last : field;
     _retrievalFlags |= _retrievalMaskVector;
-    where(field, r'$vector', payload);
+    where(cleanField, r'$vector', payload);
     // where() invalidates caches; re-stash while this remains a single predicate.
     if (_conditionCount == 1) {
-      final cleanField = field.contains('.') ? field.split('.').last : field;
       _cachedPureVectorMatch = (
         field: cleanField,
         vector: queryVector,
@@ -1529,6 +1604,49 @@ class QueryCondition {
     return this;
   }
 
+  /// Switch to OR for a retrieval channel (`orMatchVector`/`Text`/`Sparse`).
+  ///
+  /// When structured filters precede a retrieval predicate inside the same
+  /// AND node (e.g. `whereEqual(...).matchVector(...).orMatchText(...)`), only
+  /// the retrieval branch moves into the OR group; structured filters remain
+  /// in the outer AND so they apply to every arm.
+  QueryCondition _orForRetrieval() {
+    _ensureTreeInitialized();
+    _pendingOrConnector = true;
+    if (_current!.type == NodeType.or) {
+      return this;
+    }
+    if (_current!.type == NodeType.and && _current!.children.length >= 2) {
+      final retrievalChildren = <ConditionNode>[];
+      final structuredChildren = <ConditionNode>[];
+      for (final child in _current!.children) {
+        if (_nodeContainsRetrieval(child)) {
+          retrievalChildren.add(child);
+        } else {
+          structuredChildren.add(child);
+        }
+      }
+      if (retrievalChildren.isNotEmpty && structuredChildren.isNotEmpty) {
+        _current!.children
+          ..clear()
+          ..addAll(structuredChildren);
+        if (retrievalChildren.length == 1 &&
+            retrievalChildren.first.type == NodeType.or) {
+          final existingOr = retrievalChildren.first;
+          _current!.children.add(existingOr);
+          _current = existingOr;
+          return this;
+        }
+        final orNode = ConditionNode(type: NodeType.or);
+        orNode.children.addAll(retrievalChildren);
+        _current!.children.add(orNode);
+        _current = orNode;
+        return this;
+      }
+    }
+    return or();
+  }
+
   /// OR branch with vector similarity search.
   QueryCondition orMatchVector(
     String field,
@@ -1538,7 +1656,7 @@ class QueryCondition {
     double? distanceThreshold,
     double? minScore,
   }) {
-    final result = or().matchVector(
+    final result = _orForRetrieval().matchVector(
       field,
       queryVector,
       weight: weight,
@@ -1576,10 +1694,10 @@ class QueryCondition {
       'weight': weight,
       if (minScore != null) 'minScore': minScore,
     };
+    final cleanField = field.contains('.') ? field.split('.').last : field;
     _retrievalFlags |= _retrievalMaskText;
-    where(field, r'$text', payload);
+    where(cleanField, r'$text', payload);
     if (_conditionCount == 1) {
-      final cleanField = field.contains('.') ? field.split('.').last : field;
       _cachedPureTextMatch = (
         field: cleanField,
         query: query,
@@ -1599,7 +1717,7 @@ class QueryCondition {
     double weight = 1.0,
     double? minScore,
   }) {
-    final result = or().matchText(
+    final result = _orForRetrieval().matchText(
       field,
       query,
       operator: operator,
@@ -1622,10 +1740,10 @@ class QueryCondition {
       'weight': weight,
       if (minScore != null) 'minScore': minScore,
     };
+    final cleanField = field.contains('.') ? field.split('.').last : field;
     _retrievalFlags |= _retrievalMaskSparse;
-    where(field, r'$sparse', payload);
+    where(cleanField, r'$sparse', payload);
     if (_conditionCount == 1) {
-      final cleanField = field.contains('.') ? field.split('.').last : field;
       _cachedPureSparseMatch = (
         field: cleanField,
         query: query,
@@ -1643,7 +1761,7 @@ class QueryCondition {
     double weight = 1.0,
     double? minScore,
   }) {
-    final result = or().matchSparse(
+    final result = _orForRetrieval().matchSparse(
       field,
       query,
       weight: weight,

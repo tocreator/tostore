@@ -192,14 +192,26 @@ class QueryOptimizer {
     );
   }
 
-  // ------------------------- AND-only optimizer (no OR) -------------------------
-
-  Future<QueryPlan> _optimizeAndOnly(
-    TableContext table,
+  /// Extract and flatten an AND-only condition map for [tableName].
+  ///
+  /// Returns `null` if the extracted condition contains `OR` (cannot be
+  /// represented as a flat conjunctive map); returns `{}` if no clause applies
+  /// to [tableName]. Shared between [QueryOptimizer] and [QueryExecutor]
+  /// plan-cache hits so cached index scans receive the exact same flattened
+  /// predicate shape as freshly planned queries.
+  static Map<String, dynamic>? extractFlatAndWhereForTable(
+    String tableName,
     Map<String, dynamic> where,
-    TableSchema schema,
-  ) async {
-    // Extract conjunctive (AND-only) field conditions for this table.
+  ) {
+    final tableTree =
+        _simplifyTreeStatic(_extractTableTreeStatic(tableName, where));
+    if (tableTree.isEmpty) return <String, dynamic>{};
+    if (_containsOrStatic(tableTree)) return null;
+    return _flattenAndTreeStatic(tableTree);
+  }
+
+  static Map<String, dynamic> _flattenAndTreeStatic(
+      Map<String, dynamic> where) {
     final tableWhere = <String, dynamic>{};
     void mergeFieldCond(String field, dynamic v) {
       if (!tableWhere.containsKey(field)) {
@@ -245,6 +257,18 @@ class QueryOptimizer {
     }
 
     visit(where);
+    return tableWhere;
+  }
+
+  // ------------------------- AND-only optimizer (no OR) -------------------------
+
+  Future<QueryPlan> _optimizeAndOnly(
+    TableContext table,
+    Map<String, dynamic> where,
+    TableSchema schema,
+  ) async {
+    // Extract conjunctive (AND-only) field conditions for this table.
+    final tableWhere = _flattenAndTreeStatic(where);
 
     if (tableWhere.isEmpty) {
       return _createTableScanPlan(table, primaryKey: schema.primaryKey);
@@ -420,21 +444,23 @@ class QueryOptimizer {
 
   // ------------------------- Boolean tree helpers -------------------------
 
-  bool _containsOr(Map<String, dynamic> node) {
+  bool _containsOr(Map<String, dynamic> node) => _containsOrStatic(node);
+
+  static bool _containsOrStatic(Map<String, dynamic> node) {
     if (node.containsKey('OR')) return true;
     final andVal = node['AND'];
     if (andVal is List) {
       for (final c in andVal) {
-        if (c is Map<String, dynamic> && _containsOr(c)) return true;
+        if (c is Map<String, dynamic> && _containsOrStatic(c)) return true;
       }
     }
     for (final e in node.entries) {
       final v = e.value;
       if (v is Map<String, dynamic>) {
-        if (_containsOr(v)) return true;
+        if (_containsOrStatic(v)) return true;
       } else if (v is List) {
         for (final it in v) {
-          if (it is Map<String, dynamic> && _containsOr(it)) return true;
+          if (it is Map<String, dynamic> && _containsOrStatic(it)) return true;
         }
       }
     }
@@ -442,8 +468,11 @@ class QueryOptimizer {
   }
 
   Map<String, dynamic> _extractTableConditionTree(
-      TableContext table, Map<String, dynamic> node) {
-    final tableName = table.tableName;
+          TableContext table, Map<String, dynamic> node) =>
+      _extractTableTreeStatic(table.tableName, node);
+
+  static Map<String, dynamic> _extractTableTreeStatic(
+      String tableName, Map<String, dynamic> node) {
     // Split node into logical children and leaf field predicates.
     final hasAnd = node.containsKey('AND') && node['AND'] is List;
     final hasOr = node.containsKey('OR') && node['OR'] is List;
@@ -473,7 +502,7 @@ class QueryOptimizer {
       final list = node['AND'] as List;
       for (final c in list) {
         if (c is Map<String, dynamic>) {
-          final sub = _extractTableConditionTree(table, c);
+          final sub = _extractTableTreeStatic(tableName, c);
           if (sub.isNotEmpty) outChildren.add(sub);
         }
       }
@@ -488,7 +517,7 @@ class QueryOptimizer {
       final list = node['OR'] as List;
       for (final c in list) {
         if (c is Map<String, dynamic>) {
-          final sub = _extractTableConditionTree(table, c);
+          final sub = _extractTableTreeStatic(tableName, c);
           if (sub.isNotEmpty) outChildren.add(sub);
         }
       }
@@ -515,13 +544,16 @@ class QueryOptimizer {
     return leaf;
   }
 
-  Map<String, dynamic> _simplifyLogicalTree(Map<String, dynamic> node) {
+  Map<String, dynamic> _simplifyLogicalTree(Map<String, dynamic> node) =>
+      _simplifyTreeStatic(node);
+
+  static Map<String, dynamic> _simplifyTreeStatic(Map<String, dynamic> node) {
     if (node.isEmpty) return node;
     if (node.containsKey('AND') && node['AND'] is List) {
       final list = <Map<String, dynamic>>[];
       for (final c in (node['AND'] as List)) {
         if (c is! Map<String, dynamic>) continue;
-        final sub = _simplifyLogicalTree(c);
+        final sub = _simplifyTreeStatic(c);
         if (sub.isEmpty) continue;
         if (sub.containsKey('AND') && sub['AND'] is List) {
           for (final g in (sub['AND'] as List)) {
@@ -539,7 +571,7 @@ class QueryOptimizer {
       final list = <Map<String, dynamic>>[];
       for (final c in (node['OR'] as List)) {
         if (c is! Map<String, dynamic>) continue;
-        final sub = _simplifyLogicalTree(c);
+        final sub = _simplifyTreeStatic(c);
         if (sub.isEmpty) continue;
         if (sub.containsKey('OR') && sub['OR'] is List) {
           for (final g in (sub['OR'] as List)) {

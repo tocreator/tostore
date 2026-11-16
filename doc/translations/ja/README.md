@@ -89,7 +89,7 @@ ToStore は、AGI 時代とエッジ インテリジェンス シナリオ向け
 
 ```yaml
 dependencies:
-  tostore: ^3.6.1
+  tostore: ^3.6.2
 ```
 
 ### For AI Coding Assistants

@@ -83,14 +83,16 @@ abstract final class ConditionShapeBuilder {
   static String buildShape(ConditionNode node) {
     if (node.type == NodeType.leaf) {
       if (node.condition.isEmpty) return '';
-      final entry = node.condition.entries.first;
-      final k = entry.key;
-      final v = entry.value;
-      if (v is Map) {
-        final op = v.keys.first.toString();
-        return '$k:$op';
+      if (node.condition.length == 1) {
+        return _formatFieldShape(
+            node.condition.keys.first, node.condition.values.first);
       }
-      return '$k:=';
+      final parts = <String>[];
+      for (final entry in node.condition.entries) {
+        parts.add(_formatFieldShape(entry.key, entry.value));
+      }
+      parts.sort();
+      return 'AND(${parts.join(',')})';
     }
     final childShapes = <String>[];
     for (final c in node.children) {
@@ -101,6 +103,16 @@ abstract final class ConditionShapeBuilder {
     childShapes.sort();
     final prefix = node.type == NodeType.or ? 'OR' : 'AND';
     return '$prefix(${childShapes.join(',')})';
+  }
+
+  static String _formatFieldShape(String field, dynamic value) {
+    if (value is Map) {
+      if (value.isEmpty) return '$field:=';
+      if (value.length == 1) return '$field:${value.keys.first}';
+      final ops = value.keys.map((k) => k.toString()).toList()..sort();
+      return '$field:${ops.join('&')}';
+    }
+    return '$field:=';
   }
 }
 

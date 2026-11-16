@@ -365,6 +365,18 @@ class TableMetaManager {
     }
   }
 
+  void _finalizeSavedTableMeta(TableMeta saved, {required bool isUpdate}) {
+    _cacheTableMeta(saved);
+    if (isUpdate) {
+      // Drop stale compiled plans (e.g. old PK naturalOrderBy / dropped indexes)
+      // and query result cache entries whenever a table's schema evolves.
+      _dataStore.queryExecutor.invalidatePlanCacheForTable(saved.tableUid);
+      _dataStore.queryExecutor.invalidateQueryCacheForUid(saved.tableUid);
+    }
+    _dataStore.upsertTtlPlanForSchema(saved.schema);
+    _dataStore.upsertCapacityPlanForSchema(saved.schema);
+  }
+
   void _cacheTableMeta(TableMeta meta) {
     _ensureTableMetaCache().put(meta.tableUid, meta);
     _tableFieldLayoutCache[meta.tableUid] = meta.fieldLayout;
@@ -536,6 +548,7 @@ class TableMetaManager {
       _pinnedMetaTableMeta = null;
     }
     _dataStore.queryExecutor.invalidatePlanCacheForTable(tableUid);
+    _dataStore.queryExecutor.invalidateQueryCacheForUid(tableUid);
   }
 
   /// Current schema cache size in bytes (incremental tracked).
@@ -1544,6 +1557,7 @@ class TableMetaManager {
     bool clearExtra = false,
     bool memoryOnly = false,
     Map<String, String> fieldRenameHints = const <String, String>{},
+    Map<String, String>? indexFieldRenameHints,
   }) async {
     if (tableUid.isEmpty) {
       throw DbException([
@@ -1585,6 +1599,7 @@ class TableMetaManager {
       ),
       memoryOnly: memoryOnly,
       fieldRenameHints: fieldRenameHints,
+      indexFieldRenameHints: indexFieldRenameHints,
       layoutOverride: layoutOverride,
     );
   }
@@ -1601,6 +1616,7 @@ class TableMetaManager {
     TableMeta meta, {
     bool memoryOnly = false,
     Map<String, String> fieldRenameHints = const <String, String>{},
+    Map<String, String>? indexFieldRenameHints,
     FieldStorageLayout? layoutOverride,
     int? dirIndex,
   }) async {
@@ -1633,7 +1649,7 @@ class TableMetaManager {
       final currentSchema = current?.schema;
       schema = schema.generateAutoIndexes(
         oldSchema: currentSchema,
-        fieldRenames: fieldRenameHints,
+        fieldRenames: indexFieldRenameHints ?? fieldRenameHints,
       );
 
       if (schema.schemaVersion == null || schema.schemaVersion!.isEmpty) {
@@ -1647,22 +1663,25 @@ class TableMetaManager {
         }
       }
 
-      final existingLayout = layoutOverride ??
-          current?.fieldLayout ??
-          _tableFieldLayoutCache[tableUid];
-      final resolvedLayout = layoutOverride ??
-          ((existingLayout != null &&
-                  _canReuseExistingFieldStorageLayout(
-                    existingLayout,
-                    schema,
-                    renameHints: fieldRenameHints,
-                  ))
-              ? existingLayout
-              : evolveFieldStorageLayout(
-                  existingLayout: existingLayout,
-                  nextSchema: schema,
+      late final FieldStorageLayout resolvedLayout;
+      if (layoutOverride != null) {
+        resolvedLayout = layoutOverride;
+      } else {
+        final existingLayout =
+            current?.fieldLayout ?? _tableFieldLayoutCache[tableUid];
+        resolvedLayout = (existingLayout != null &&
+                _canReuseExistingFieldStorageLayout(
+                  existingLayout,
+                  schema,
                   renameHints: fieldRenameHints,
-                ));
+                ))
+            ? existingLayout
+            : evolveFieldStorageLayout(
+                existingLayout: existingLayout,
+                nextSchema: schema,
+                renameHints: fieldRenameHints,
+              );
+      }
 
       // Dir index: keep existing, or allocate. Bootstrap table is fixed at 0.
       // allocateDirIndex / caller-supplied dirIndex already bump under-capacity
@@ -1699,10 +1718,8 @@ class TableMetaManager {
 
       if (memoryOnly) {
         _registerMetaInLookups(saved, skipDirCountIncrement: dirPreCounted);
-        _cacheTableMeta(saved);
+        _finalizeSavedTableMeta(saved, isUpdate: current != null);
         dirSlotCommitted = true;
-        _dataStore.upsertTtlPlanForSchema(saved.schema);
-        _dataStore.upsertCapacityPlanForSchema(saved.schema);
         return saved;
       }
 
@@ -1713,11 +1730,9 @@ class TableMetaManager {
       );
 
       _registerMetaInLookups(saved, skipDirCountIncrement: dirPreCounted);
-      _cacheTableMeta(saved);
+      _finalizeSavedTableMeta(saved, isUpdate: current != null);
       dirSlotCommitted = true;
 
-      _dataStore.upsertTtlPlanForSchema(saved.schema);
-      _dataStore.upsertCapacityPlanForSchema(saved.schema);
       return saved;
     } catch (e) {
       // Roll back dir slot reserved by allocateDirIndex / caller when create

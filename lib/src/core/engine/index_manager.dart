@@ -468,6 +468,89 @@ class IndexManager {
     ];
   }
 
+  /// Resolve B+Tree indexes for [schema] without allocating or re-filtering on
+  /// non-system tables (reuses cached [TableMetaManager.getBtreeIndexesFor]).
+  List<IndexSchema> resolveBtreeIndexesForWrite(
+    TableContext table,
+    TableSchema schema,
+  ) {
+    final cached = _dataStore.tableMetaManager?.getBtreeIndexesFor(schema) ??
+        schema.getAllIndexes().where(_isBtreeIndexType).toList(growable: false);
+    if (!SystemTable.isKeyValueTable(table.tableName)) {
+      return cached;
+    }
+    final managed = getEngineManagedBtreeIndexes(table, schema);
+    if (managed.isEmpty) return cached;
+    return <IndexSchema>[...cached, ...managed];
+  }
+
+  static bool _isBtreeIndexType(IndexSchema index) =>
+      index.type != IndexType.vector &&
+      index.type != IndexType.text &&
+      index.type != IndexType.sparse;
+
+  /// Partition memory-mode migration target indexes into B+Tree vs vector/WMBP
+  /// once per table/space migration rather than per-batch.
+  ({List<IndexSchema> btree, List<IndexSchema> nonBtree})
+      resolveMemoryMigrationIndexes(
+    TableContext table,
+    TableSchema schema, {
+    List<IndexUid>? specificIndexUids,
+  }) {
+    final metaMgr = _dataStore.tableMetaManager;
+    if (specificIndexUids != null && specificIndexUids.isNotEmpty) {
+      final btree = <IndexSchema>[];
+      final nonBtree = <IndexSchema>[];
+      final seen = <String>{};
+      final managed = SystemTable.isKeyValueTable(table.tableName)
+          ? getEngineManagedBtreeIndexes(table, schema)
+          : const <IndexSchema>[];
+
+      for (final uid in specificIndexUids) {
+        if (uid.isEmpty) continue;
+        IndexSchema? resolved = metaMgr?.findIndexSchemaByUid(schema, uid);
+        resolved ??= metaMgr?.findIndexSchemaByField(schema, uid.value);
+        if (resolved == null && managed.isNotEmpty) {
+          for (final m in managed) {
+            if (_indexUidFromSchema(m) == uid) {
+              resolved = m;
+              break;
+            }
+          }
+        }
+        if (resolved == null) continue;
+        final dedupKey = resolved.indexUid.isNotEmpty
+            ? resolved.indexUid.value
+            : resolved.actualIndexName;
+        if (!seen.add(dedupKey)) continue;
+        if (resolved.fields.length == 1 &&
+            resolved.fields.first == schema.primaryKey) {
+          continue;
+        }
+        if (_isBtreeIndexType(resolved)) {
+          btree.add(resolved);
+        } else {
+          nonBtree.add(resolved);
+        }
+      }
+      return (btree: btree, nonBtree: nonBtree);
+    }
+
+    final btree = resolveBtreeIndexesForWrite(table, schema);
+    if (metaMgr != null &&
+        !metaMgr.hasVectorIndexes(schema) &&
+        !metaMgr.hasWmbpIndexes(schema)) {
+      return (btree: btree, nonBtree: const <IndexSchema>[]);
+    }
+    final nonBtree = <IndexSchema>[
+      if (metaMgr != null) ...metaMgr.getVectorIndexesFor(schema),
+      if (metaMgr != null) ...metaMgr.getWmbpIndexesFor(schema),
+      if (metaMgr == null)
+        ...schema.getAllIndexes().where((idx) => !_isBtreeIndexType(idx)),
+    ];
+    return (btree: btree, nonBtree: nonBtree);
+  }
+
   String get _internalKvExpiryActualIndexName => const IndexSchema(
         indexName: SystemTable.keyValueExpiryIndexName,
         fields: <String>[SystemTable.keyValueExpiresAtField],
@@ -794,14 +877,10 @@ class IndexManager {
       }
 
       final schema = overrideSchema ?? table.schema;
-      final indexes = <IndexSchema>[
-        ...?_dataStore.tableMetaManager?.getAllIndexesFor(schema),
-        ...getEngineManagedBtreeIndexes(table, schema),
-      ];
+      final indexes = resolveBtreeIndexesForWrite(table, schema);
       if (indexes.isEmpty) return;
 
       for (final index in indexes) {
-        if (index.type == IndexType.vector) continue;
         final indexUid = _indexUidFromSchema(index);
 
         // Remove old
@@ -866,6 +945,54 @@ class IndexManager {
       }
     } catch (e) {
       Logger.warn('Failed to update index cache', rawError: e);
+    }
+  }
+
+  /// Populates memory-mode B+Tree index caches directly from migrated rows.
+  Future<void> applyInMemoryMigratedBtreeIndexes(
+    TableContext table,
+    TableSchema schema,
+    List<BufferEntry> migratedRecords, {
+    required List<IndexSchema> btreeIndexes,
+  }) async {
+    if (migratedRecords.isEmpty || btreeIndexes.isEmpty) return;
+
+    final pkName = schema.primaryKey;
+    final yieldController = YieldController(
+      'IndexManager.applyInMemoryMigratedBtreeIndexes',
+      checkInterval: 128,
+    );
+    for (final be in migratedRecords) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+      if (be.operation == BufferOperationType.delete) continue;
+      final data = be.data;
+      final pk = data[pkName]?.toString();
+      if (pk == null || pk.isEmpty) continue;
+
+      for (int i = 0; i < btreeIndexes.length; i++) {
+        final index = btreeIndexes[i];
+        final indexUid = _indexUidFromSchema(index);
+        final fields = <dynamic>[];
+        var ok = true;
+        for (final f in index.fields) {
+          final v = data[f];
+          if (v == null) {
+            ok = false;
+            break;
+          }
+          fields.add(v);
+        }
+        if (!ok) continue;
+
+        final compositeKey = <dynamic>[table.tableUid, indexUid, ...fields];
+        if (index.unique) {
+          _indexDataCache.put(compositeKey, pk);
+        } else {
+          final fullKey = <dynamic>[...compositeKey, pk];
+          _indexDataCache.put(fullKey, true, size: pk.length + 1);
+        }
+      }
     }
   }
 
@@ -2051,7 +2178,8 @@ class IndexManager {
     final resolvedUid = meta.indexUid.isNotEmpty ? meta.indexUid : indexUid;
 
     try {
-      if (persistToDisk) {
+      if (persistToDisk &&
+          _dataStore.config.persistenceMode != PersistenceMode.memory) {
         await _dataStore.treeMetaPageService.persistIndexGlobalMeta(
           table: table,
           indexUid: resolvedUid,
@@ -3161,6 +3289,7 @@ class IndexManager {
     required String legacyLogicalName,
   }) async {
     if (indexUid.isEmpty) return;
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) return;
 
     final lockMgr = _dataStore.lockManager;
     final lockOpId = GlobalIdGenerator.generate('reconcile_index_');
@@ -3293,6 +3422,11 @@ class IndexManager {
     }
 
     _invalidateIndexCache(table, resolved);
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      _dataStore.vectorIndexManager
+          ?.clearCacheForIndex(table.tableUid, resolved);
+      return;
+    }
 
     try {
       final indexSchema = _dataStore.tableMetaManager
@@ -3600,19 +3734,21 @@ class IndexManager {
         isUnique: indexSchema.unique,
       );
 
-      if (!isMemoryMode && meta.isBuilding) {
+      if (meta.isBuilding) {
         if (isIndexBuildOwned(table, indexUid)) {
           return IndexSearchResult.tableScan();
         }
-        // Heal sticky isBuilding left by crashed non-authority writers.
-        Logger.warn(
-          'Clearing orphan isBuilding for ${table.tableName}.'
-          '${_indexLogLabel(table, indexUid, schema: schema)} '
-          '(no schema/key migration owns this rebuild)',
-        );
-        await endIndexBuild(table, indexUid);
-        meta = (await getIndexMeta(table.tableUid, indexUid)) ??
-            meta.copyWith(isBuilding: false);
+        if (!isMemoryMode) {
+          // Heal sticky isBuilding left by crashed non-authority writers.
+          Logger.warn(
+            'Clearing orphan isBuilding for ${table.tableName}.'
+            '${_indexLogLabel(table, indexUid, schema: schema)} '
+            '(no schema/key migration owns this rebuild)',
+          );
+          await endIndexBuild(table, indexUid);
+          meta = (await getIndexMeta(table.tableUid, indexUid)) ??
+              meta.copyWith(isBuilding: false);
+        }
       }
       // In memory mode, the primary index store is [_indexDataCache], so B+Tree
       // pointers/entry counts may be unset or stale. We still allow searching.

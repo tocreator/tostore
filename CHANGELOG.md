@@ -4,6 +4,9 @@ All notable changes to this project will be documented in this file.
 
 ## 3.6.2
 
+### Added
+- Added `db.updateSchema(...).renamePrimaryKey(newName)` as a convenience method for primary key renaming.
+
 ### Changed
 - `db.rotateEncryptionKey` now takes `required String? newKey`. Pass `null` or `""` to switch back to the engine built-in encryption key. Whitespace is kept as entered and is not treated as empty.
 - Optimized full-text tokenization.

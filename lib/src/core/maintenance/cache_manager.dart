@@ -239,17 +239,25 @@ final class CacheManager {
     bool removeTableState = false,
   }) async {
     final tableName = table.tableName;
+    final bool preserveMemoryBackingStore =
+        _dataStore.config.persistenceMode == PersistenceMode.memory &&
+            !removeTableState;
     try {
-      if (invalidateRecords) {
+      if (invalidateRecords && !preserveMemoryBackingStore) {
         await _dataStore.tableDataManager.clearTableRecordsForTable(table);
-      } else if (invalidateRecordCount) {
-        // Record count cache may need refresh even when hot records are kept.
-        _dataStore.tableDataManager.removeRecordCountCache(table);
+      } else {
+        if (invalidateRecordCount && !preserveMemoryBackingStore) {
+          // Record count cache may need refresh even when hot records are kept.
+          _dataStore.tableDataManager.removeRecordCountCache(table);
+        }
+        if (invalidateRecords) {
+          _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
+        }
       }
-      if (invalidateTableDataMeta) {
+      if (!preserveMemoryBackingStore && invalidateTableDataMeta) {
         _dataStore.tableDataManager.invalidateTableDataMetaCacheForTable(table);
       }
-      if (invalidateTablePages) {
+      if (!preserveMemoryBackingStore && invalidateTablePages) {
         _dataStore.tableTreePartitionManager?.clearPageCacheForTable(table);
       }
       if (invalidateSchema) {
@@ -260,21 +268,21 @@ final class CacheManager {
         _markQueryCacheDirty(table);
       }
 
-      if (invalidateIndexData) {
+      if (invalidateIndexData && !preserveMemoryBackingStore) {
         await _dataStore.indexManager?.removeFullIndexCacheForTable(table);
       }
-      if (invalidateIndexMeta) {
+      if (invalidateIndexMeta && !preserveMemoryBackingStore) {
         await _dataStore.indexManager?.removeIndexMetaCacheForTable(table);
       }
-      if (invalidateIndexPages) {
+      if (!preserveMemoryBackingStore && invalidateIndexPages) {
         _dataStore.indexTreePartitionManager?.clearPageCacheForTable(table);
       }
 
-      if (invalidateVectorCache) {
+      if (invalidateVectorCache && !preserveMemoryBackingStore) {
         _dataStore.vectorIndexManager?.clearCacheForTable(table.tableUid);
       }
 
-      if (invalidateWmbpCache) {
+      if (invalidateWmbpCache && !preserveMemoryBackingStore) {
         _dataStore.wmbpIndexManager?.clearTable(table.tableUid);
       }
 
@@ -282,11 +290,13 @@ final class CacheManager {
         _dataStore.foreignKeyManager?.invalidateCache();
       }
 
-      if (invalidateCompactionHints) {
+      if (!preserveMemoryBackingStore && invalidateCompactionHints) {
         _dataStore.compactionManager.clearHintsForTable(table);
       }
 
-      _dataStore.weightManager?.clearWeightsForTable(table);
+      if (!preserveMemoryBackingStore) {
+        _dataStore.weightManager?.clearWeightsForTable(table);
+      }
 
       if (removeTableState) {
         await _dataStore.tableDataManager.removeTable(table);

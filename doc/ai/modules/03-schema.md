@@ -186,7 +186,8 @@ SchemaBuilder updateSchema(String tableName);
 | `modifyField(name, updater)` | Change field attributes |
 | `addIndex({…})` / `removeIndex({indexName, fields})` | Indexes |
 | `renameTable(newName)` | Rename table |
-| `setPrimaryKeyConfig(PrimaryKeyConfig)` | Change PK config |
+| `setPrimaryKeyConfig(PrimaryKeyConfig)` | Change PK config (pure rename requires no data migration) |
+| `renamePrimaryKey(newName)` | Rename PK field keeping existing key type |
 | `promoteFieldToPrimaryKey({sourceFieldName, targetPrimaryKeyName?})` | Promote unique non-null field to PK |
 | `setTtlConfig` / `disableTtl` | Table TTL |
 | `setCapacityConfig` / `disableCapacity` | Table capacity eviction (FIFO/LRU) |

@@ -45,6 +45,7 @@ abstract final class QueryClauseMask {
   static const int matchVector = 1 << 10;
   static const int matchText = 1 << 11;
   static const int matchSparse = 1 << 12;
+  static const int orClause = 1 << 13;
   static const int retrieval = matchVector | matchText | matchSparse;
 }
 
@@ -220,12 +221,16 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   SELF or() {
     _ensureConditionTree();
     _condition!.or();
+    _clauseFlags |= QueryClauseMask.orClause;
     _onChanged();
     return _self;
   }
 
   /// Add a predefined condition to this query with AND logic
   SELF condition(QueryCondition condition) {
+    if (!condition.isEmpty) {
+      _conditionCount++;
+    }
     _ensureConditionTree();
     _condition!.condition(condition);
     if (condition.hasRetrievalMatch) {
@@ -253,6 +258,10 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// orCondition condition - adds OR logic
   SELF orCondition(QueryCondition condition) {
+    if (!condition.isEmpty) {
+      _conditionCount++;
+    }
+    _clauseFlags |= QueryClauseMask.orClause;
     _ensureConditionTree();
     _condition!.orCondition(condition);
     if (condition.hasRetrievalMatch) {
@@ -280,6 +289,8 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// orWhere condition - adds OR logic
   SELF orWhere(String field, String operator, dynamic value) {
+    _conditionCount++;
+    _clauseFlags |= QueryClauseMask.orClause;
     _ensureConditionTree();
     _condition!.or().where(field, operator, value);
     _onChanged();
@@ -288,6 +299,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereNotIn condition
   SELF whereNotIn(String field, List values) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.where(field, 'NOT IN', values);
     _onChanged();
@@ -296,6 +308,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereLike condition
   SELF whereLike(String field, String pattern) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.where(field, 'LIKE', pattern);
     _onChanged();
@@ -304,6 +317,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereNotLike condition
   SELF whereNotLike(String field, String pattern) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.where(field, 'NOT LIKE', pattern);
     _onChanged();
@@ -317,6 +331,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereNotEqual condition
   SELF whereNotEqual(String field, dynamic value) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereNotEqual(field, value);
     _onChanged();
@@ -325,6 +340,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereGreaterThan condition
   SELF whereGreaterThan(String field, dynamic value) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereGreaterThan(field, value);
     _onChanged();
@@ -333,6 +349,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereGreaterThanOrEqualTo condition
   SELF whereGreaterThanOrEqualTo(String field, dynamic value) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereGreaterThanOrEqualTo(field, value);
     _onChanged();
@@ -341,6 +358,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereLessThan condition
   SELF whereLessThan(String field, dynamic value) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereLessThan(field, value);
     _onChanged();
@@ -349,6 +367,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereLessThanOrEqualTo condition
   SELF whereLessThanOrEqualTo(String field, dynamic value) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereLessThanOrEqualTo(field, value);
     _onChanged();
@@ -357,6 +376,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereContains condition
   SELF whereContains(String field, String value) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereContains(field, value);
     _onChanged();
@@ -365,6 +385,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereNotContains condition
   SELF whereNotContains(String field, String value) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereNotContains(field, value);
     _onChanged();
@@ -373,6 +394,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereStartsWith condition
   SELF whereStartsWith(String field, String prefix) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereStartsWith(field, prefix);
     _onChanged();
@@ -381,6 +403,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereEndsWith condition
   SELF whereEndsWith(String field, String suffix) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereEndsWith(field, suffix);
     _onChanged();
@@ -389,6 +412,10 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereContainsAny condition
   SELF whereContainsAny(String field, List values) {
+    if (values.isNotEmpty) {
+      _conditionCount++;
+      _clauseFlags |= QueryClauseMask.orClause;
+    }
     _ensureConditionTree();
     _condition!.whereContainsAny(field, values);
     _onChanged();
@@ -397,6 +424,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereEmpty condition - matches null or empty string
   SELF whereEmpty(String field) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereEmpty(field);
     _onChanged();
@@ -405,6 +433,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereNotEmpty condition - matches non-null and non-empty string
   SELF whereNotEmpty(String field) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereNotEmpty(field);
     _onChanged();
@@ -413,6 +442,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereTrue condition - matches true
   SELF whereTrue(String field) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereTrue(field);
     _onChanged();
@@ -421,6 +451,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// whereFalse condition - matches false
   SELF whereFalse(String field) {
+    _conditionCount++;
     _ensureConditionTree();
     _condition!.whereFalse(field);
     _onChanged();

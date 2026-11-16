@@ -89,7 +89,7 @@ ToStore — это современный движок данных, разра�
 
 ```yaml
 dependencies:
-  tostore: ^3.6.1
+  tostore: ^3.6.2
 ```
 
 ### For AI Coding Assistants

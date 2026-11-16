@@ -530,6 +530,107 @@ class TableDataManager {
     _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
   }
 
+  /// Update field/PK keys in cached records in-place when running in
+  /// `PersistenceMode.memory` so schema renames do not discard memory data.
+  Future<void> applyInMemoryRecordRenames(
+    TableContext table,
+    List<MapEntry<String, String>> orderedRenames,
+  ) async {
+    if (orderedRenames.isEmpty) return;
+    await _tableRecordCache.scanRange(
+      [table.tableUid],
+      null,
+      onEntry: (_, record) {
+        for (final rename in orderedRenames) {
+          final oldKey = rename.key;
+          final newKey = rename.value;
+          if (oldKey == newKey) continue;
+          if (record.containsKey(oldKey) && !record.containsKey(newKey)) {
+            record[newKey] = record[oldKey];
+            record.remove(oldKey);
+          }
+        }
+        return true;
+      },
+    );
+    _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
+  }
+
+  /// Applies pre-migrated batch records directly to in-memory stores for
+  /// `PersistenceMode.memory` (where ParallelJournalManager is disabled).
+  Future<void> applyInMemoryMigratedRecords(
+    TableContext table,
+    List<BufferEntry> migratedRecords, {
+    String? sourcePkName,
+    String? targetPkName,
+  }) async {
+    if (migratedRecords.isEmpty) return;
+    final trees = _dataStore.writeBufferManager.bufferTrees;
+    final hasPending = trees.hasPendingWritesForUid(table.tableUid);
+    final yieldController = YieldController(
+      'TableDataManager.applyInMemoryMigratedRecords',
+      checkInterval: 128,
+    );
+    final resolvedTargetPk = targetPkName ?? table.schema.primaryKey;
+
+    for (final be in migratedRecords) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+      final pk = (be.data[resolvedTargetPk] ??
+              (sourcePkName != null ? be.data[sourcePkName] : null) ??
+              be.data[table.schema.primaryKey])
+          ?.toString();
+      if (pk == null || pk.isEmpty) continue;
+
+      if (be.operation == BufferOperationType.delete) {
+        _tableRecordCache.removePoint2(table.tableUid, pk);
+        continue;
+      }
+
+      _tableRecordCache.putPoint2(table.tableUid, pk, be.data);
+      if (hasPending) {
+        final pending = trees.getPendingRecord(table.tableUid, pk);
+        if (pending != null &&
+            pending.operation != BufferOperationType.delete) {
+          trees.pendingRecordCache.putPoint2(
+            table.tableUid,
+            pk,
+            pending.copyWith(
+              data: be.data,
+              schemaVersion: be.schemaVersion,
+            ),
+          );
+        }
+      }
+    }
+    _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
+  }
+
+  bool _hasRuntimeMigration(TableContext table) {
+    final mgr = _dataStore.migrationManager;
+    return mgr != null &&
+        mgr.hasActiveRuntimeMigrations &&
+        mgr.hasRuntimeMigrationForTable(table);
+  }
+
+  /// Normalize [data] synchronously (callers must gate on [_hasRuntimeMigration]).
+  Map<String, dynamic> _normalizeMigratingRecordSync(
+    TableContext table,
+    Map<String, dynamic> data, {
+    String fromVersion = '',
+    WalPointer? walPointer,
+  }) {
+    final effectiveWp = (walPointer != null && walPointer.partitionIndex >= 0)
+        ? walPointer
+        : null;
+    return _dataStore.migrationManager!.normalizeRecordToLatestSync(
+      table,
+      data,
+      fromVersion: fromVersion,
+      walPointer: effectiveWp,
+    );
+  }
+
   /// Remove record count cache for a table.
   void removeRecordCountCache(TableContext table) {
     _tableRecordCounts.remove(table.tableUid);
@@ -3158,6 +3259,12 @@ class TableDataManager {
     await _dataStore.storage.ensureDirectoryExists(path);
   }
 
+  /// Invalidate cached ID generator when primary key type or sequence config changes.
+  void invalidateIdGeneratorForTable(TableUid tableUid) {
+    _idGenerators.remove(tableUid);
+    _idGeneratorPending.remove(tableUid);
+  }
+
   /// Get id generator, create if not exists. Single instance per table under concurrency.
   Future<IdGenerator> _getIdGenerator(TableContext table) async {
     final cached = _idGenerators[table.tableUid];
@@ -3574,13 +3681,17 @@ class TableDataManager {
 
     // Get current transaction ID for transaction overlay
     final String? currentTxId = TransactionContext.getCurrentTransactionId();
+    final bool hasRuntimeMigration = _hasRuntimeMigration(table);
 
     // Register read view for consistent snapshot
     final viewId = _dataStore.readViewManager.registerReadView();
     try {
       // Helper: apply buffer/transaction overlay for a base record and return final visible record (or null).
       Map<String, dynamic>? applyOverlay(Map<String, dynamic> record) {
-        final pk = record[primaryKey]?.toString();
+        final normalizedBase = hasRuntimeMigration
+            ? _normalizeMigratingRecordSync(table, record)
+            : record;
+        final pk = normalizedBase[primaryKey]?.toString();
         if (pk == null || pk.isEmpty) return null;
 
         processedKeys.add(pk);
@@ -3595,7 +3706,14 @@ class TableDataManager {
             }
             // BufferEntry.oldValues is separate; data is shared by ref.
             // Legacy guard if _oldValues was embedded in data.
-            return _visibleTxnRecord(txOp.data);
+            return _visibleTxnRecord(hasRuntimeMigration
+                ? _normalizeMigratingRecordSync(
+                    table,
+                    txOp.data,
+                    fromVersion: txOp.schemaVersion,
+                    walPointer: txOp.walPointer,
+                  )
+                : txOp.data);
           }
         }
 
@@ -3612,7 +3730,7 @@ class TableDataManager {
           return bufferEntry.data;
         }
 
-        return record;
+        return normalizedBase;
       }
 
       // Skip file stream when disk is empty; pending/txn inserts still emit below.
@@ -3702,7 +3820,14 @@ class TableDataManager {
               return true;
             }
           }
-          pendingExtra.add(entry.data);
+          pendingExtra.add(hasRuntimeMigration
+              ? _normalizeMigratingRecordSync(
+                  table,
+                  entry.data,
+                  fromVersion: entry.schemaVersion,
+                  walPointer: entry.walPointer,
+                )
+              : entry.data);
           return true;
         },
       );
@@ -3722,7 +3847,14 @@ class TableDataManager {
             if (entry.operation == BufferOperationType.delete) {
               return true;
             }
-            txnExtra.add(_visibleTxnRecord(entry.data));
+            txnExtra.add(_visibleTxnRecord(hasRuntimeMigration
+                ? _normalizeMigratingRecordSync(
+                    table,
+                    entry.data,
+                    fromVersion: entry.schemaVersion,
+                    walPointer: entry.walPointer,
+                  )
+                : entry.data));
             return true;
           },
         );
@@ -4244,6 +4376,7 @@ class TableDataManager {
     final applyingCommit = TransactionContext.isApplyingCommit();
     final useTxn =
         txId != null && !applyingCommit && _txnIdsWithOps.contains(txId);
+    final hasRuntimeMigration = _hasRuntimeMigration(table);
 
     bool acceptPredicates(Map<String, dynamic> row) {
       if (matcher != null && !matcher(row)) return false;
@@ -4266,7 +4399,14 @@ class TableDataManager {
           if (tx.operation == BufferOperationType.delete) {
             continue;
           }
-          visible = _visibleTxnRecord(tx.data);
+          visible = _visibleTxnRecord(hasRuntimeMigration
+              ? _normalizeMigratingRecordSync(
+                  table,
+                  tx.data,
+                  fromVersion: tx.schemaVersion,
+                  walPointer: tx.walPointer,
+                )
+              : tx.data);
         }
       }
       if (visible == null) {
@@ -4275,7 +4415,14 @@ class TableDataManager {
           if (pending.operation == BufferOperationType.delete) {
             continue;
           }
-          visible = pending.data;
+          visible = hasRuntimeMigration
+              ? _normalizeMigratingRecordSync(
+                  table,
+                  pending.data,
+                  fromVersion: pending.schemaVersion,
+                  walPointer: pending.walPointer,
+                )
+              : pending.data;
         } else {
           visible = row;
         }
@@ -4319,18 +4466,28 @@ class TableDataManager {
         reverse: reverse,
         limit: scanCap,
         onEntry: (pk, entry) {
+          final isDelete = entry.operation == BufferOperationType.delete;
+          final Map<String, dynamic> normalized =
+              (!isDelete && hasRuntimeMigration)
+                  ? _normalizeMigratingRecordSync(
+                      table,
+                      entry.data,
+                      fromVersion: entry.schemaVersion,
+                      walPointer: entry.walPointer,
+                    )
+                  : entry.data;
           if (skipCursorKey) {
-            final c = pkMatcher(entry.data[pkName] ?? pk, afterPrimaryKey);
+            final c = pkMatcher(normalized[pkName] ?? pk, afterPrimaryKey);
             if (c == 0) {
               skipCursorKey = false;
               return true;
             }
             skipCursorKey = false;
           }
-          if (entry.operation == BufferOperationType.delete) {
+          if (isDelete) {
             return true;
           }
-          final row = _visibleTxnRecord(entry.data);
+          final row = _visibleTxnRecord(normalized);
           if (!acceptPredicates(row)) return true;
           out.add(row);
           return out.length < limit;
@@ -4473,6 +4630,7 @@ class TableDataManager {
     final applyingCommit = TransactionContext.isApplyingCommit();
     final useTxn =
         txId != null && !applyingCommit && _txnIdsWithOps.contains(txId);
+    final hasRuntimeMigration = _hasRuntimeMigration(table);
     final pkMatcher =
         ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
@@ -4488,7 +4646,14 @@ class TableDataManager {
           if (tx.operation == BufferOperationType.delete) {
             continue;
           }
-          visible = _visibleTxnRecord(tx.data);
+          visible = _visibleTxnRecord(hasRuntimeMigration
+              ? _normalizeMigratingRecordSync(
+                  table,
+                  tx.data,
+                  fromVersion: tx.schemaVersion,
+                  walPointer: tx.walPointer,
+                )
+              : tx.data);
         }
       }
       if (visible == null) {
@@ -4497,7 +4662,14 @@ class TableDataManager {
           if (pending.operation == BufferOperationType.delete) {
             continue;
           }
-          visible = pending.data;
+          visible = hasRuntimeMigration
+              ? _normalizeMigratingRecordSync(
+                  table,
+                  pending.data,
+                  fromVersion: pending.schemaVersion,
+                  walPointer: pending.walPointer,
+                )
+              : pending.data;
         } else {
           visible = row;
         }
@@ -4743,16 +4915,31 @@ class TableDataManager {
       if (entry.operation == BufferOperationType.delete) {
         return (found: true, record: null);
       }
+      if (!fromTxn) {
+        return (found: true, record: entry.data);
+      }
       return (
         found: true,
-        record: fromTxn ? _visibleTxnRecord(entry.data) : entry.data,
+        record: _visibleTxnRecord(_hasRuntimeMigration(table)
+            ? _normalizeMigratingRecordSync(
+                table,
+                entry.data,
+                fromVersion: entry.schemaVersion,
+                walPointer: entry.walPointer,
+              )
+            : entry.data),
       );
     }
 
     // 1. Hotspot / Row Cache Check
     final cached = _tableRecordCache.getPoint2(table.tableUid, pk);
     if (cached != null) {
-      return (found: true, record: cached);
+      return (
+        found: true,
+        record: _hasRuntimeMigration(table)
+            ? _normalizeMigratingRecordSync(table, cached)
+            : cached,
+      );
     }
 
     return (found: false, record: null);
@@ -4907,6 +5094,8 @@ class TableDataManager {
         !TransactionContext.isApplyingCommit() &&
         _txnIdsWithOps.contains(txId);
     final tableUid = table.tableUid;
+    final hasRuntimeMigration =
+        decodeSchema == null && _hasRuntimeMigration(table);
 
     for (int i = 0; i < keys.length; i++) {
       final pk = keys[i];
@@ -4923,14 +5112,25 @@ class TableDataManager {
           _dataStore.writeBufferManager.getBufferedRecordForRead(table, pk);
       if (entry != null) {
         if (entry.operation != BufferOperationType.delete) {
-          resultsMap[pk] = fromTxn ? _visibleTxnRecord(entry.data) : entry.data;
+          resultsMap[pk] = fromTxn
+              ? _visibleTxnRecord(hasRuntimeMigration
+                  ? _normalizeMigratingRecordSync(
+                      table,
+                      entry.data,
+                      fromVersion: entry.schemaVersion,
+                      walPointer: entry.walPointer,
+                    )
+                  : entry.data)
+              : entry.data;
         }
         continue;
       }
 
       final cached = _tableRecordCache.getPoint2(tableUid, pk);
       if (cached != null) {
-        resultsMap[pk] = cached;
+        resultsMap[pk] = hasRuntimeMigration
+            ? _normalizeMigratingRecordSync(table, cached)
+            : cached;
         continue;
       }
 
@@ -4979,6 +5179,8 @@ class TableDataManager {
         !TransactionContext.isApplyingCommit() &&
         _txnIdsWithOps.contains(txId);
     final tableUid = table.tableUid;
+    final hasRuntimeMigration =
+        decodeSchema == null && _hasRuntimeMigration(table);
 
     for (int i = 0; i < keys.length; i++) {
       final pk = keys[i];
@@ -5000,12 +5202,23 @@ class TableDataManager {
           _dataStore.writeBufferManager.getBufferedRecordForRead(table, pk);
       if (entry != null) {
         if (entry.operation != BufferOperationType.delete) {
-          resultsMap[pk] = fromTxn ? _visibleTxnRecord(entry.data) : entry.data;
+          resultsMap[pk] = fromTxn
+              ? _visibleTxnRecord(hasRuntimeMigration
+                  ? _normalizeMigratingRecordSync(
+                      table,
+                      entry.data,
+                      fromVersion: entry.schemaVersion,
+                      walPointer: entry.walPointer,
+                    )
+                  : entry.data)
+              : entry.data;
         }
       } else {
         final cached = _tableRecordCache.getPoint2(tableUid, pk);
         if (cached != null) {
-          resultsMap[pk] = cached;
+          resultsMap[pk] = hasRuntimeMigration
+              ? _normalizeMigratingRecordSync(table, cached)
+              : cached;
         } else if (!readFromFileOnly) {
           // Tier: B+Tree leaf page cache (sync, zero I/O when table prewarmed).
           final pageHit = _dataStore.tableTreePartitionManager
@@ -5217,6 +5430,8 @@ class TableDataManager {
     final hasPending = !readFromFileOnly &&
         _dataStore.writeBufferManager.hasPendingWritesForUid(table.tableUid);
     final needBufferFuse = hasPending || useTxn;
+    final hasRuntimeMigration =
+        decodeSchema == null && _hasRuntimeMigration(table);
 
     bool deliver(Map<String, dynamic> row) {
       if (acceptRow != null && !acceptRow(row)) return true;
@@ -5273,7 +5488,14 @@ class TableDataManager {
           if (tx.operation == BufferOperationType.delete) {
             return null;
           }
-          return _visibleTxnRecord(tx.data);
+          return _visibleTxnRecord(hasRuntimeMigration
+              ? _normalizeMigratingRecordSync(
+                  table,
+                  tx.data,
+                  fromVersion: tx.schemaVersion,
+                  walPointer: tx.walPointer,
+                )
+              : tx.data);
         }
       }
       if (hasPending) {
@@ -5282,7 +5504,14 @@ class TableDataManager {
           if (pending.operation == BufferOperationType.delete) {
             return null;
           }
-          return pending.data;
+          return hasRuntimeMigration
+              ? _normalizeMigratingRecordSync(
+                  table,
+                  pending.data,
+                  fromVersion: pending.schemaVersion,
+                  walPointer: pending.walPointer,
+                )
+              : pending.data;
         }
       }
       return row;
@@ -5331,8 +5560,11 @@ class TableDataManager {
         reverse: reverse,
         limit: null,
         onEntry: (path, value) {
-          final rec = value;
-          final dynamic pkNative = rec[primaryKey];
+          final rec = hasRuntimeMigration
+              ? _normalizeMigratingRecordSync(table, value)
+              : value;
+          final dynamic pkNative = rec[primaryKey] ??
+              (decodeSchema != null ? rec[table.schema.primaryKey] : null);
           if (pkNative == null) return true;
           if (!checkRange(pkNative)) return true;
           if (!onBase(rec)) return false;
@@ -5406,18 +5638,28 @@ class TableDataManager {
         reverse: reverse,
         limit: null,
         onEntry: (pk, entry) {
+          final isDelete = entry.operation == BufferOperationType.delete;
+          final Map<String, dynamic> normalized =
+              (!isDelete && hasRuntimeMigration)
+                  ? _normalizeMigratingRecordSync(
+                      table,
+                      entry.data,
+                      fromVersion: entry.schemaVersion,
+                      walPointer: entry.walPointer,
+                    )
+                  : entry.data;
           if (skipCursorKey) {
-            final c = pkMatcher(entry.data[primaryKey] ?? pk, cursor);
+            final c = pkMatcher(normalized[primaryKey] ?? pk, cursor);
             if (c == 0) {
               skipCursorKey = false;
               return true;
             }
             skipCursorKey = false;
           }
-          if (entry.operation == BufferOperationType.delete) {
+          if (isDelete) {
             return true;
           }
-          final row = _visibleTxnRecord(entry.data);
+          final row = _visibleTxnRecord(normalized);
           final pkNative = row[primaryKey];
           if (pkNative == null) return true;
           if (!checkRange(pkNative)) {

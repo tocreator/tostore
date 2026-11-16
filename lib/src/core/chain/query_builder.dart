@@ -558,7 +558,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       distanceThreshold: distanceThreshold,
       minScore: minScore,
     );
-    _clauseFlags |= QueryClauseMask.matchVector;
+    _clauseFlags |= QueryClauseMask.matchVector | QueryClauseMask.orClause;
     _onChanged();
     return this;
   }
@@ -630,7 +630,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       weight: weight,
       minScore: minScore,
     );
-    _clauseFlags |= QueryClauseMask.matchText;
+    _clauseFlags |= QueryClauseMask.matchText | QueryClauseMask.orClause;
     _onChanged();
     return this;
   }
@@ -678,7 +678,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       weight: weight,
       minScore: minScore,
     );
-    _clauseFlags |= QueryClauseMask.matchSparse;
+    _clauseFlags |= QueryClauseMask.matchSparse | QueryClauseMask.orClause;
     _onChanged();
     return this;
   }

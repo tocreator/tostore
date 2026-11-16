@@ -1642,14 +1642,13 @@ class TableSchema {
       return MatcherType.datetime;
     }
 
-    try {
-      final field = fields.firstWhere((f) => f.name == fieldName);
-      return field.getMatcherType();
-    } catch (e) {
-      Logger.warn('Field $fieldName not found, using unsupported matcher',
-          rawError: e);
-      return MatcherType.unsupported;
+    for (final f in fields) {
+      if (f.name == fieldName) {
+        return f.getMatcherType();
+      }
     }
+    Logger.warn('Field $fieldName not found, using unsupported matcher');
+    return MatcherType.unsupported;
   }
 
   /// Encode primary key as a MemComparable component.

@@ -1295,6 +1295,43 @@ class ParallelJournalManager {
                 if (schema == null) return;
                 final pkName = schema.primaryKey;
                 final migrationManager = _dataStore.migrationManager;
+                final hasRuntimeMigration = migrationManager != null &&
+                    migrationManager.hasRuntimeMigrationForTable(tableContext);
+                final normalizedDataCache = hasRuntimeMigration
+                    ? <BufferEntry, Map<String, dynamic>>{}
+                    : null;
+
+                Map<String, dynamic> normalizeEntryData(BufferEntry be) {
+                  if (!hasRuntimeMigration) return be.data;
+                  final cached = normalizedDataCache![be];
+                  if (cached != null) return cached;
+                  final wp = be.walPointer;
+                  final effectiveWp =
+                      (wp != null && wp.partitionIndex >= 0) ? wp : null;
+                  final normalized =
+                      migrationManager.normalizeRecordToLatestSync(
+                    tableContext,
+                    be.data,
+                    fromVersion: be.schemaVersion,
+                    walPointer: effectiveWp,
+                  );
+                  normalizedDataCache[be] = normalized;
+                  return normalized;
+                }
+
+                Map<String, dynamic>? normalizeEntryOldValues(BufferEntry be) {
+                  final rawOld = be.oldValues;
+                  if (rawOld == null || !hasRuntimeMigration) return rawOld;
+                  final wp = be.walPointer;
+                  final effectiveWp =
+                      (wp != null && wp.partitionIndex >= 0) ? wp : null;
+                  return migrationManager.normalizeRecordToLatestSync(
+                    tableContext,
+                    rawOld,
+                    fromVersion: be.schemaVersion,
+                    walPointer: effectiveWp,
+                  );
+                }
 
                 // Extract and separate valid background write data
                 final activeBgEntries = <BackgroundWriteEntry>[];
@@ -1338,18 +1375,7 @@ class ParallelJournalManager {
                 await EngineCpuChunk.forEachIterable(
                   unifiedPkMap.values,
                   (be) {
-                    var currentData = be.data;
-                    if (migrationManager != null &&
-                        be.schemaVersion.isNotEmpty &&
-                        migrationManager
-                            .hasRuntimeMigrationForTable(tableContext)) {
-                      currentData =
-                          migrationManager.normalizeRecordToLatestSync(
-                        tableContext,
-                        be.data,
-                        fromVersion: be.schemaVersion,
-                      );
-                    }
+                    final currentData = normalizeEntryData(be);
 
                     if (be.operation == BufferOperationType.insert ||
                         be.operation == BufferOperationType.rewrite) {
@@ -1357,7 +1383,8 @@ class ParallelJournalManager {
                     } else if (be.operation == BufferOperationType.update) {
                       updateRecords.add(currentData);
                       if (be.oldValues == null) {
-                        final pk = be.data[pkName]?.toString();
+                        final pk = (currentData[pkName] ?? be.data[pkName])
+                            ?.toString();
                         if (pk != null && pk.isNotEmpty) {
                           missingOld.add(pk);
                         }
@@ -1383,17 +1410,13 @@ class ParallelJournalManager {
                         final pk = r[pkName]?.toString();
                         if (pk == null || pk.isEmpty) return;
 
-                        var normalizedRecord = r;
-                        if (migrationManager != null &&
-                            migrationManager
-                                .hasRuntimeMigrationForTable(tableContext)) {
-                          normalizedRecord =
-                              migrationManager.normalizeRecordToLatestSync(
-                            tableContext,
-                            r,
-                            fromVersion: '',
-                          );
-                        }
+                        final normalizedRecord = hasRuntimeMigration
+                            ? migrationManager.normalizeRecordToLatestSync(
+                                tableContext,
+                                r,
+                                fromVersion: '',
+                              )
+                            : r;
                         oldByPk[pk] = normalizedRecord;
                       },
                       kind: CpuChunkKind.medium,
@@ -1411,29 +1434,30 @@ class ParallelJournalManager {
                 await EngineCpuChunk.forEachIndexed(
                   inserts,
                   (_, be) {
-                    idxInserts.add(be.data);
+                    idxInserts.add(normalizeEntryData(be));
                   },
                   kind: CpuChunkKind.light,
                 );
                 await EngineCpuChunk.forEachIndexed(
                   deletes,
                   (_, be) {
-                    idxDeletes.add(be.data);
+                    idxDeletes.add(normalizeEntryData(be));
                   },
                   kind: CpuChunkKind.light,
                 );
                 await EngineCpuChunk.forEachIndexed(
                   updates,
                   (_, be) {
-                    final pk = be.data[pkName]?.toString();
+                    final newVals = normalizeEntryData(be);
+                    final pk = newVals[pkName]?.toString();
                     if (pk == null || pk.isEmpty) return;
-                    final oldVals = be.oldValues ?? oldByPk[pk];
+                    final oldVals = normalizeEntryOldValues(be) ?? oldByPk[pk];
                     if (oldVals == null) {
-                      idxInserts.add(be.data);
+                      idxInserts.add(newVals);
                     } else {
                       idxUpdates.add(IndexRecordUpdate(
                         primaryKey: pk,
-                        newValues: be.data,
+                        newValues: newVals,
                         oldValues: oldVals,
                       ));
                     }
@@ -1449,23 +1473,26 @@ class ParallelJournalManager {
                     final specIdxs = bgEntry.specificIndexUids;
                     if (specIdxs == null || specIdxs.isEmpty) {
                       final be = bgEntry.entry;
+                      final newVals = normalizeEntryData(be);
                       if (be.operation == BufferOperationType.insert ||
                           be.operation == BufferOperationType.rewrite) {
-                        idxInserts.add(be.data);
+                        idxInserts.add(newVals);
                       } else if (be.operation == BufferOperationType.update) {
-                        final pk = bgEntry.primaryKey;
-                        final oldVals = be.oldValues ?? oldByPk[pk];
+                        final pk =
+                            (newVals[pkName]?.toString() ?? bgEntry.primaryKey);
+                        final oldVals =
+                            normalizeEntryOldValues(be) ?? oldByPk[pk];
                         if (oldVals == null) {
-                          idxInserts.add(be.data);
+                          idxInserts.add(newVals);
                         } else {
                           idxUpdates.add(IndexRecordUpdate(
                             primaryKey: pk,
-                            newValues: be.data,
+                            newValues: newVals,
                             oldValues: oldVals,
                           ));
                         }
                       } else if (be.operation == BufferOperationType.delete) {
-                        idxDeletes.add(be.data);
+                        idxDeletes.add(newVals);
                       }
                     } else {
                       final key = specIdxs.join(',');
@@ -1519,23 +1546,26 @@ class ParallelJournalManager {
 
                     for (final entry in entries) {
                       final be = entry.entry;
-                      final pk = entry.primaryKey;
+                      final newVals = normalizeEntryData(be);
+                      final pk =
+                          newVals[pkName]?.toString() ?? entry.primaryKey;
                       if (be.operation == BufferOperationType.insert ||
                           be.operation == BufferOperationType.rewrite) {
-                        specIns.add(be.data);
+                        specIns.add(newVals);
                       } else if (be.operation == BufferOperationType.update) {
-                        final oldVals = be.oldValues ?? oldByPk[pk];
+                        final oldVals =
+                            normalizeEntryOldValues(be) ?? oldByPk[pk];
                         if (oldVals == null) {
-                          specIns.add(be.data);
+                          specIns.add(newVals);
                         } else {
                           specUps.add(IndexRecordUpdate(
                             primaryKey: pk,
-                            newValues: be.data,
+                            newValues: newVals,
                             oldValues: oldVals,
                           ));
                         }
                       } else if (be.operation == BufferOperationType.delete) {
-                        specDels.add(be.data);
+                        specDels.add(newVals);
                       }
                     }
 
@@ -1927,13 +1957,39 @@ class ParallelJournalManager {
               }
             }
             final op = BufferOperationType.values[opIdx];
-            final schema = await _resolveTableSchema(resolvedTable);
+            final tableContext = await _resolveTableContext(resolvedTable);
+            final schema = tableContext?.schema ??
+                await _resolveTableSchema(resolvedTable);
             if (schema == null) {
               Logger.warn(
                 'WAL recovery: skipping entry for unresolved table field '
                 '"$table"${resolvedTable.value != table ? ' (resolved: "${resolvedTable.value}")' : ''}',
               );
               continue;
+            }
+            final walSchemaVersion = entry['schemaVersion'] as String? ?? '';
+            var oldValues =
+                (entry['oldValues'] as Map?)?.cast<String, dynamic>();
+            var effectiveSchemaVersion = walSchemaVersion;
+            final migrationManager = _dataStore.migrationManager;
+            if (migrationManager != null && tableContext != null) {
+              final normalized =
+                  migrationManager.normalizeRecoveredWalRecordIfNeeded(
+                tableContext,
+                data,
+                oldValues: oldValues,
+                walPointer: ptr,
+                schemaVersion: walSchemaVersion,
+              );
+              if (!identical(normalized.data, data) ||
+                  !identical(normalized.oldValues, oldValues) ||
+                  migrationManager.shouldNormalizeBufferedWrite(
+                      tableContext, ptr)) {
+                effectiveSchemaVersion =
+                    schema.schemaVersion ?? walSchemaVersion;
+              }
+              data = normalized.data;
+              oldValues = normalized.oldValues;
             }
             final recordId = data[schema.primaryKey]?.toString();
             if (recordId == null) continue;
@@ -1969,16 +2025,14 @@ class ParallelJournalManager {
               operation: op,
               timestamp: recoveryNow,
               transactionId: entry['txId'] as String?,
-              oldValues: (entry['oldValues'] as Map?)?.cast<String, dynamic>(),
-              schemaVersion: entry['schemaVersion'] as String? ?? '',
+              oldValues: oldValues,
+              schemaVersion: effectiveSchemaVersion,
             );
-            final walPtr = WalPointer(partitionIndex: p, entrySeq: seq);
-            final tableContext = await _resolveTableContext(resolvedTable);
             if (tableContext == null) continue;
             await _bufferManager.addRecord(
               table: tableContext,
               recordId: recordId,
-              entry: be.copyWith(walPointer: walPtr),
+              entry: be.copyWith(walPointer: ptr),
             );
 
             // Meta records land in the write buffer only; hydrate memory inventory
@@ -2444,24 +2498,39 @@ class ParallelJournalManager {
         }
         final schema = tableContext.schema;
         final pkName = schema.primaryKey;
-        final pkValue = op.data[pkName]?.toString();
+        var opData = op.data;
+        var opOldValues = op.oldValues;
+        final migrationManager = _dataStore.migrationManager;
+        if (migrationManager != null) {
+          final normalized =
+              migrationManager.normalizeRecoveredWalRecordIfNeeded(
+            tableContext,
+            opData,
+            oldValues: opOldValues,
+            walPointer: op.walPointer,
+            schemaVersion: op.schemaVersion,
+          );
+          opData = normalized.data;
+          opOldValues = normalized.oldValues;
+        }
+        final pkValue = opData[pkName]?.toString();
         if (pkValue == null) continue;
 
         final be = BufferEntry(
-          data: op.data,
+          data: opData,
           operation: op.op,
           timestamp: recoveryNow,
-          oldValues: op.oldValues,
+          oldValues: opOldValues,
           walPointer: op.walPointer,
           schemaVersion: schema.schemaVersion ?? '',
         );
 
         await _dataStore.tableDataManager.recoverRecordToBuffer(
           tableContext,
-          op.data,
+          opData,
           op.op,
           entry: be,
-          oldValues: op.oldValues,
+          oldValues: opOldValues,
           updateStats: true,
         );
 
@@ -2469,7 +2538,7 @@ class ParallelJournalManager {
             (op.op == BufferOperationType.insert ||
                 op.op == BufferOperationType.update)) {
           try {
-            _dataStore.tableMetaManager?.ingestRecoveredTableMetaRow(op.data);
+            _dataStore.tableMetaManager?.ingestRecoveredTableMetaRow(opData);
           } catch (e) {
             Logger.warn(
               'Batch recovery: failed to ingest tableMeta row pk=$pkValue',
@@ -2588,9 +2657,6 @@ class ParallelJournalManager {
 
   Future<_BatchWalData> _collectBatchWalChanges(
       PendingParallelBatch batch) async {
-    final Map<TableUid, List<Map<String, dynamic>>> inserts = {};
-    final Map<TableUid, List<Map<String, dynamic>>> updates = {};
-    final Map<TableUid, List<Map<String, dynamic>>> deletes = {};
     final Map<TableUid, List<_WalOp>> ordered = {};
     final List<({TableUid table, _WalOp op})> orderedOpsInWalOrder = [];
 
@@ -2613,9 +2679,6 @@ class ParallelJournalManager {
       final endP = batch.end.partitionIndex;
       if (startP < 0 || endP < 0) {
         return _BatchWalData(
-          insertsByTable: inserts,
-          updatesByTable: updates,
-          deletesByTable: deletes,
           orderedOpsByTable: ordered,
           orderedOpsInWalOrder: [],
         );
@@ -2623,9 +2686,6 @@ class ParallelJournalManager {
       final cap = _dataStore.config.logPartitionCycle;
       if (cap <= 0) {
         return _BatchWalData(
-          insertsByTable: inserts,
-          updatesByTable: updates,
-          deletesByTable: deletes,
           orderedOpsByTable: ordered,
           orderedOpsInWalOrder: [],
         );
@@ -2702,29 +2762,39 @@ class ParallelJournalManager {
             if (_reachedWalEnd(p, seq, batch.end)) break;
             final op = BufferOperationType.values[opIdx];
             final walPtr = WalPointer(partitionIndex: p, entrySeq: seq);
+            final walSchemaVersion = entry['schemaVersion'] as String? ?? '';
             _WalOp walOp;
             switch (op) {
               case BufferOperationType.insert:
-                (inserts.putIfAbsent(
-                    resolvedTable, () => <Map<String, dynamic>>[])).add(data);
-                walOp = _WalOp(op, data, walPointer: walPtr);
+                walOp = _WalOp(
+                  op,
+                  data,
+                  walPointer: walPtr,
+                  schemaVersion: walSchemaVersion,
+                );
                 (ordered.putIfAbsent(resolvedTable, () => <_WalOp>[]))
                     .add(walOp);
                 orderedOpsInWalOrder.add((table: resolvedTable, op: walOp));
                 break;
               case BufferOperationType.update:
-                (updates.putIfAbsent(
-                    resolvedTable, () => <Map<String, dynamic>>[])).add(data);
-                walOp =
-                    _WalOp(op, data, oldValues: oldValues, walPointer: walPtr);
+                walOp = _WalOp(
+                  op,
+                  data,
+                  oldValues: oldValues,
+                  walPointer: walPtr,
+                  schemaVersion: walSchemaVersion,
+                );
                 (ordered.putIfAbsent(resolvedTable, () => <_WalOp>[]))
                     .add(walOp);
                 orderedOpsInWalOrder.add((table: resolvedTable, op: walOp));
                 break;
               case BufferOperationType.delete:
-                (deletes.putIfAbsent(
-                    resolvedTable, () => <Map<String, dynamic>>[])).add(data);
-                walOp = _WalOp(op, data, walPointer: walPtr);
+                walOp = _WalOp(
+                  op,
+                  data,
+                  walPointer: walPtr,
+                  schemaVersion: walSchemaVersion,
+                );
                 (ordered.putIfAbsent(resolvedTable, () => <_WalOp>[]))
                     .add(walOp);
                 orderedOpsInWalOrder.add((table: resolvedTable, op: walOp));
@@ -2739,9 +2809,6 @@ class ParallelJournalManager {
       Logger.error('collect WAL for batch failed', rawError: e);
     }
     return _BatchWalData(
-      insertsByTable: inserts,
-      updatesByTable: updates,
-      deletesByTable: deletes,
       orderedOpsByTable: ordered,
       orderedOpsInWalOrder: orderedOpsInWalOrder,
     );
@@ -3559,9 +3626,6 @@ class ParallelJournalManager {
 }
 
 class _BatchWalData {
-  final Map<TableUid, List<Map<String, dynamic>>> insertsByTable;
-  final Map<TableUid, List<Map<String, dynamic>>> updatesByTable;
-  final Map<TableUid, List<Map<String, dynamic>>> deletesByTable;
   final Map<TableUid, List<_WalOp>> orderedOpsByTable;
 
   /// Same ops in exact WAL (partition+seq) order so recovery push order
@@ -3570,9 +3634,6 @@ class _BatchWalData {
   final Map<TableUid, BatchTablePlan> tablePlans = {};
 
   _BatchWalData({
-    required this.insertsByTable,
-    required this.updatesByTable,
-    required this.deletesByTable,
     required this.orderedOpsByTable,
     required this.orderedOpsInWalOrder,
   });
@@ -3583,5 +3644,12 @@ class _WalOp {
   final Map<String, dynamic> data;
   final Map<String, dynamic>? oldValues;
   final WalPointer? walPointer;
-  _WalOp(this.op, this.data, {this.oldValues, this.walPointer});
+  final String schemaVersion;
+  _WalOp(
+    this.op,
+    this.data, {
+    this.oldValues,
+    this.walPointer,
+    this.schemaVersion = '',
+  });
 }

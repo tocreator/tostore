@@ -739,6 +739,9 @@ class VectorIndexManager {
     double? distanceThreshold,
     double? minScore,
   }) {
+    if (topK <= 0) {
+      return Future<List<VectorSearchResult>>.value(const []);
+    }
     final indexUid = _resolveVectorIndexUid(table, fieldName);
     if (indexUid == null) {
       return Future<List<VectorSearchResult>>.value(const []);

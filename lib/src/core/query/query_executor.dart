@@ -33,6 +33,7 @@ import '../wmbp/wmbp_scheduler.dart';
 import '../wmbp/wmbp_score.dart';
 import 'query_cache.dart';
 import 'query_condition.dart';
+import 'query_optimizer.dart';
 import 'query_plan.dart';
 import 'value_matcher.dart';
 
@@ -822,6 +823,7 @@ class QueryExecutor {
               readFromFileOnly: readFromFileOnly,
               promoteDesc: null,
               applyPromoteResultTransform: applyPromoteResultTransform,
+              selectedFields: selectedFields,
               stopwatch: stopwatch,
             );
           }
@@ -1032,17 +1034,44 @@ class QueryExecutor {
     if (compiledPlan != null) {
       switch (compiledPlan.routeType) {
         case PlanRouteType.indexRangeScan:
-          plan = QueryPlan(
-            QueryOperation(
-              type: QueryOperationType.indexScan,
-              indexUid: compiledPlan.indexUid,
-              value: <String, dynamic>{
-                'table': table.tableUid,
-                'where': where,
-              },
-            ),
-            naturalOrderBy: compiledPlan.naturalOrderBy,
-          );
+          final Map<String, dynamic>? planWhere = (where == null ||
+                  where.isEmpty ||
+                  !_needsFlatWhereNormalization(where))
+              ? where
+              : QueryOptimizer.extractFlatAndWhereForTable(tableName, where);
+          if (where != null && where.isNotEmpty && planWhere == null) {
+            // Contains OR / complex boolean structure: re-plan via optimizer
+            // so cached indexScan never sees unflattened raw trees.
+            final optimizer = _dataStore.getQueryOptimizer();
+            if (optimizer == null) {
+              if (!_dataStore.isInitialized) return ExecuteResult.empty();
+              throw DbException([
+                GeneralStatus(
+                  type: ResultType.engError,
+                  message: 'Query optimizer not initialized',
+                )
+              ]);
+            }
+            plan = await optimizer.optimize(
+              table,
+              where,
+              orderBy: effectiveOrderBy,
+              limit: limit,
+              offset: offset,
+            );
+          } else {
+            plan = QueryPlan(
+              QueryOperation(
+                type: QueryOperationType.indexScan,
+                indexUid: compiledPlan.indexUid,
+                value: <String, dynamic>{
+                  'table': table.tableUid,
+                  'where': planWhere,
+                },
+              ),
+              naturalOrderBy: compiledPlan.naturalOrderBy,
+            );
+          }
           break;
         case PlanRouteType.tableScan:
           plan = QueryPlan(
@@ -1053,7 +1082,8 @@ class QueryExecutor {
                 'where': where,
               },
             ),
-            naturalOrderBy: compiledPlan.naturalOrderBy,
+            naturalOrderBy:
+                schema.primaryKey.isEmpty ? null : <String>[schema.primaryKey],
           );
           break;
         case PlanRouteType.unionScan:
@@ -2813,6 +2843,248 @@ class QueryExecutor {
     return IndexCondition.composite(components);
   }
 
+  static bool _needsFlatWhereNormalization(Map<String, dynamic> where) {
+    for (final k in where.keys) {
+      if (k == 'AND' || k == 'OR' || k.contains('.')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static String _normalizeOpUpper(String op) {
+    switch (op) {
+      case '=':
+      case '>':
+      case '>=':
+      case '<':
+      case '<=':
+      case 'IN':
+      case 'BETWEEN':
+      case 'LIKE':
+      case 'SCAN':
+      case 'COMPOSITE':
+        return op;
+      case 'between':
+        return 'BETWEEN';
+      case 'like':
+        return 'LIKE';
+      case 'in':
+        return 'IN';
+      default:
+        return op.toUpperCase();
+    }
+  }
+
+  static bool _valueMightExceed256(dynamic v) {
+    if (v == null) return true;
+    if (v is num || v is bool) return false;
+    if (v is String) return v.length > 256;
+    return true;
+  }
+
+  static bool _matchesSingleCoveredOp(dynamic condVal, String covOp) {
+    if (condVal == null) return false;
+    if (condVal is Map) {
+      if (condVal.length != 1) return false;
+      final rawOp = _normalizeOpUpper(condVal.keys.first.toString());
+      return rawOp == covOp && rawOp != 'LIKE';
+    }
+    return covOp == '=';
+  }
+
+  static bool _isCoveredTextExact(
+    TableSchema schema,
+    IndexSchema indexSchema,
+    String field,
+    dynamic condVal,
+  ) {
+    if (indexSchema.unique) return true;
+
+    bool mightTruncate = false;
+    if (condVal is! Map) {
+      mightTruncate = _valueMightExceed256(condVal);
+    } else if (condVal.length != 1) {
+      return false;
+    } else {
+      final val = condVal.values.first;
+      if (val is List) {
+        for (final item in val) {
+          if (_valueMightExceed256(item)) {
+            mightTruncate = true;
+            break;
+          }
+        }
+      } else if (val is Map) {
+        mightTruncate = _valueMightExceed256(val['start']) ||
+            _valueMightExceed256(val['end']);
+      } else {
+        mightTruncate = _valueMightExceed256(val);
+      }
+    }
+    if (!mightTruncate) return true;
+
+    final mt = schema.getFieldMatcherType(field);
+    return mt != MatcherType.pkString &&
+        mt != MatcherType.text &&
+        mt != MatcherType.textNullable &&
+        mt != MatcherType.datetime &&
+        mt != MatcherType.datetimeNullable &&
+        mt != MatcherType.unsupported;
+  }
+
+  static int _coveredSlotIndex(
+    IndexCondition builtCondition,
+    String builtOp,
+    List<String> idxFields,
+    String bareField,
+  ) {
+    if (builtOp == 'COMPOSITE') {
+      final comps = builtCondition.components;
+      if (comps == null || comps.isEmpty) return -1;
+      for (int i = 0; i < comps.length; i++) {
+        if (comps[i].field == bareField) return i;
+      }
+      return -1;
+    }
+    if (builtOp == '=' && idxFields.length > 1) {
+      for (int i = 0; i < idxFields.length; i++) {
+        if (idxFields[i] == bareField) return i;
+      }
+      return -1;
+    }
+    if (idxFields.length == 1 && idxFields[0] == bareField) {
+      return 0;
+    }
+    return -1;
+  }
+
+  static String? _coveredOpAtSlot(
+    IndexCondition builtCondition,
+    String builtOp,
+    int slot,
+  ) {
+    if (builtOp == 'COMPOSITE') {
+      final comps = builtCondition.components;
+      if (comps == null || slot < 0 || slot >= comps.length) return null;
+      return _normalizeOpUpper(comps[slot].operator);
+    }
+    return builtOp;
+  }
+
+  int _visitAndCoveredMask({
+    required Map<String, dynamic> node,
+    required TableSchema schema,
+    required String tableName,
+    required IndexSchema indexSchema,
+    required IndexCondition builtCondition,
+    required String builtOp,
+    required Map<String, dynamic> flattenedConditions,
+    required int seenMask,
+  }) {
+    if (node.containsKey('OR')) return -1;
+    final andVal = node['AND'];
+    if (andVal is List) {
+      for (final c in andVal) {
+        if (c is! Map<String, dynamic>) return -1;
+        seenMask = _visitAndCoveredMask(
+          node: c,
+          schema: schema,
+          tableName: tableName,
+          indexSchema: indexSchema,
+          builtCondition: builtCondition,
+          builtOp: builtOp,
+          flattenedConditions: flattenedConditions,
+          seenMask: seenMask,
+        );
+        if (seenMask < 0) return -1;
+      }
+    }
+    final idxFields = indexSchema.fields;
+    for (final entry in node.entries) {
+      final k = entry.key;
+      if (k == 'AND') continue;
+      if (k == 'OR') return -1;
+
+      final dotIdx = k.indexOf('.');
+      final String bareField;
+      if (dotIdx != -1) {
+        if (k.substring(0, dotIdx) != tableName) return -1;
+        bareField = k.substring(dotIdx + 1);
+      } else {
+        bareField = k;
+      }
+
+      final slot =
+          _coveredSlotIndex(builtCondition, builtOp, idxFields, bareField);
+      if (slot < 0 || slot >= 30) return -1;
+
+      final bit = 1 << slot;
+      if ((seenMask & bit) != 0) return -1;
+      seenMask |= bit;
+
+      final covOp = _coveredOpAtSlot(builtCondition, builtOp, slot);
+      if (covOp == null || covOp == 'SCAN') return -1;
+
+      final condVal = flattenedConditions[bareField];
+      if (!_matchesSingleCoveredOp(condVal, covOp)) return -1;
+      if (!_isCoveredTextExact(schema, indexSchema, bareField, condVal)) {
+        return -1;
+      }
+    }
+    return seenMask;
+  }
+
+  /// True only when [builtCondition] fully enforces every predicate in
+  /// [matcherCondition] without needing post-fetch [matcher] evaluation.
+  bool _isConditionCoveredByIndexScan({
+    required TableSchema schema,
+    required String tableName,
+    required IndexSchema? indexSchema,
+    required IndexCondition? builtCondition,
+    required Map<String, dynamic> flattenedConditions,
+    required Map<String, dynamic>? matcherCondition,
+    required ConditionRecordMatcher? matcher,
+  }) {
+    if (matcher == null) return true;
+    if (builtCondition == null ||
+        indexSchema == null ||
+        flattenedConditions.isEmpty ||
+        matcherCondition == null ||
+        matcherCondition.isEmpty) {
+      return false;
+    }
+
+    final idxFields = indexSchema.fields;
+    if (idxFields.isEmpty) return false;
+    final builtOp = _normalizeOpUpper(builtCondition.operator);
+    if (builtOp == 'SCAN') return false;
+
+    // Fast path: single-field index with a single-field leaf condition
+    // (0 Map, 0 Set, 0 closure allocations).
+    if (idxFields.length == 1 && matcherCondition.length == 1) {
+      final idxField = idxFields.first;
+      if (matcherCondition.containsKey(idxField) &&
+          flattenedConditions.length == 1) {
+        final condVal = flattenedConditions[idxField];
+        if (!_matchesSingleCoveredOp(condVal, builtOp)) return false;
+        return _isCoveredTextExact(schema, indexSchema, idxField, condVal);
+      }
+    }
+
+    final mask = _visitAndCoveredMask(
+      node: matcherCondition,
+      schema: schema,
+      tableName: tableName,
+      indexSchema: indexSchema,
+      builtCondition: builtCondition,
+      builtOp: builtOp,
+      flattenedConditions: flattenedConditions,
+      seenMask: 0,
+    );
+    return mask > 0;
+  }
+
   /// perform index scan
   Future<TableScanResult> _performIndexScan(
     TableContext table,
@@ -2905,6 +3177,15 @@ class QueryExecutor {
       final pkMatcher =
           ValueMatcher.getMatcher(tblSchema.getPrimaryKeyMatcherType());
       final matcherCondition = matcher?.condition.build();
+      final bool isCoveredByIndexScan = _isConditionCoveredByIndexScan(
+        schema: tblSchema,
+        tableName: tableName,
+        indexSchema: indexSchema,
+        builtCondition: builtCondition,
+        flattenedConditions: conditions,
+        matcherCondition: matcherCondition,
+        matcher: matcher,
+      );
 
       // Decide whether the requested order can be produced directly by this index scan.
       // If orderBy does NOT match this index, we must scan the full index range and keep
@@ -3084,15 +3365,6 @@ class QueryExecutor {
               }
             }
           } else {
-            final idxFields = indexSchema?.fields;
-            final bool isCoveredByIndexScan = matcher == null ||
-                (idxFields != null &&
-                    matcher.fields.isNotEmpty &&
-                    matcher.fields.every((f) =>
-                        idxFields.contains(f) || f == tblSchema.primaryKey) &&
-                    (matcherCondition == null ||
-                        !matcherCondition.containsKey('OR')));
-
             final records = pks.isEmpty
                 ? const <Map<String, dynamic>>[]
                 : (await _dataStore.tableDataManager.queryRecordsBatch(
@@ -3379,15 +3651,6 @@ class QueryExecutor {
         final pks = indexResults.primaryKeys;
         final lastKey = indexResults.lastKey;
         if ((pks.isEmpty) && (lastKey == null)) break;
-
-        final idxFields = indexSchema?.fields;
-        final bool isCoveredByIndexScan = matcher == null ||
-            (idxFields != null &&
-                matcher.fields.isNotEmpty &&
-                matcher.fields.every((f) =>
-                    idxFields.contains(f) || f == tblSchema.primaryKey) &&
-                (matcherCondition == null ||
-                    !matcherCondition.containsKey('OR')));
 
         final records = pks.isEmpty
             ? const <Map<String, dynamic>>[]
@@ -3794,10 +4057,16 @@ class QueryExecutor {
           final spec = _resolveIndexSpecForCursor(schema, idxUid);
           final idxSchema =
               _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, idxUid);
+          final opVal = plan.operation.value;
+          final Map<String, dynamic> planWhere =
+              (opVal is Map<String, dynamic> &&
+                      opVal['where'] is Map<String, dynamic>)
+                  ? (opVal['where'] as Map<String, dynamic>)
+                  : (where ?? const <String, dynamic>{});
           final indexCond = _buildIndexConditionForSchema(
             idxSchema,
             idxUid,
-            where ?? const <String, dynamic>{},
+            planWhere,
           );
           if (indexCond == null) return false;
           final alignment = _resolveIndexOrderByAlignment(
@@ -4400,7 +4669,12 @@ class QueryExecutor {
 
   /// Invalidate query result cache for a table (O(1)).
   void invalidateQueryCacheForTable(TableContext table) {
-    final tableUidStr = table.tableUid.value;
+    invalidateQueryCacheForUid(table.tableUid);
+  }
+
+  /// Invalidate query result cache by stable [TableUid] (O(1)).
+  void invalidateQueryCacheForUid(TableUid tableUid) {
+    final tableUidStr = tableUid.value;
     final cur = _tableQueryGenerations[tableUidStr] ?? 0;
     // Keep it positive and bounded.
     _tableQueryGenerations[tableUidStr] = (cur + 1) & 0x7fffffff;
@@ -4727,6 +5001,20 @@ class QueryExecutor {
         )
       ]);
     }
+    if (effectiveLimit <= 0) {
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
+          entries: [],
+          fusionMethod: null,
+        ),
+        hasMore: false,
+        hasPrev: effectiveOffset > 0,
+        count: 0,
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
+      );
+    }
     final QueryCondition? resolvedFilter = filterCondition ??
         ((structuredWhere != null && structuredWhere.isNotEmpty)
             ? QueryCondition.fromMap(structuredWhere)
@@ -4980,6 +5268,7 @@ class QueryExecutor {
           readFromFileOnly: readFromFileOnly,
           promoteDesc: promoteDesc,
           applyPromoteResultTransform: applyPromoteResultTransform,
+          selectedFields: selectedFields,
           stopwatch: stopwatch,
         );
       }
@@ -5049,6 +5338,21 @@ class QueryExecutor {
           message: 'Vector index manager is not initialized',
         )
       ]);
+    }
+
+    if (effectiveLimit <= 0) {
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
+          entries: [],
+          fusionMethod: null,
+        ),
+        hasMore: false,
+        hasPrev: effectiveOffset > 0,
+        count: 0,
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
+      );
     }
 
     // Exact topK when offset==0 (same ANN cost as db.vectorSearch).
@@ -5189,6 +5493,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     PromoteRuntimeDescriptor? promoteDesc,
     bool applyPromoteResultTransform = false,
+    List<String>? selectedFields,
     Stopwatch? stopwatch,
   }) async {
     final vectorIndexMgr = _dataStore.vectorIndexManager;
@@ -5199,6 +5504,20 @@ class QueryExecutor {
           message: 'Vector index manager is not initialized',
         )
       ]);
+    }
+    if (effectiveLimit <= 0) {
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
+          entries: [],
+          fusionMethod: null,
+        ),
+        hasMore: false,
+        hasPrev: effectiveOffset > 0,
+        count: 0,
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
+      );
     }
 
     final int need = effectiveOffset + effectiveLimit;
@@ -5242,13 +5561,20 @@ class QueryExecutor {
       candidatePks.add(cand.primaryKey);
     }
 
-    // full-record decode: filter matcher may reference any column before SELECT.
+    final neededFields = promoteDesc == null
+        ? resolveNeededFields(
+            selectedFields: selectedFields,
+            matcher: matcher,
+            primaryKey: table.schema.primaryKey,
+          )
+        : null;
     final recordsMap = candidatePks.isEmpty
         ? const <String, Map<String, dynamic>>{}
         : await _dataStore.tableDataManager.queryRecordsMapBatch(
             table,
             candidatePks,
             readFromFileOnly: readFromFileOnly,
+            neededFields: neededFields,
           );
 
     final qualifiedCandidates =
@@ -5380,6 +5706,10 @@ class QueryExecutor {
     for (int branchIdx = 0; branchIdx < recallBranches.length; branchIdx++) {
       final branch = recallBranches[branchIdx];
       final branchKey = 'channel_$branchIdx';
+      final localFilter = (branch.containsKey('AND') || branch.length > 1) &&
+              _mapTreeContainsRetrieval(branch)
+          ? _stripRetrieval(branch)
+          : null;
       branchTasks.add(() async {
         final hits = <String,
             ({
@@ -5471,9 +5801,15 @@ class QueryExecutor {
             }
           }
         } else {
+          final Map<String, dynamic> effectiveBranch =
+              (globalFilter != null && globalFilter.isNotEmpty)
+                  ? {
+                      'AND': [branch, globalFilter]
+                    }
+                  : branch;
           final subResult = await execute(
             table,
-            condition: QueryCondition.fromMap(branch),
+            condition: QueryCondition.fromMap(effectiveBranch),
             limit: recallPerChannel,
             readFromFileOnly: readFromFileOnly,
           );
@@ -5494,6 +5830,27 @@ class QueryExecutor {
           }
         }
 
+        if (localFilter != null && hits.isNotEmpty) {
+          final localMatcher = ConditionRecordMatcher.prepare(
+            QueryCondition.fromMap(localFilter),
+            {table.tableName.toString(): table.schema},
+            table.tableName.toString(),
+          );
+          final localMap =
+              await _dataStore.tableDataManager.queryRecordsMapBatch(
+            table,
+            hits.keys.toList(growable: false),
+            readFromFileOnly: readFromFileOnly,
+            neededFields: localMatcher.fields.isEmpty
+                ? null
+                : {table.schema.primaryKey, ...localMatcher.fields},
+          );
+          hits.removeWhere((pk, _) {
+            final rec = localMap[pk];
+            return rec == null || !localMatcher.matches(rec);
+          });
+        }
+
         return (branchKey: branchKey, weight: weight, hits: hits);
       }());
     }
@@ -5507,6 +5864,7 @@ class QueryExecutor {
     final rrfScores = <String, double>{};
     final pkChannelScores = <String, List<({double score, double weight})>>{};
     final pkContributions = <String, Map<String, dynamic>>{};
+    bool hasStructuredHit = false;
 
     for (final entry in channelHits.entries) {
       final channelKey = entry.key;
@@ -5516,7 +5874,7 @@ class QueryExecutor {
       for (final hit in hits.entries) {
         final pk = hit.key;
         final info = hit.value;
-        final rrfDelta = weight / (60.0 + info.rank);
+        final rrfDelta = weight > 0 ? weight / (60.0 + info.rank) : 0.0;
         rrfScores[pk] = (rrfScores[pk] ?? 0.0) + rrfDelta;
         // Structured branches have no absolute relevance; they must not pull
         // fused scores toward zero or invent a relative 1.0.
@@ -5526,6 +5884,8 @@ class QueryExecutor {
           pkChannelScores
               .putIfAbsent(pk, () => <({double score, double weight})>[])
               .add((score: info.score, weight: weight));
+        } else if (info.channel == RetrievalChannel.structured) {
+          hasStructuredHit = true;
         }
 
         final contrib =
@@ -5589,22 +5949,57 @@ class QueryExecutor {
     }
 
     final bool useRrf = effectiveFusion == RetrievalFusionMethod.rrf;
+    final bool rankByRrf = useRrf || hasStructuredHit;
     double publicScore(String pk) =>
         useRrf ? (rrfScores[pk] ?? 0.0) : fusedRelevance(pk);
+    double? publicRawScore(double fused, Map<String, dynamic>? contribs) {
+      if (useRrf) return fused;
+      if (contribs == null || contribs.length != 1) return null;
+      return (contribs.values.first['rawScore'] as num?)?.toDouble();
+    }
 
     final sortedPks = <String>{
       ...pkChannelScores.keys,
       ...rrfScores.keys,
     }.toList()
       ..sort((a, b) {
-        final int byScore = publicScore(b).compareTo(publicScore(a));
-        if (byScore != 0) return byScore;
-        if (!useRrf) {
-          final int byRrf = (rrfScores[b] ?? 0).compareTo(rrfScores[a] ?? 0);
+        if (rankByRrf) {
+          final int byRrf =
+              (rrfScores[b] ?? 0.0).compareTo(rrfScores[a] ?? 0.0);
+          if (byRrf != 0) return byRrf;
+          if (!useRrf) {
+            final int byRel = fusedRelevance(b).compareTo(fusedRelevance(a));
+            if (byRel != 0) return byRel;
+          }
+        } else {
+          final int byScore = fusedRelevance(b).compareTo(fusedRelevance(a));
+          if (byScore != 0) return byScore;
+          final int byRrf =
+              (rrfScores[b] ?? 0.0).compareTo(rrfScores[a] ?? 0.0);
           if (byRrf != 0) return byRrf;
         }
         return a.compareTo(b);
       });
+
+    RetrievalEntry buildEntry(String pk) {
+      final rawRrf = rrfScores[pk] ?? 0.0;
+      final contribs = pkContributions[pk];
+      final bool isMultiHit = contribs != null && contribs.length > 1;
+      final RetrievalChannel primaryChannel = isMultiHit
+          ? RetrievalChannel.hybrid
+          : _retrievalChannelByName(contribs?.values.first['channel']);
+      final fused = publicScore(pk);
+      return RetrievalEntry(
+        score: fused,
+        channel: primaryChannel,
+        rawScore: publicRawScore(fused, contribs),
+        meta: {
+          'rrfScore': rawRrf,
+          'relevanceScore': fusedRelevance(pk),
+          'channelContributions': contribs,
+        },
+      );
+    }
 
     if (selectedFields != null &&
         globalMatcher == null &&
@@ -5618,27 +6013,7 @@ class QueryExecutor {
         for (int i = start; i < end; i++) {
           final pk = sortedPks[i];
           records.add(<String, dynamic>{pkField: pk});
-          final rawRrf = rrfScores[pk] ?? 0.0;
-          final contribs = pkContributions[pk];
-          final bool isMultiHit = contribs != null && contribs.length > 1;
-          RetrievalChannel primaryChannel;
-          if (isMultiHit) {
-            primaryChannel = RetrievalChannel.hybrid;
-          } else {
-            primaryChannel =
-                _retrievalChannelByName(contribs?.values.first['channel']);
-          }
-          final fused = publicScore(pk);
-          entries.add(RetrievalEntry(
-            score: fused,
-            channel: primaryChannel,
-            rawScore: fused,
-            meta: {
-              'rrfScore': rawRrf,
-              if (!useRrf) 'relevanceScore': fusedRelevance(pk),
-              'channelContributions': contribs,
-            },
-          ));
+          entries.add(buildEntry(pk));
         }
         stopwatch?.stop();
         return ExecuteResult(
@@ -5651,7 +6026,7 @@ class QueryExecutor {
               'channels': channelWeights,
             },
           ),
-          hasMore: records.length == effectiveLimit,
+          hasMore: effectiveLimit > 0 && end < sortedPks.length,
           hasPrev: effectiveOffset > 0,
           count: records.length,
           executionTimeMs: stopwatch?.elapsedMilliseconds,
@@ -5660,41 +6035,69 @@ class QueryExecutor {
       }
     }
 
+    if (effectiveLimit <= 0) {
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: RetrievalContext(
+          entries: const [],
+          fusionMethod: effectiveFusion,
+          meta: {
+            'totalCandidates': sortedPks.length,
+            'channels': channelWeights,
+          },
+        ),
+        hasMore: false,
+        hasPrev: effectiveOffset > 0,
+        count: 0,
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
+      );
+    }
+
     final records = <Map<String, dynamic>>[];
     final entries = <RetrievalEntry>[];
     int qualifiedOffsetCount = 0;
-    final fetchCount = globalMatcher != null
+    bool hasMore = false;
+    int loadedUntil = globalMatcher != null
         ? min(sortedPks.length, max(need * 3, need + 16))
-        : min(sortedPks.length, need);
-    final batchPks = sortedPks.sublist(0, fetchCount);
+        : min(sortedPks.length, need + 1);
+    final batchPks = sortedPks.sublist(0, loadedUntil);
     final recordsMap = batchPks.isEmpty
-        ? const <String, Map<String, dynamic>>{}
-        : await _dataStore.tableDataManager.queryRecordsMapBatch(
+        ? <String, Map<String, dynamic>>{}
+        : Map<String, Map<String, dynamic>>.from(
+            await _dataStore.tableDataManager.queryRecordsMapBatch(
+              table,
+              batchPks,
+              readFromFileOnly: readFromFileOnly,
+              neededFields: neededFields,
+            ),
+          );
+
+    final yieldController = YieldController('QueryExecutor.hybridMaterialize');
+    for (int i = 0; i < sortedPks.length; i++) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+
+      if (i >= loadedUntil) {
+        // Rare: overfetch window exhausted under heavy filter rejection; fetch next chunk in batch.
+        final int nextEnd =
+            min<int>(sortedPks.length, loadedUntil + max<int>(32, need));
+        final morePks = sortedPks.sublist(loadedUntil, nextEnd);
+        loadedUntil = nextEnd;
+        if (morePks.isNotEmpty) {
+          final moreMap =
+              await _dataStore.tableDataManager.queryRecordsMapBatch(
             table,
-            batchPks,
+            morePks,
             readFromFileOnly: readFromFileOnly,
             neededFields: neededFields,
           );
-
-    for (int i = 0; i < sortedPks.length; i++) {
-      if (records.length >= effectiveLimit) {
-        break;
+          recordsMap.addAll(moreMap);
+        }
       }
 
       final pk = sortedPks[i];
-      Map<String, dynamic>? rec = recordsMap[pk];
-      if (rec == null && i >= fetchCount) {
-        // Rare: overfetch window exhausted under heavy filter rejection.
-        if (!readFromFileOnly) {
-          rec =
-              _dataStore.tableDataManager.getRecordByPrimaryKeySync(table, pk);
-        }
-        rec ??= await _dataStore.tableDataManager.getRecordByPrimaryKey(
-          table,
-          pk,
-          readFromFileOnly: readFromFileOnly,
-        );
-      }
+      final rec = recordsMap[pk];
 
       if (rec != null) {
         // Global pre-filter validation (if global filter is specified)
@@ -5707,6 +6110,11 @@ class QueryExecutor {
           continue;
         }
 
+        if (records.length >= effectiveLimit) {
+          hasMore = true;
+          break;
+        }
+
         final Map<String, dynamic> row;
         if (promoteDesc != null && applyPromoteResultTransform) {
           row = Map<String, dynamic>.from(rec);
@@ -5715,34 +6123,9 @@ class QueryExecutor {
           row = rec;
         }
         records.add(row);
-
-        final rawRrf = rrfScores[pk] ?? 0.0;
-        final contribs = pkContributions[pk];
-        final bool isMultiHit = contribs != null && contribs.length > 1;
-
-        RetrievalChannel primaryChannel;
-        if (isMultiHit) {
-          primaryChannel = RetrievalChannel.hybrid;
-        } else {
-          primaryChannel =
-              _retrievalChannelByName(contribs?.values.first['channel']);
-        }
-
-        final fused = publicScore(pk);
-        entries.add(RetrievalEntry(
-          score: fused,
-          channel: primaryChannel,
-          rawScore: fused,
-          meta: {
-            'rrfScore': rawRrf,
-            if (!useRrf) 'relevanceScore': fusedRelevance(pk),
-            'channelContributions': contribs,
-          },
-        ));
+        entries.add(buildEntry(pk));
       }
     }
-
-    final bool hasMore = (records.length == effectiveLimit);
 
     stopwatch?.stop();
     return ExecuteResult(
@@ -5781,7 +6164,7 @@ class _HybridQueryShape {
   });
 
   static _HybridQueryShape analyze(Map<String, dynamic> where) {
-    // Check if root is OR
+    // Check if root is OR: keep every arm (retrieval or structured) as a recall branch.
     if (where.containsKey('OR') &&
         where['OR'] is List &&
         (where['OR'] as List).isNotEmpty) {
@@ -5789,25 +6172,28 @@ class _HybridQueryShape {
         for (final arm in (where['OR'] as List))
           if (arm is Map<String, dynamic>) arm,
       ];
-      if (_orArmsContainRetrieval(arms)) {
-        return _splitRetrievalOr(arms);
-      }
       return _HybridQueryShape(
         recallBranches: arms,
         isMultiWay: true,
       );
     }
 
-    // Check if root is AND containing an OR branch
+    // Check if root is AND containing a retrieval OR branch
     if (where.containsKey('AND') && where['AND'] is List) {
       final andList = where['AND'] as List;
       Map<String, dynamic>? orBranchMap;
+      final extraRetrievalBranches = <Map<String, dynamic>>[];
       final globalFilters = <Map<String, dynamic>>[];
 
       for (final item in andList) {
         if (item is Map<String, dynamic>) {
-          if (item.containsKey('OR') && item['OR'] is List) {
+          if (item.containsKey('OR') &&
+              item['OR'] is List &&
+              _mapTreeContainsRetrieval(item) &&
+              orBranchMap == null) {
             orBranchMap = item;
+          } else if (_mapTreeContainsRetrieval(item)) {
+            extraRetrievalBranches.add(item);
           } else {
             globalFilters.add(item);
           }
@@ -5818,23 +6204,16 @@ class _HybridQueryShape {
         final arms = <Map<String, dynamic>>[
           for (final arm in (orBranchMap['OR'] as List))
             if (arm is Map<String, dynamic>) arm,
+          ...extraRetrievalBranches,
         ];
-        final split = _orArmsContainRetrieval(arms)
-            ? _splitRetrievalOr(arms)
-            : _HybridQueryShape(
-                recallBranches: arms,
-                isMultiWay: true,
-              );
-        final filters = <Map<String, dynamic>>[
-          ...globalFilters,
-          if (split.globalFilter != null) split.globalFilter!,
-        ];
-        final Map<String, dynamic>? combinedGlobalFilter = filters.isEmpty
+        final Map<String, dynamic>? combinedGlobalFilter = globalFilters.isEmpty
             ? null
-            : (filters.length == 1 ? filters.first : {'AND': filters});
+            : (globalFilters.length == 1
+                ? globalFilters.first
+                : {'AND': globalFilters});
         return _HybridQueryShape(
           globalFilter: combinedGlobalFilter,
-          recallBranches: split.recallBranches,
+          recallBranches: arms,
           isMultiWay: true,
         );
       }
@@ -5897,13 +6276,6 @@ bool _isRetrievalLeaf(Map<String, dynamic> item) {
   return false;
 }
 
-bool _orArmsContainRetrieval(List<Map<String, dynamic>> arms) {
-  for (final arm in arms) {
-    if (_mapTreeContainsRetrieval(arm)) return true;
-  }
-  return false;
-}
-
 bool _mapTreeContainsRetrieval(Map<String, dynamic> where) {
   if (where.containsKey('AND') && where['AND'] is List) {
     for (final item in where['AND'] as List) {
@@ -5930,54 +6302,6 @@ bool _mapTreeContainsRetrieval(Map<String, dynamic> where) {
     }
   }
   return false;
-}
-
-/// Pull structured predicates out of a retrieval OR so they filter every arm.
-_HybridQueryShape _splitRetrievalOr(List<Map<String, dynamic>> arms) {
-  final branches = <Map<String, dynamic>>[];
-  final filters = <Map<String, dynamic>>[];
-  for (final arm in arms) {
-    _splitRetrievalArm(arm, branches, filters);
-  }
-  Map<String, dynamic>? globalFilter;
-  if (filters.length == 1) {
-    globalFilter = filters.first;
-  } else if (filters.length > 1) {
-    globalFilter = {'AND': filters};
-  }
-  return _HybridQueryShape(
-    globalFilter: globalFilter,
-    recallBranches: branches,
-    isMultiWay: true,
-  );
-}
-
-void _splitRetrievalArm(
-  Map<String, dynamic> arm,
-  List<Map<String, dynamic>> branches,
-  List<Map<String, dynamic>> filters,
-) {
-  if (arm.containsKey('AND') && arm['AND'] is List) {
-    for (final item in arm['AND'] as List) {
-      if (item is Map<String, dynamic>) {
-        _splitRetrievalArm(item, branches, filters);
-      }
-    }
-    return;
-  }
-  if (arm.containsKey('OR') && arm['OR'] is List) {
-    for (final item in arm['OR'] as List) {
-      if (item is Map<String, dynamic>) {
-        _splitRetrievalArm(item, branches, filters);
-      }
-    }
-    return;
-  }
-  if (_mapTreeContainsRetrieval(arm)) {
-    branches.add(arm);
-  } else if (arm.isNotEmpty) {
-    filters.add(arm);
-  }
 }
 
 Map<String, dynamic>? _stripRetrieval(Map<String, dynamic>? where) {
@@ -6112,7 +6436,9 @@ class _SparseMatchSpec {
     if (entry.value is Map && (entry.value as Map).containsKey(operator)) {
       final payload = (entry.value as Map)[operator];
       if (payload is Map) {
-        return (field: entry.key, payload: payload);
+        final field =
+            entry.key.contains('.') ? entry.key.split('.').last : entry.key;
+        return (field: field, payload: payload);
       }
     }
   }
@@ -6172,8 +6498,10 @@ class _VectorMatchSpec {
         final payload = (entry.value as Map)[r'$vector'] as Map;
         final vec = payload['vector'];
         if (vec is VectorData) {
+          final field =
+              entry.key.contains('.') ? entry.key.split('.').last : entry.key;
           return _VectorMatchSpec(
-            field: entry.key,
+            field: field,
             vector: vec,
             weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
             searchDepth: payload['searchDepth'] as int?,

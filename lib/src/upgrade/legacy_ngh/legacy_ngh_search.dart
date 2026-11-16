@@ -1399,7 +1399,14 @@ class LegacyNghSearch {
       );
     }
 
-    if (distanceThreshold != null && dist > distanceThreshold) return;
+    if (distanceThreshold != null) {
+      final double effectiveThreshold = (!isCosine && !isIP)
+          ? (distanceThreshold < 0.0
+              ? -1.0
+              : distanceThreshold * distanceThreshold)
+          : distanceThreshold;
+      if (dist > effectiveThreshold) return;
+    }
 
     if (!resultHeap.isFull || dist < resultHeap.peekDist) {
       resultHeap.pushWithPk(

@@ -748,19 +748,24 @@ class WriteBufferManager {
     final entry = getBufferedRecord(table, recordId);
     if (entry == null) return null;
     if (migrationManager == null ||
+        !migrationManager.hasActiveRuntimeMigrations ||
         !migrationManager.hasRuntimeMigrationForTable(table)) {
       return entry;
     }
+    final wp = entry.walPointer;
+    final effectiveWp = (wp != null && wp.partitionIndex >= 0) ? wp : null;
     final normalizedData = migrationManager.normalizeRecordToLatestSync(
       table,
       entry.data,
       fromVersion: entry.schemaVersion,
+      walPointer: effectiveWp,
     );
     final normalizedOldValues = entry.oldValues != null
         ? migrationManager.normalizeRecordToLatestSync(
             table,
             entry.oldValues!,
             fromVersion: entry.schemaVersion,
+            walPointer: effectiveWp,
           )
         : null;
     if (identical(normalizedData, entry.data) &&

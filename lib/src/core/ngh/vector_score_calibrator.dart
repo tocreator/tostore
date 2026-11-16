@@ -129,7 +129,7 @@ abstract final class VectorScoreCalibrator {
       calibration,
       isExactSelf: isSelf,
     );
-    return (distance: d2, rawScore: rawDist, score: score);
+    return (distance: rawDist, rawScore: rawDist, score: score);
   }
 
   /// Evaluates inner product into distance, rawScore, and score.

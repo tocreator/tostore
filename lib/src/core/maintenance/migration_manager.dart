@@ -462,7 +462,10 @@ class MigrationManager {
     return false;
   }
 
+  bool get hasActiveRuntimeMigrations => _runtimeMigrations.isNotEmpty;
+
   bool hasRuntimeMigrationForTable(TableContext table) {
+    if (_runtimeMigrations.isEmpty) return false;
     return _findRuntimeMigrationDescriptor(table) != null;
   }
 
@@ -1162,13 +1165,7 @@ class MigrationManager {
     }
 
     // Alias / pre-rename name on context -> normalize through migration ops.
-    var canonical = descriptor.oldSchema.name;
-    for (final op in descriptor.operations) {
-      if (op.type == MigrationType.renameTable && op.newTableName != null) {
-        canonical = op.newTableName!;
-      }
-    }
-    if (table.tableName.value != canonical) {
+    if (table.tableName.value != descriptor.canonicalTableName) {
       return true;
     }
 
@@ -1212,41 +1209,99 @@ class MigrationManager {
     return _runtimeMigrations[table.tableUid];
   }
 
+  /// Normalize a recovered WAL entry (data and optional oldValues) to the
+  /// latest active schema when the table has a runtime migration whose cutover
+  /// covers [walPointer].
+  ({Map<String, dynamic> data, Map<String, dynamic>? oldValues})
+      normalizeRecoveredWalRecordIfNeeded(
+    TableContext table,
+    Map<String, dynamic> data, {
+    Map<String, dynamic>? oldValues,
+    WalPointer? walPointer,
+    String schemaVersion = '',
+  }) {
+    if (!hasRuntimeMigrationForTable(table) ||
+        !shouldNormalizeBufferedWrite(table, walPointer)) {
+      return (data: data, oldValues: oldValues);
+    }
+    final normalizedData = normalizeRecordToLatestSync(
+      table,
+      data,
+      fromVersion: schemaVersion,
+      walPointer: walPointer,
+    );
+    final normalizedOldValues = (oldValues != null && oldValues.isNotEmpty)
+        ? normalizeRecordToLatestSync(
+            table,
+            oldValues,
+            fromVersion: schemaVersion,
+            walPointer: walPointer,
+          )
+        : oldValues;
+    return (data: normalizedData, oldValues: normalizedOldValues);
+  }
+
+  static bool _isTaskEligibleForWal(
+    MigrationTask task,
+    WalPointer? walPointer,
+    int walCycle,
+  ) {
+    if (walPointer == null) return true;
+    final cutover = task.schemaCutoverWalPointer;
+    return cutover == null || !walPointer.isNewerThan(cutover, walCycle);
+  }
+
   /// Symmetrically normalizes a record from a historical version up to the latest active schema version.
   Map<String, dynamic> normalizeRecordToLatestSync(
     TableContext table,
     Map<String, dynamic> record, {
     required String fromVersion,
+    WalPointer? walPointer,
   }) {
-    final tableTasks = _pendingTasks.where((t) {
-      final currentName = t.currentTableName ??
-          _resolveCurrentTableNameFromName(t.tableName, t.operations);
-      return t.tableUid == table.tableUid ||
-          t.tableName == table.tableName ||
-          currentName == table.tableName;
-    }).toList()
-      ..sort((a, b) => a.createTime.compareTo(b.createTime));
+    final descriptor = _findRuntimeMigrationDescriptor(table);
+    final List<MigrationTask> tableTasks;
+    if (descriptor != null) {
+      tableTasks = descriptor.orderedTasks;
+    } else {
+      tableTasks = _pendingTasks.where((t) {
+        final currentName = t.currentTableName ??
+            _resolveCurrentTableNameFromName(t.tableName, t.operations);
+        return t.tableUid == table.tableUid ||
+            t.tableName == table.tableName ||
+            currentName == table.tableName;
+      }).toList()
+        ..sort((a, b) => a.createTime.compareTo(b.createTime));
+    }
+    if (tableTasks.isEmpty) {
+      return record;
+    }
+
+    // Fast path: record already tagged with the latest target schema version
+    // requires zero migration work when no task above it applies.
+    if (fromVersion.isNotEmpty &&
+        fromVersion == tableTasks.last.targetSchemaSnapshot?.schemaVersion) {
+      return record;
+    }
 
     // Copy-on-write: return the original reference when no migration ops apply.
     // Critical for getBufferedRecordForRead identical() short-circuit.
     var currentRecord = record;
     var owned = false;
-    void ensureOwned() {
-      if (owned) return;
-      currentRecord = Map<String, dynamic>.from(currentRecord);
-      owned = true;
-    }
+    final walCycle =
+        walPointer != null ? _dataStore.config.logPartitionCycle : 0;
 
     if (fromVersion.isEmpty) {
       bool shouldApply = false;
       for (final task in tableTasks) {
+        if (!_isTaskEligibleForWal(task, walPointer, walCycle)) {
+          continue;
+        }
         if (!shouldApply) {
           for (final op in task.operations) {
-            if (op.type == MigrationType.renameField &&
-                op.fieldName != null &&
-                op.newName != null &&
-                record.containsKey(op.fieldName) &&
-                !record.containsKey(op.newName)) {
+            final renamePair = _extractFieldRenamePair(op);
+            if (renamePair != null &&
+                record.containsKey(renamePair.oldName) &&
+                !record.containsKey(renamePair.newName)) {
               shouldApply = true;
               break;
             }
@@ -1261,7 +1316,10 @@ class MigrationManager {
         }
         if (shouldApply) {
           // applyMigrationOperationsSync mutates in place.
-          ensureOwned();
+          if (!owned) {
+            currentRecord = Map<String, dynamic>.from(currentRecord);
+            owned = true;
+          }
           currentRecord = applyMigrationOperationsSync(
             currentRecord,
             task.operations,
@@ -1282,8 +1340,11 @@ class MigrationManager {
         startUpgrading = true;
       }
 
-      if (startUpgrading) {
-        ensureOwned();
+      if (startUpgrading && _isTaskEligibleForWal(task, walPointer, walCycle)) {
+        if (!owned) {
+          currentRecord = Map<String, dynamic>.from(currentRecord);
+          owned = true;
+        }
         currentRecord = applyMigrationOperationsSync(
           currentRecord,
           task.operations,
@@ -1427,6 +1488,107 @@ class MigrationManager {
         existingTables: existingTables,
       );
 
+      final existingTableSet = existingTables.toSet();
+      final tablesToDropSet = tablesToDrop.toSet();
+      final tablesToCreateSet = tablesToCreate.toSet();
+      final renamedNewNames = <String>{
+        for (final s in renamedTables.values) s.name,
+      };
+      final targetSchemaByName = <String, TableSchema>{
+        for (final s in targetSchemas) s.name: s,
+      };
+      final renamedOldByNewName = <String, String>{
+        for (final e in renamedTables.entries) e.value.name: e.key,
+      };
+      // Populated lazily during the single migration pass (or on-demand only when
+      // a child table appears before a parent whose referenced field/PK renamed).
+      final resolvedRefFieldsByTable = <String, Map<String, String>>{};
+
+      void cacheTableFieldRenames(
+        TableSchema oldSchema,
+        TableSchema newSchema,
+        List<MigrationOperation> ops,
+      ) {
+        if (ops.isEmpty) return;
+        final hints = _buildFieldRenameHints(ops);
+        if (hints.isEmpty) return;
+        resolvedRefFieldsByTable[newSchema.name] = hints;
+        if (oldSchema.name != newSchema.name) {
+          resolvedRefFieldsByTable[oldSchema.name] = hints;
+        }
+      }
+
+      Future<void> resolveReferencedTableFieldRenamesOnDemand(
+        String refTableName,
+      ) async {
+        if (resolvedRefFieldsByTable.containsKey(refTableName)) return;
+        final metaMgr = _dataStore.tableMetaManager;
+        final newParentSchema = targetSchemaByName[refTableName];
+        if (metaMgr == null || newParentSchema == null) {
+          resolvedRefFieldsByTable[refTableName] = const <String, String>{};
+          return;
+        }
+
+        final oldParentName = renamedOldByNewName[refTableName] ?? refTableName;
+        TableSchema? oldParentSchema;
+        if (oldParentName != refTableName) {
+          oldParentSchema =
+              await metaMgr.getTableSchemaByName(TableName(oldParentName));
+        } else if (existingTableSet.contains(refTableName) &&
+            !tablesToDropSet.contains(refTableName)) {
+          final uid = newParentSchema.tableUid.isNotEmpty
+              ? TableUid(newParentSchema.tableUid)
+              : await metaMgr.getUidByName(TableName(refTableName));
+          if (uid != null) {
+            oldParentSchema = await metaMgr.getTableSchema(uid);
+          }
+        }
+        if (oldParentSchema == null) {
+          resolvedRefFieldsByTable[refTableName] = const <String, String>{};
+          return;
+        }
+
+        final hints = <String, String>{};
+        if (oldParentSchema.primaryKey != newParentSchema.primaryKey &&
+            detectPromoteFieldToPrimaryKey(oldParentSchema, newParentSchema) ==
+                null) {
+          hints[oldParentSchema.primaryKey] = newParentSchema.primaryKey;
+        }
+        final oldNames = oldParentSchema.fields.map((f) => f.name).toSet();
+        final newNames = newParentSchema.fields.map((f) => f.name).toSet();
+        final tmpOps = <MigrationOperation>[
+          for (final oldField in oldParentSchema.fields)
+            if (!newNames.contains(oldField.name))
+              MigrationOperation(
+                type: MigrationType.removeField,
+                fieldName: oldField.name,
+              ),
+          for (final newField in newParentSchema.fields)
+            if (!oldNames.contains(newField.name))
+              MigrationOperation(
+                type: MigrationType.addField,
+                field: newField,
+              ),
+        ];
+        if (tmpOps.isNotEmpty) {
+          await _detectRenamedFields(oldParentSchema, newParentSchema, tmpOps);
+          for (final op in tmpOps) {
+            final pair = _extractFieldRenamePair(op);
+            if (pair != null) {
+              hints[pair.oldName] = pair.newName;
+            }
+          }
+        }
+        cacheTableFieldRenames(oldParentSchema, newParentSchema, [
+          for (final e in hints.entries)
+            MigrationOperation(
+              type: MigrationType.renameField,
+              fieldName: e.key,
+              newName: e.value,
+            ),
+        ]);
+      }
+
       // Handle renamed tables
       for (final entry in renamedTables.entries) {
         final oldTableName = entry.key;
@@ -1445,7 +1607,11 @@ class MigrationManager {
             oldSchema,
             newSchema,
             renamedTableTargets: renamedTableTargets,
+            renamedRefFieldsByTable: resolvedRefFieldsByTable,
+            onResolveRefFieldRenames:
+                resolveReferencedTableFieldRenamesOnDemand,
           );
+          cacheTableFieldRenames(oldSchema, newSchema, schemaOperations);
 
           // Generate final operations list
           final operations = <MigrationOperation>[];
@@ -1485,27 +1651,33 @@ class MigrationManager {
       // 2. Handle remaining tables
       int tablesUpdated = 0;
       int tablesCreated = 0;
+      final migrateYield = YieldController('MigrationManager.migrate');
 
       for (var schema in targetSchemas) {
+        final y = migrateYield.maybeYield();
+        if (y != null) await y;
         try {
           // Skip already processed renamed tables
-          if (renamedTables.values.any((s) => s.name == schema.name)) {
+          if (renamedNewNames.contains(schema.name)) {
             continue;
           }
 
-          if (existingTables.contains(schema.name) &&
-              !tablesToDrop.contains(schema.name)) {
+          if (existingTableSet.contains(schema.name) &&
+              !tablesToDropSet.contains(schema.name)) {
             // Migrate existing table
             final task = await _migrateExistingTable(
               schema,
               batchSize: batchSize,
               renamedTableTargets: renamedTableTargets,
+              renamedRefFieldsByTable: resolvedRefFieldsByTable,
+              onResolveRefFieldRenames:
+                  resolveReferencedTableFieldRenamesOnDemand,
             );
             if (task != null) {
               allTasks.add(task);
               tablesUpdated++;
             }
-          } else if (tablesToCreate.contains(schema.name)) {
+          } else if (tablesToCreateSet.contains(schema.name)) {
             // Create new table (isSystemTable already set at migrate entry)
             await _dataStore.createTable(
               schema,
@@ -2016,6 +2188,8 @@ class MigrationManager {
     TableSchema newSchema, {
     required int batchSize,
     Map<String, String> renamedTableTargets = const {},
+    Map<String, Map<String, String>>? renamedRefFieldsByTable,
+    Future<void> Function(String refTableName)? onResolveRefFieldRenames,
   }) async {
     final tableName = newSchema.name;
     final tableUid = newSchema.tableUid.isNotEmpty
@@ -2034,7 +2208,15 @@ class MigrationManager {
       oldSchema,
       newSchema,
       renamedTableTargets: renamedTableTargets,
+      renamedRefFieldsByTable: renamedRefFieldsByTable ?? const {},
+      onResolveRefFieldRenames: onResolveRefFieldRenames,
     );
+    if (renamedRefFieldsByTable != null && operations.isNotEmpty) {
+      final hints = _buildFieldRenameHints(operations);
+      if (hints.isNotEmpty) {
+        renamedRefFieldsByTable[newSchema.name] = hints;
+      }
+    }
 
     if (operations.isEmpty) {
       return null;
@@ -2153,8 +2335,13 @@ class MigrationManager {
       }
     }
     try {
+      final isDropTable =
+          _containsMigrationType(operations, MigrationType.dropTable);
+      final normalizedOperations = (oldSchema != null && !isDropTable)
+          ? _normalizeAndEnrichPrimaryKeyOps(operations, oldSchema)
+          : operations;
       var sortedOperations =
-          _sortOperations(List<MigrationOperation>.from(operations));
+          _sortOperations(List<MigrationOperation>.from(normalizedOperations));
       final renameOp = _findRenameOperation(sortedOperations);
 
       var fieldRenames = _buildFieldRenameHints(sortedOperations);
@@ -2177,8 +2364,6 @@ class MigrationManager {
         ]);
       }
 
-      final isDropTable =
-          _containsMigrationType(sortedOperations, MigrationType.dropTable);
       if (oldSchema != null && !isDropTable) {
         final indexTableCtx = await _requireTableContextByUid(tableUid);
         sortedOperations = await _foldRedundantMigrationOperations(
@@ -2214,8 +2399,10 @@ class MigrationManager {
           final prevLayout = latestPending.oldFieldLayoutSnapshot;
           if (prevLayout != null &&
               latestPending.targetSchemaSnapshot != null) {
-            final renameHints =
-                _buildFieldRenameHints(latestPending.operations);
+            final renameHints = _buildFieldRenameHints(
+              latestPending.operations,
+              includePrimaryKey: false,
+            );
             oldFieldLayout = schemaMgrForLayout?.evolveFieldStorageLayout(
               existingLayout: prevLayout,
               nextSchema: latestPending.targetSchemaSnapshot!,
@@ -2270,6 +2457,19 @@ class MigrationManager {
                 case MigrationType.renameField:
                 case MigrationType.modifyField:
                   final fieldName = op.fieldName ?? op.fieldUpdate?.name;
+                  if (op.type == MigrationType.renameField &&
+                      fieldName == oldSchema.primaryKey) {
+                    throw DbException([
+                      SchemaValidationStatus(
+                        type: ResultType.devInvalidSchemaPrimaryKey,
+                        message:
+                            'Cannot rename primary key field [$fieldName] using renameField on table [$tableName]. '
+                            'Please use renamePrimaryKey() or setPrimaryKeyConfig() instead.',
+                        tableName: tableName,
+                        field: fieldName,
+                      )
+                    ]);
+                  }
                   if (fieldName != null &&
                       !oldSchema.fields.any((f) => f.name == fieldName)) {
                     throw DbException([
@@ -2464,7 +2664,10 @@ class MigrationManager {
       FieldStorageLayout? targetFieldLayout;
       var enableDeletedSlotCompaction = false;
       if (!isDropTable && targetSchema != null && schemaMgrForLayout != null) {
-        final renameHints = _buildFieldRenameHints(sortedOperations);
+        final renameHints = _buildFieldRenameHints(
+          sortedOperations,
+          includePrimaryKey: false,
+        );
         final evolvedLayout = schemaMgrForLayout.evolveFieldStorageLayout(
           existingLayout: oldFieldLayout,
           nextSchema: targetSchema,
@@ -2502,15 +2705,6 @@ class MigrationManager {
       final cutoverPointer = _dataStore.walManager.currentPointer;
 
       final childIndexesToDrop = <TableUid, List<IndexUid>>{};
-
-      // Promote-only: enrich old PK config (SchemaBuilder may omit it).
-      // Non-promote: keep the existing list instance -- no map/alloc.
-      if (hasPromoteOp && oldSchema != null) {
-        sortedOperations = _enrichPromoteOperationsWithOldPk(
-          sortedOperations,
-          oldSchema,
-        );
-      }
 
       // Use pre-lock hint; under the exclusive lock counts/queries are unreliable.
       final promoteWithData =
@@ -2572,7 +2766,10 @@ class MigrationManager {
             oldWorkingLayout = schemaMgrForLayout?.evolveFieldStorageLayout(
               existingLayout: oldFieldLayout,
               nextSchema: oldWorkingSchema,
-              renameHints: _buildFieldRenameHints(siblingOps),
+              renameHints: _buildFieldRenameHints(
+                siblingOps,
+                includePrimaryKey: false,
+              ),
             );
 
             // Persist via normal cutover ritual (FK sync, rename side effects,
@@ -2776,6 +2973,9 @@ class MigrationManager {
 
       // Promote still needs read-cache drop (overlay / PK shape changed) even
       // though writeMode stays none and no in-place rewrite is scheduled.
+      final hasScheduledIndexBuild = !hasPromoteOp &&
+          task.writeMode != MigrationWriteMode.none &&
+          (task.specificIndexUids?.isNotEmpty ?? false);
       final needDataMigration =
           hasPromoteOp || task.forceDataMigration || needsTableWrite;
 
@@ -2785,6 +2985,7 @@ class MigrationManager {
           operations: sortedOperations,
           renameOp: renameOp,
           needDataMigration: needDataMigration,
+          applyInMemoryTransforms: !hasScheduledIndexBuild,
         );
       }
       if (!isDropTable) {
@@ -3064,13 +3265,35 @@ class MigrationManager {
       break;
     }
 
+    WalPointer? latestCutover;
+    final walCycle = _dataStore.config.logPartitionCycle;
+    for (final task in tasks) {
+      final ptr = task.schemaCutoverWalPointer;
+      if (ptr == null) {
+        latestCutover = null;
+        break;
+      }
+      if (latestCutover == null || ptr.isNewerThan(latestCutover, walCycle)) {
+        latestCutover = ptr;
+      }
+    }
+
+    var canonicalTableName = oldSchema.name;
+    for (final op in operations) {
+      if (op.type == MigrationType.renameTable && op.newTableName != null) {
+        canonicalTableName = op.newTableName!;
+      }
+    }
+
     return _RuntimeMigrationDescriptor(
       taskId: latest.taskId,
       tableUid: TableUid(latest.tableUid),
+      canonicalTableName: canonicalTableName,
       oldSchema: oldSchema,
       operations: operations,
+      orderedTasks: List<MigrationTask>.unmodifiable(tasks),
       oldFieldStruct: oldFieldStruct,
-      cutoverPointer: oldestWithSnapshot.schemaCutoverWalPointer,
+      cutoverPointer: latestCutover,
       currentSpaceCheckpointKey: checkpointKey,
       tableAliases: Set<String>.unmodifiable(aliases),
     );
@@ -3224,7 +3447,18 @@ class MigrationManager {
           table.tableUid, BackgroundWriteType.keyMigration);
 
       final currentTableName = targetSchema.name;
-      final fieldRenameHints = _buildFieldRenameHints(operations);
+      final fieldRenameHints = _buildFieldRenameHints(
+        operations,
+        includePrimaryKey: false,
+      );
+      final hasPkRename = operations.any((op) =>
+          op.type == MigrationType.setPrimaryKeyConfig &&
+          op.oldPrimaryKeyConfig != null &&
+          op.primaryKeyConfig != null &&
+          op.oldPrimaryKeyConfig!.name != op.primaryKeyConfig!.name);
+      final indexFieldRenameHints = hasPkRename
+          ? _buildFieldRenameHints(operations, includePrimaryKey: true)
+          : fieldRenameHints;
       final isTableRename = renameOp != null &&
           renameOp.newTableName != null &&
           tableName != currentTableName;
@@ -3250,6 +3484,7 @@ class MigrationManager {
           schema: schemaToSave,
           layoutOverride: fieldLayout,
           fieldRenameHints: fieldRenameHints,
+          indexFieldRenameHints: indexFieldRenameHints,
         );
       }
 
@@ -3302,19 +3537,141 @@ class MigrationManager {
     }
   }
 
-  Map<String, String> _buildFieldRenameHints(
-    List<MigrationOperation> operations,
+  /// Extract (oldName, newName) when [operation] renames a regular field or PK.
+  ({String oldName, String newName})? _extractFieldRenamePair(
+    MigrationOperation operation,
   ) {
-    // oldFieldName -> newFieldName (matches evolveFieldStorageLayout lookup)
+    if (operation.type == MigrationType.renameField &&
+        operation.fieldName != null &&
+        operation.newName != null) {
+      return (oldName: operation.fieldName!, newName: operation.newName!);
+    }
+    if (operation.type == MigrationType.setPrimaryKeyConfig) {
+      final oldPk = operation.oldPrimaryKeyConfig;
+      final newPk = operation.primaryKeyConfig;
+      if (oldPk != null && newPk != null && oldPk.name != newPk.name) {
+        return (oldName: oldPk.name, newName: newPk.name);
+      }
+    }
+    return null;
+  }
+
+  Map<String, String> _buildFieldRenameHints(
+    List<MigrationOperation> operations, {
+    bool includePrimaryKey = true,
+  }) {
+    // oldFieldName -> newFieldName (compose multi-hop non-cyclic renames).
     final hints = <String, String>{};
     for (final operation in operations) {
-      if (operation.type == MigrationType.renameField &&
+      final ({String oldName, String newName})? pair;
+      if (includePrimaryKey) {
+        pair = _extractFieldRenamePair(operation);
+      } else if (operation.type == MigrationType.renameField &&
           operation.fieldName != null &&
           operation.newName != null) {
-        hints[operation.fieldName!] = operation.newName!;
+        pair = (oldName: operation.fieldName!, newName: operation.newName!);
+      } else {
+        pair = null;
+      }
+      if (pair == null || pair.oldName == pair.newName) continue;
+
+      String? matchedKey;
+      List<String>? extraKeys;
+      if (hints.isNotEmpty) {
+        for (final entry in hints.entries) {
+          if (entry.value == pair.oldName) {
+            if (matchedKey == null) {
+              matchedKey = entry.key;
+            } else {
+              (extraKeys ??= <String>[]).add(entry.key);
+            }
+          }
+        }
+      }
+      if (matchedKey != null) {
+        if (matchedKey == pair.newName) {
+          hints.remove(matchedKey);
+        } else {
+          hints[matchedKey] = pair.newName;
+        }
+        if (extraKeys != null) {
+          for (final k in extraKeys) {
+            if (k == pair.newName) {
+              hints.remove(k);
+            } else {
+              hints[k] = pair.newName;
+            }
+          }
+        }
+      } else if (!hints.containsKey(pair.oldName)) {
+        hints[pair.oldName] = pair.newName;
       }
     }
     return hints;
+  }
+
+  List<MapEntry<String, String>> _buildOrderedFieldRenames(
+    List<MigrationOperation> operations,
+  ) {
+    final renames = <MapEntry<String, String>>[];
+    for (final operation in operations) {
+      final pair = _extractFieldRenamePair(operation);
+      if (pair != null) {
+        renames.add(MapEntry<String, String>(pair.oldName, pair.newName));
+      }
+    }
+    return renames;
+  }
+
+  /// Whether changing PK from [oldConfig] to [newConfig] alters key generation
+  /// or physical ordering and therefore requires a full table rewrite.
+  /// Pure PK field renames (same type and matcher) apply immediately without
+  /// rewriting table or index B+Tree files.
+  bool _isPrimaryKeyDataRewriteRequired(
+    PrimaryKeyConfig oldConfig,
+    PrimaryKeyConfig newConfig,
+  ) {
+    if (oldConfig.type != newConfig.type) {
+      return true;
+    }
+    if (oldConfig.getMatcherType() != newConfig.getMatcherType()) {
+      return true;
+    }
+    return false;
+  }
+
+  /// Update indexes, foreign keys, TTL, and capacity configs when a field
+  /// (regular or primary key) is renamed inside [schema].
+  TableSchema _propagateFieldRenameInSchema(
+    TableSchema schema,
+    String oldName,
+    String newName,
+  ) {
+    if (oldName == newName) return schema;
+    return schema.copyWith(
+      indexes: schema.indexes.map((idx) {
+        if (idx.fields.contains(oldName)) {
+          return idx.copyWith(
+            fields: idx.fields.map((f) => f == oldName ? newName : f).toList(),
+          );
+        }
+        return idx;
+      }).toList(),
+      foreignKeys: schema.foreignKeys.map((fk) {
+        if (fk.fields.contains(oldName)) {
+          return fk.copyWith(
+            fields: fk.fields.map((f) => f == oldName ? newName : f).toList(),
+          );
+        }
+        return fk;
+      }).toList(),
+      ttlConfig: schema.ttlConfig?.sourceField == oldName
+          ? schema.ttlConfig!.copyWith(sourceField: newName)
+          : schema.ttlConfig,
+      capacityConfig: schema.capacityConfig?.sourceField == oldName
+          ? schema.capacityConfig!.copyWith(sourceField: newName)
+          : schema.capacityConfig,
+    );
   }
 
   /// old indexName/actualIndexName -> new name (for stable indexUid inheritance).
@@ -3440,8 +3797,16 @@ class MigrationManager {
     for (final operation in operations) {
       switch (operation.type) {
         case MigrationType.modifyField:
-        case MigrationType.setPrimaryKeyConfig:
           return true;
+        case MigrationType.setPrimaryKeyConfig:
+          final oldPk = operation.oldPrimaryKeyConfig;
+          final newPk = operation.primaryKeyConfig;
+          if (oldPk == null ||
+              newPk == null ||
+              _isPrimaryKeyDataRewriteRequired(oldPk, newPk)) {
+            return true;
+          }
+          break;
         default:
           break;
       }
@@ -3508,15 +3873,7 @@ class MigrationManager {
     final indexesToBuild = <IndexUid>[];
 
     if (oldSchema != null && targetSchema != null) {
-      // Build field rename mapping: old field name -> new field name
-      final fieldRenames = <String, String>{};
-      for (final op in sortedOperations) {
-        if (op.type == MigrationType.renameField &&
-            op.fieldName != null &&
-            op.newName != null) {
-          fieldRenames[op.fieldName!] = op.newName!;
-        }
-      }
+      final fieldRenames = _buildFieldRenameHints(sortedOperations);
 
       final oldAllIndexes = <IndexSchema>[
         ...oldSchema.getAllIndexes(),
@@ -3769,10 +4126,10 @@ class MigrationManager {
         }
       } else if (operation.type == MigrationType.setPrimaryKeyConfig) {
         final newConfig = operation.primaryKeyConfig;
-        final oldConfig = oldSchema.primaryKeyConfig;
+        final oldConfig =
+            operation.oldPrimaryKeyConfig ?? oldSchema.primaryKeyConfig;
         if (newConfig != null &&
-            (newConfig.name != oldConfig.name ||
-                newConfig.type != oldConfig.type)) {
+            _isPrimaryKeyDataRewriteRequired(oldConfig, newConfig)) {
           return true;
         }
       }
@@ -3886,10 +4243,12 @@ class MigrationManager {
     }
 
     for (final operation in operations) {
+      if (_extractFieldRenamePair(operation) != null) {
+        return true;
+      }
       switch (operation.type) {
         case MigrationType.addField:
         case MigrationType.removeField:
-        case MigrationType.renameField:
         case MigrationType.renameTable:
           return true;
         default:
@@ -3917,10 +4276,51 @@ class MigrationManager {
     return false;
   }
 
+  /// Resolve referenced parent tables' renamed fields strictly on demand when
+  /// a child FK changed `referencedFields` before its parent was compared.
+  Future<void> _prepareMissingRefFieldRenamesForForeignKeys(
+    TableSchema oldSchema,
+    TableSchema newSchema,
+    Map<String, String> fieldRenames, {
+    required Map<String, Map<String, String>> renamedRefFieldsByTable,
+    required Future<void> Function(String refTableName)
+        onResolveRefFieldRenames,
+  }) async {
+    for (final newFk in newSchema.foreignKeys) {
+      final refName = newFk.referencedTable;
+      if (renamedRefFieldsByTable.containsKey(refName)) {
+        continue;
+      }
+      var hasRefFieldMismatch = false;
+      for (final oldFk in oldSchema.foreignKeys) {
+        if (oldFk.referencedTable != refName) continue;
+        final mappedFields = fieldRenames.isEmpty
+            ? oldFk.fields
+            : oldFk.fields
+                .map((f) => fieldRenames[f] ?? f)
+                .toList(growable: false);
+        if (oldFk.actualName == newFk.actualName ||
+            _areFieldListsEqual(mappedFields, newFk.fields)) {
+          if (!_areFieldListsEqual(
+              oldFk.referencedFields, newFk.referencedFields)) {
+            hasRefFieldMismatch = true;
+            break;
+          }
+        }
+      }
+      if (hasRefFieldMismatch) {
+        await onResolveRefFieldRenames(refName);
+      }
+    }
+  }
+
   /// Compare schemas and generate operations
   Future<List<MigrationOperation>> _compareSchemasAndGenerateOperations(
       TableSchema oldSchema, TableSchema newSchema,
-      {Map<String, String> renamedTableTargets = const {}}) async {
+      {Map<String, String> renamedTableTargets = const {},
+      Map<String, Map<String, String>> renamedRefFieldsByTable = const {},
+      Future<void> Function(String refTableName)?
+          onResolveRefFieldRenames}) async {
     final normalizedOldSchema = _normalizeSchemaForRenameAwareComparison(
       oldSchema,
       renamedTableTargets,
@@ -4031,8 +4431,32 @@ class MigrationManager {
     // Check indexes changes
     _compareIndexes(normalizedOldSchema, normalizedNewSchema, operations);
 
+    final Map<String, String>? fkFieldRenames =
+        (normalizedOldSchema.foreignKeys.isNotEmpty ||
+                normalizedNewSchema.foreignKeys.isNotEmpty)
+            ? _buildFieldRenameHints(operations)
+            : null;
+
+    if (onResolveRefFieldRenames != null &&
+        normalizedOldSchema.foreignKeys.isNotEmpty &&
+        normalizedNewSchema.foreignKeys.isNotEmpty) {
+      await _prepareMissingRefFieldRenamesForForeignKeys(
+        normalizedOldSchema,
+        normalizedNewSchema,
+        fkFieldRenames!,
+        renamedRefFieldsByTable: renamedRefFieldsByTable,
+        onResolveRefFieldRenames: onResolveRefFieldRenames,
+      );
+    }
+
     // Check foreign key changes
-    _compareForeignKeys(normalizedOldSchema, normalizedNewSchema, operations);
+    _compareForeignKeys(
+      normalizedOldSchema,
+      normalizedNewSchema,
+      operations,
+      renamedRefFieldsByTable: renamedRefFieldsByTable,
+      fieldRenamesOverride: fkFieldRenames,
+    );
 
     return operations;
   }
@@ -4244,15 +4668,7 @@ class MigrationManager {
     final oldIndexes = oldSchema.getAllIndexes();
     final newIndexes = newSchema.getAllIndexes();
 
-    // Build field rename mapping
-    final fieldRenames = <String, String>{};
-    for (final op in operations) {
-      if (op.type == MigrationType.renameField &&
-          op.fieldName != null &&
-          op.newName != null) {
-        fieldRenames[op.fieldName!] = op.newName!;
-      }
-    }
+    final fieldRenames = _buildFieldRenameHints(operations);
 
     // First mark all old effective indexes as to be removed
     final indexesToRemove = List<IndexSchema>.from(oldIndexes);
@@ -4460,12 +4876,27 @@ class MigrationManager {
   void _compareForeignKeys(
     TableSchema oldSchema,
     TableSchema newSchema,
-    List<MigrationOperation> operations,
-  ) {
-    final fieldRenames = _buildFieldRenameHints(operations);
+    List<MigrationOperation> operations, {
+    Map<String, Map<String, String>> renamedRefFieldsByTable = const {},
+    Map<String, String>? fieldRenamesOverride,
+  }) {
+    final fieldRenames =
+        fieldRenamesOverride ?? _buildFieldRenameHints(operations);
     // First mark all old foreign keys as to be removed
     final foreignKeysToRemove =
         List<ForeignKeySchema>.from(oldSchema.foreignKeys);
+
+    List<String> mapReferencedFields(
+        ForeignKeySchema oldFk, ForeignKeySchema newFk) {
+      final refRenames = renamedRefFieldsByTable[newFk.referencedTable] ??
+          renamedRefFieldsByTable[oldFk.referencedTable];
+      if (refRenames == null || refRenames.isEmpty) {
+        return oldFk.referencedFields;
+      }
+      return oldFk.referencedFields
+          .map((f) => refRenames[f] ?? f)
+          .toList(growable: false);
+    }
 
     // Check for added and modified foreign keys
     for (var newFk in newSchema.foreignKeys) {
@@ -4479,15 +4910,16 @@ class MigrationManager {
           break;
         }
       }
-      if (matchedOldFk == null && fieldRenames.isNotEmpty) {
+      if (matchedOldFk == null &&
+          (fieldRenames.isNotEmpty || renamedRefFieldsByTable.isNotEmpty)) {
         for (var oldFk in foreignKeysToRemove) {
           final mappedFields = oldFk.fields
               .map((f) => fieldRenames[f] ?? f)
               .toList(growable: false);
+          final mappedRefFields = mapReferencedFields(oldFk, newFk);
           if (_areFieldListsEqual(mappedFields, newFk.fields) &&
               oldFk.referencedTable == newFk.referencedTable &&
-              _areFieldListsEqual(
-                  oldFk.referencedFields, newFk.referencedFields)) {
+              _areFieldListsEqual(mappedRefFields, newFk.referencedFields)) {
             matchedOldFk = oldFk;
             break;
           }
@@ -4510,11 +4942,11 @@ class MigrationManager {
         final mappedOldFields = matchedOldFk.fields
             .map((f) => fieldRenames[f] ?? f)
             .toList(growable: false);
+        final mappedRefFields = mapReferencedFields(matchedOldFk, newFk);
         final coreDefinitionChanged =
             !_areFieldListsEqual(mappedOldFields, newFk.fields) ||
                 matchedOldFk.referencedTable != newFk.referencedTable ||
-                !_areFieldListsEqual(
-                    matchedOldFk.referencedFields, newFk.referencedFields);
+                !_areFieldListsEqual(mappedRefFields, newFk.referencedFields);
 
         if (coreDefinitionChanged) {
           // Core definition changed - this is a breaking change that requires manual handling
@@ -5410,7 +5842,10 @@ class MigrationManager {
         if (currentTask.targetFieldLayoutSnapshot == null) {
           final schemaMgr = _dataStore.tableMetaManager;
           if (schemaMgr != null) {
-            final renameHints = _buildFieldRenameHints(sortedOperations);
+            final renameHints = _buildFieldRenameHints(
+              sortedOperations,
+              includePrimaryKey: false,
+            );
             final evolved = schemaMgr.evolveFieldStorageLayout(
               existingLayout: currentTask.oldFieldLayoutSnapshot,
               nextSchema: currentTask.targetSchemaSnapshot!,
@@ -5534,6 +5969,7 @@ class MigrationManager {
         operations: sortedOperations,
         renameOp: renameOp,
         needDataMigration: needDataMigration,
+        applyInMemoryTransforms: false,
       );
 
       // get latest space priority order
@@ -5636,7 +6072,7 @@ class MigrationManager {
             }
 
             final cutover = currentTask.schemaCutoverWalPointer;
-            if (cutover != null) {
+            if (cutover != null && reusePrimaryInstance) {
               // Wait until the WAL checkpoint advances past schemaCutoverWalPointer.
               // This ensures all buffered legacy-shape writes are safely flushed to disk.
               // Actively drain WAL/journal -- a pure poll can hang forever when nothing
@@ -5750,6 +6186,9 @@ class MigrationManager {
               }
 
               final sourcePkName = sourceSchema.primaryKey;
+              final targetPkName =
+                  currentTask.targetSchemaSnapshot?.primaryKey ??
+                      migrationTableCtx.schema.primaryKey;
 
               final tableDataMeta = await migrationInstance.tableDataManager
                   .getTableDataMeta(migrationTableCtx.tableUid);
@@ -5771,6 +6210,12 @@ class MigrationManager {
               }
 
               final startCursor = currentTask.checkpointKeyForSpace(space);
+              final isMemoryMode = migrationInstance.config.persistenceMode ==
+                  PersistenceMode.memory;
+              final memoryShouldUpdateTableRecords = isMemoryMode &&
+                  (currentTask.writeMode != MigrationWriteMode.indexOnly ||
+                      sortedOperations
+                          .any((op) => _extractFieldRenamePair(op) != null));
 
               final writeMode =
                   currentTask.writeMode ?? MigrationWriteMode.tableAndIndex;
@@ -5785,7 +6230,10 @@ class MigrationManager {
                   currentTask.specificIndexUids != null &&
                   currentTask.specificIndexUids!.isNotEmpty) {
                 final isResume = startCursor != null && startCursor.isNotEmpty;
-                final spaceRecordCount = tableDataMeta?.totalRecordCount ?? 0;
+                final spaceRecordCount = isMemoryMode
+                    ? await migrationInstance.tableDataManager
+                        .getTableRecordCount(migrationTableCtx)
+                    : (tableDataMeta?.totalRecordCount ?? 0);
                 final targetSchema = await migrationInstance.tableMetaManager
                     ?.getTableSchema(migrationTableCtx.tableUid);
                 final liveIndexes = <IndexSchema>[
@@ -5868,6 +6316,28 @@ class MigrationManager {
                 }
               }
 
+              final bool memNeedsIndexUpdate = isMemoryMode &&
+                  (writeMode == MigrationWriteMode.indexOnly ||
+                      writeMode == MigrationWriteMode.tableAndIndex) &&
+                  migrationInstance.indexManager != null;
+              TableSchema? memIndexTargetSchema;
+              List<IndexSchema> memBtreeIndexes = const <IndexSchema>[];
+              List<IndexSchema> memNonBtreeIndexes = const <IndexSchema>[];
+              if (memNeedsIndexUpdate) {
+                memIndexTargetSchema = await migrationInstance.tableMetaManager
+                    ?.getTableSchema(migrationTableCtx.tableUid);
+                if (memIndexTargetSchema != null) {
+                  final resolvedMemIndexes = migrationInstance.indexManager!
+                      .resolveMemoryMigrationIndexes(
+                    migrationTableCtx,
+                    memIndexTargetSchema,
+                    specificIndexUids: specificIndexUids,
+                  );
+                  memBtreeIndexes = resolvedMemIndexes.btree;
+                  memNonBtreeIndexes = resolvedMemIndexes.nonBtree;
+                }
+              }
+
               await migrationInstance.queryExecutor.queryEachBatch(
                 migrationTableCtx,
                 batchSize: 1000,
@@ -5917,37 +6387,73 @@ class MigrationManager {
                   );
 
                   if (migratedRecords.isNotEmpty) {
-                    final yieldController = YieldController(
-                        'MigrationManager.toBackgroundScheduler',
-                        checkInterval: 64);
-
-                    for (int i = 0; i < migratedRecords.length; i++) {
-                      if (migrationController.isCancelled) {
-                        return false;
+                    if (isMemoryMode) {
+                      if (memoryShouldUpdateTableRecords) {
+                        await migrationInstance.tableDataManager
+                            .applyInMemoryMigratedRecords(
+                          migrationTableCtx,
+                          migratedRecords,
+                          sourcePkName: sourcePkName,
+                          targetPkName: targetPkName,
+                        );
                       }
-                      final y3 = yieldController.maybeYield();
-                      if (y3 != null) await y3;
-                      final be = migratedRecords[i];
-                      final pk = be.data[sourcePkName]?.toString() ?? '';
+                      if (memNeedsIndexUpdate && memIndexTargetSchema != null) {
+                        if (memBtreeIndexes.isNotEmpty) {
+                          await migrationInstance.indexManager!
+                              .applyInMemoryMigratedBtreeIndexes(
+                            migrationTableCtx,
+                            memIndexTargetSchema,
+                            migratedRecords,
+                            btreeIndexes: memBtreeIndexes,
+                          );
+                        }
+                        if (memNonBtreeIndexes.isNotEmpty) {
+                          await migrationInstance.indexManager!.writeChanges(
+                            table: migrationTableCtx,
+                            inserts: [
+                              for (final be in migratedRecords) be.data
+                            ],
+                            schemaOverride: memIndexTargetSchema,
+                            targetIndexesOverride: memNonBtreeIndexes,
+                          );
+                        }
+                      }
+                    } else {
+                      final yieldController = YieldController(
+                          'MigrationManager.toBackgroundScheduler',
+                          checkInterval: 64);
 
-                      final bgEntry = BackgroundWriteEntry(
-                        taskId: currentTask.taskId,
-                        tableUid: migrationTableCtx.tableUid,
-                        primaryKey: pk,
-                        type: BackgroundWriteType.schemaMigration,
-                        mode: writeMode,
-                        entry: be,
-                        specificIndexUids: specificIndexUids,
-                        currentCursor: currentCursor,
-                        nextCursor: nextCursor,
-                      );
+                      for (int i = 0; i < migratedRecords.length; i++) {
+                        if (migrationController.isCancelled) {
+                          return false;
+                        }
+                        final y3 = yieldController.maybeYield();
+                        if (y3 != null) await y3;
+                        final be = migratedRecords[i];
+                        final pk =
+                            (be.data[targetPkName] ?? be.data[sourcePkName])
+                                    ?.toString() ??
+                                '';
 
-                      migrationInstance.backgroundWriteScheduler
-                          .addEntry(bgEntry, pk);
+                        final bgEntry = BackgroundWriteEntry(
+                          taskId: currentTask.taskId,
+                          tableUid: migrationTableCtx.tableUid,
+                          primaryKey: pk,
+                          type: BackgroundWriteType.schemaMigration,
+                          mode: writeMode,
+                          entry: be,
+                          specificIndexUids: specificIndexUids,
+                          currentCursor: currentCursor,
+                          nextCursor: nextCursor,
+                        );
+
+                        migrationInstance.backgroundWriteScheduler
+                            .addEntry(bgEntry, pk);
+                      }
+
+                      migrationInstance.parallelJournalManager
+                          .scheduleFlushIfNeeded();
                     }
-
-                    migrationInstance.parallelJournalManager
-                        .scheduleFlushIfNeeded();
                   }
 
                   return true;
@@ -5960,7 +6466,10 @@ class MigrationManager {
 
               // Ensure all migration data is physically persisted before marking complete.
               // flushCompletely() waits until the PJM queue is fully drained to disk.
-              await migrationInstance.parallelJournalManager.flushCompletely();
+              if (!isMemoryMode) {
+                await migrationInstance.parallelJournalManager
+                    .flushCompletely();
+              }
 
               // Unlock isBuilding = false after this space's rebuild finishes.
               // Use task-snapshot type when live schema no longer lists the uid
@@ -6255,7 +6764,7 @@ class MigrationManager {
       return;
     }
 
-    final fieldRenames = _buildOldToNewFieldRenameMap(operations);
+    final fieldRenames = _buildFieldRenameHints(operations);
     final targetByUid = <IndexUid, IndexSchema>{
       for (final index in targetIndexes)
         if (index.indexUid.isNotEmpty) index.indexUid: index,
@@ -6282,6 +6791,18 @@ class MigrationManager {
         }
         bool typeChanged = false;
         for (final oldFieldName in oldIndex.fields) {
+          final newFieldName = fieldRenames[oldFieldName] ?? oldFieldName;
+          final oldIsPk = oldFieldName == oldSchema.primaryKey;
+          final newIsPk = newFieldName == targetSchema.primaryKey;
+          if (oldIsPk || newIsPk) {
+            if (oldIsPk != newIsPk ||
+                oldSchema.primaryKeyConfig.type !=
+                    targetSchema.primaryKeyConfig.type) {
+              typeChanged = true;
+              break;
+            }
+            continue;
+          }
           FieldSchema? oldField;
           for (final f in oldSchema.fields) {
             if (f.name == oldFieldName) {
@@ -6289,7 +6810,6 @@ class MigrationManager {
               break;
             }
           }
-          final newFieldName = fieldRenames[oldFieldName] ?? oldFieldName;
           FieldSchema? targetField;
           for (final f in targetSchema.fields) {
             if (f.name == newFieldName) {
@@ -6458,7 +6978,7 @@ class MigrationManager {
     }
 
     final fieldOps = operations.where((op) {
-      return op.type == MigrationType.renameField ||
+      return _extractFieldRenamePair(op) != null ||
           op.type == MigrationType.removeField;
     }).toList(growable: false);
 
@@ -6473,14 +6993,13 @@ class MigrationManager {
       var childChanged = false;
 
       for (final op in fieldOps) {
-        if (op.type == MigrationType.renameField &&
-            op.fieldName != null &&
-            op.newName != null) {
+        final renamePair = _extractFieldRenamePair(op);
+        if (renamePair != null) {
           final renamed = _applyParentFieldRenameToChildSchema(
             updatedChildSchema,
             parentNames,
-            op.fieldName!,
-            op.newName!,
+            renamePair.oldName,
+            renamePair.newName,
           );
           if (renamed != null) {
             updatedChildSchema = renamed;
@@ -6620,20 +7139,6 @@ class MigrationManager {
       return null;
     }
     return childSchema.copyWith(foreignKeys: updatedForeignKeys);
-  }
-
-  Map<String, String> _buildOldToNewFieldRenameMap(
-    List<MigrationOperation> operations,
-  ) {
-    final renames = <String, String>{};
-    for (final operation in operations) {
-      if (operation.type == MigrationType.renameField &&
-          operation.fieldName != null &&
-          operation.newName != null) {
-        renames[operation.fieldName!] = operation.newName!;
-      }
-    }
-    return renames;
   }
 
   IndexSchema? _findIndexAfterFieldRename(
@@ -6802,34 +7307,71 @@ class MigrationManager {
     }
   }
 
-  /// Fill [MigrationOperation.oldPrimaryKeyConfig] on promote ops when omitted.
-  /// Returns the original list when nothing needs enrichment.
-  List<MigrationOperation> _enrichPromoteOperationsWithOldPk(
+  /// Resolve [SchemaBuilder.renamePrimaryKey] shorthand and fill missing
+  /// [MigrationOperation.oldPrimaryKeyConfig] on [setPrimaryKeyConfig] and
+  /// [promoteFieldToPrimaryKey] ops from [oldSchema].
+  /// Returns the original list when nothing needs normalization.
+  List<MigrationOperation> _normalizeAndEnrichPrimaryKeyOps(
     List<MigrationOperation> operations,
     TableSchema oldSchema,
   ) {
     var needsEnrich = false;
     for (final op in operations) {
-      if (op.type == MigrationType.promoteFieldToPrimaryKey &&
-          op.oldPrimaryKeyConfig == null) {
+      if ((op.type == MigrationType.setPrimaryKeyConfig &&
+              (op.primaryKeyConfig == null ||
+                  op.oldPrimaryKeyConfig == null)) ||
+          (op.type == MigrationType.promoteFieldToPrimaryKey &&
+              op.oldPrimaryKeyConfig == null)) {
         needsEnrich = true;
         break;
       }
     }
     if (!needsEnrich) return operations;
 
+    var currentPk = oldSchema.primaryKeyConfig;
     return [
       for (final op in operations)
-        if (op.type == MigrationType.promoteFieldToPrimaryKey &&
+        if (op.type == MigrationType.setPrimaryKeyConfig &&
+            (op.primaryKeyConfig == null || op.oldPrimaryKeyConfig == null))
+          () {
+            final oldPk = op.oldPrimaryKeyConfig ?? currentPk;
+            final PrimaryKeyConfig? newPk = op.primaryKeyConfig ??
+                (op.newName != null
+                    ? currentPk.copyWith(name: op.newName!)
+                    : null);
+            if (newPk != null) {
+              currentPk = newPk;
+            }
+            return MigrationOperation(
+              type: op.type,
+              newName: op.newName,
+              primaryKeyConfig: newPk,
+              oldPrimaryKeyConfig: oldPk,
+            );
+          }()
+        else if (op.type == MigrationType.setPrimaryKeyConfig)
+          () {
+            if (op.primaryKeyConfig != null) {
+              currentPk = op.primaryKeyConfig!;
+            }
+            return op;
+          }()
+        else if (op.type == MigrationType.promoteFieldToPrimaryKey &&
             op.oldPrimaryKeyConfig == null)
-          MigrationOperation(
-            type: op.type,
-            fieldName: op.fieldName,
-            sourceFieldId: op.sourceFieldId,
-            primaryKeyConfig: op.primaryKeyConfig,
-            oldPrimaryKeyConfig: oldSchema.primaryKeyConfig,
-            discardOldPrimaryKey: op.discardOldPrimaryKey ?? true,
-          )
+          () {
+            final updated = MigrationOperation(
+              type: op.type,
+              fieldName: op.fieldName,
+              sourceFieldId: op.sourceFieldId,
+              primaryKeyConfig: op.primaryKeyConfig,
+              oldPrimaryKeyConfig: currentPk,
+              discardOldPrimaryKey: op.discardOldPrimaryKey ?? true,
+            );
+            if (op.primaryKeyConfig != null) {
+              currentPk = op.primaryKeyConfig!;
+            }
+            return updated;
+          }()
         else
           op,
     ];
@@ -6860,7 +7402,69 @@ class MigrationManager {
     operations.sort((a, b) =>
         (typePriority[a.type] ?? 99).compareTo(typePriority[b.type] ?? 99));
 
-    return operations;
+    // When a PK rename targets a name freed in the same batch (via
+    // removeField/renameField), move those freeing operations ahead of
+    // setPrimaryKeyConfig so target names never collide mid-batch.
+    final pkTargetNames = <String>{};
+    for (final op in operations) {
+      if (op.type == MigrationType.setPrimaryKeyConfig) {
+        final newPkName = op.primaryKeyConfig?.name ?? op.newName;
+        final oldPkName = op.oldPrimaryKeyConfig?.name;
+        if (newPkName != null &&
+            (oldPkName == null || oldPkName != newPkName)) {
+          pkTargetNames.add(newPkName);
+        }
+      }
+    }
+    if (pkTargetNames.isEmpty) {
+      return operations;
+    }
+
+    final namesToFree = Set<String>.from(pkTargetNames);
+    final prePkIndicesReversed = <int>[];
+    final prePkSet = <int>{};
+    var progress = true;
+    while (progress) {
+      progress = false;
+      for (var i = 0; i < operations.length; i++) {
+        if (prePkSet.contains(i)) continue;
+        final op = operations[i];
+        if ((op.type == MigrationType.removeField ||
+                op.type == MigrationType.renameField) &&
+            op.fieldName != null &&
+            namesToFree.contains(op.fieldName)) {
+          prePkSet.add(i);
+          prePkIndicesReversed.add(i);
+          if (op.type == MigrationType.renameField && op.newName != null) {
+            namesToFree.add(op.newName!);
+          }
+          progress = true;
+        }
+      }
+    }
+    if (prePkSet.isEmpty) {
+      return operations;
+    }
+
+    final reordered = <MigrationOperation>[];
+    for (var i = prePkIndicesReversed.length - 1; i >= 0; i--) {
+      final op = operations[prePkIndicesReversed[i]];
+      if (op.type == MigrationType.removeField) {
+        reordered.add(op);
+      }
+    }
+    for (var i = prePkIndicesReversed.length - 1; i >= 0; i--) {
+      final op = operations[prePkIndicesReversed[i]];
+      if (op.type == MigrationType.renameField) {
+        reordered.add(op);
+      }
+    }
+    for (var i = 0; i < operations.length; i++) {
+      if (!prePkSet.contains(i)) {
+        reordered.add(operations[i]);
+      }
+    }
+    return reordered;
   }
 
   /// Backfill one space for promoteFieldToPrimaryKey (old -> shadow via upsert).
@@ -8055,10 +8659,10 @@ class MigrationManager {
           break;
         case MigrationType.setPrimaryKeyConfig:
           final newConfig = op.primaryKeyConfig;
-          final oldConfig = oldSchema.primaryKeyConfig;
+          final oldConfig =
+              op.oldPrimaryKeyConfig ?? oldSchema.primaryKeyConfig;
           if (newConfig != null &&
-              (newConfig.name != oldConfig.name ||
-                  newConfig.type != oldConfig.type)) {
+              _isPrimaryKeyDataRewriteRequired(oldConfig, newConfig)) {
             if (recordCount > 0 && !isAllowed) {
               throw DbException([
                 SchemaValidationStatus(
@@ -8076,7 +8680,7 @@ class MigrationManager {
               ]);
             }
             Logger.warn(
-              'Data migration required: changing primary key name or type.',
+              'Data migration required: changing primary key type or ordering.',
             );
             return true;
           }
@@ -8135,6 +8739,7 @@ class MigrationManager {
     required List<MigrationOperation> operations,
     required MigrationOperation? renameOp,
     required bool needDataMigration,
+    bool applyInMemoryTransforms = true,
   }) async {
     // Always resolve by stable tableUid: rename cutover drops the old name
     // from inventory, and cache keys are uid-based.
@@ -8143,6 +8748,38 @@ class MigrationManager {
     final table = await _tableContextForUid(tableUid);
     if (table == null) {
       return;
+    }
+
+    final shouldInvalidateIdGen = operations.any((op) {
+      if (op.type == MigrationType.promoteFieldToPrimaryKey) {
+        return true;
+      }
+      if (op.type == MigrationType.setPrimaryKeyConfig &&
+          op.primaryKeyConfig != null &&
+          op.oldPrimaryKeyConfig != null) {
+        final newPk = op.primaryKeyConfig!;
+        final oldPk = op.oldPrimaryKeyConfig!;
+        return !_arePrimaryKeyConfigsEqual(
+          oldPk.copyWith(name: newPk.name),
+          newPk,
+        );
+      }
+      return false;
+    });
+    if (shouldInvalidateIdGen) {
+      _dataStore.tableDataManager.invalidateIdGeneratorForTable(table.tableUid);
+    }
+
+    if (applyInMemoryTransforms &&
+        !needDataMigration &&
+        _dataStore.config.persistenceMode == PersistenceMode.memory) {
+      final orderedRenames = _buildOrderedFieldRenames(operations);
+      if (orderedRenames.isNotEmpty) {
+        await _dataStore.tableDataManager.applyInMemoryRecordRenames(
+          table,
+          orderedRenames,
+        );
+      }
     }
 
     if (renameOp != null || needDataMigration) {
@@ -8270,37 +8907,7 @@ class MigrationManager {
             // For auto-generated (mobile) tasks, we stay strict as the user's
             // declarative definition is expected to be complete and consistent.
             if (!isAutoGenerated) {
-              result = result.copyWith(
-                // Update indexes
-                indexes: result.indexes.map((idx) {
-                  if (idx.fields.contains(oldName)) {
-                    return idx.copyWith(
-                      fields: idx.fields
-                          .map((f) => f == oldName ? newName : f)
-                          .toList(),
-                    );
-                  }
-                  return idx;
-                }).toList(),
-                // Update foreign keys
-                foreignKeys: result.foreignKeys.map((fk) {
-                  if (fk.fields.contains(oldName)) {
-                    return fk.copyWith(
-                      fields: fk.fields
-                          .map((f) => f == oldName ? newName : f)
-                          .toList(),
-                    );
-                  }
-                  return fk;
-                }).toList(),
-                // Update TTL / capacity source fields
-                ttlConfig: result.ttlConfig?.sourceField == oldName
-                    ? result.ttlConfig!.copyWith(sourceField: newName)
-                    : result.ttlConfig,
-                capacityConfig: result.capacityConfig?.sourceField == oldName
-                    ? result.capacityConfig!.copyWith(sourceField: newName)
-                    : result.capacityConfig,
-              );
+              result = _propagateFieldRenameInSchema(result, oldName, newName);
             }
           }
           break;
@@ -8431,7 +9038,15 @@ class MigrationManager {
           break;
         case MigrationType.setPrimaryKeyConfig:
           if (op.primaryKeyConfig != null) {
+            final oldPkName = op.oldPrimaryKeyConfig?.name ?? result.primaryKey;
             result = result.copyWith(primaryKeyConfig: op.primaryKeyConfig);
+            if (!isAutoGenerated && oldPkName != op.primaryKeyConfig!.name) {
+              result = _propagateFieldRenameInSchema(
+                result,
+                oldPkName,
+                op.primaryKeyConfig!.name,
+              );
+            }
           }
           break;
         case MigrationType.setTableTtlConfig:
@@ -8533,8 +9148,18 @@ class MigrationManager {
     TableSchema? declaredTargetSchema,
   }) async {
     final folded = <MigrationOperation>[];
+    var currentTableName = effectiveSchema.name;
+    var tableBeforeLastConsecutiveRename = currentTableName;
+    var currentPkConfig = effectiveSchema.primaryKeyConfig;
+    var pkBeforeLastConsecutiveSet = currentPkConfig;
 
     for (final op in operations) {
+      if (op.type != MigrationType.renameTable) {
+        tableBeforeLastConsecutiveRename = currentTableName;
+      }
+      if (op.type != MigrationType.setPrimaryKeyConfig) {
+        pkBeforeLastConsecutiveSet = currentPkConfig;
+      }
       switch (op.type) {
         case MigrationType.addField:
           final field = op.field;
@@ -8591,6 +9216,18 @@ class MigrationManager {
           if (fromName == null || toName == null) {
             folded.add(op);
             break;
+          }
+          if (!isAutoGenerated && fromName == effectiveSchema.primaryKey) {
+            throw DbException([
+              SchemaValidationStatus(
+                type: ResultType.devInvalidSchemaPrimaryKey,
+                message:
+                    'Cannot rename primary key field [$fromName] using renameField on table [$tableName]. '
+                    'Please use renamePrimaryKey() or setPrimaryKeyConfig() instead.',
+                tableName: tableName,
+                field: fromName,
+              ),
+            ]);
           }
           if (_findFieldByName(effectiveSchema, fromName) == null) {
             if (_findFieldByName(effectiveSchema, toName) != null) {
@@ -8897,9 +9534,22 @@ class MigrationManager {
             folded.add(op);
             break;
           }
-          if (effectiveSchema.name == newName) {
+          if (currentTableName == newName) {
             break;
           }
+          if (folded.isNotEmpty &&
+              folded.last.type == MigrationType.renameTable) {
+            if (tableBeforeLastConsecutiveRename == newName) {
+              folded.removeLast();
+              currentTableName = tableBeforeLastConsecutiveRename;
+              break;
+            }
+            folded[folded.length - 1] = op;
+            currentTableName = newName;
+            break;
+          }
+          tableBeforeLastConsecutiveRename = currentTableName;
+          currentTableName = newName;
           folded.add(op);
           break;
 
@@ -8909,18 +9559,31 @@ class MigrationManager {
             folded.add(op);
             break;
           }
-          if (_arePrimaryKeyConfigsEqual(
-              effectiveSchema.primaryKeyConfig, newConfig)) {
+          if (_arePrimaryKeyConfigsEqual(currentPkConfig, newConfig)) {
+            break;
+          }
+          if (folded.isNotEmpty &&
+              folded.last.type == MigrationType.setPrimaryKeyConfig) {
+            if (_arePrimaryKeyConfigsEqual(
+                pkBeforeLastConsecutiveSet, newConfig)) {
+              folded.removeLast();
+              currentPkConfig = pkBeforeLastConsecutiveSet;
+              break;
+            }
+            folded[folded.length - 1] = op;
+            currentPkConfig = newConfig;
             break;
           }
           if (isAutoGenerated &&
               declaredTargetSchema != null &&
               _arePrimaryKeyConfigsEqual(
-                effectiveSchema.primaryKeyConfig,
+                currentPkConfig,
                 declaredTargetSchema.primaryKeyConfig,
               )) {
             break;
           }
+          pkBeforeLastConsecutiveSet = currentPkConfig;
+          currentPkConfig = newConfig;
           folded.add(op);
           break;
 
@@ -9182,7 +9845,23 @@ class MigrationManager {
     PrimaryKeyConfig a,
     PrimaryKeyConfig b,
   ) {
-    return a.name == b.name && a.type == b.type;
+    if (a.name != b.name || a.type != b.type || a.isOrdered != b.isOrdered) {
+      return false;
+    }
+    if (a.type == PrimaryKeyType.sequential) {
+      final ac = a.sequentialConfig;
+      final bc = b.sequentialConfig;
+      final aInit = ac?.initialValue ?? 1;
+      final bInit = bc?.initialValue ?? 1;
+      final aInc = ac?.increment ?? 1;
+      final bInc = bc?.increment ?? 1;
+      final aRand = ac?.useRandomIncrement ?? false;
+      final bRand = bc?.useRandomIncrement ?? false;
+      if (aInit != bInit || aInc != bInc || aRand != bRand) {
+        return false;
+      }
+    }
+    return true;
   }
 
   bool _areTtlConfigsEqual(TableTtlConfig? a, TableTtlConfig? b) {
@@ -9625,16 +10304,26 @@ class MigrationManager {
           targetSchema: triggerTask.targetSchemaSnapshot,
         );
 
-    final triggerIsPkChange = triggerTask.operations.any(
-      (op) =>
-          op.type == MigrationType.setPrimaryKeyConfig ||
-          op.type == MigrationType.promoteFieldToPrimaryKey,
-    );
+    final triggerIsPkChange = triggerTask.operations.any((op) {
+      if (op.type == MigrationType.promoteFieldToPrimaryKey) {
+        return true;
+      }
+      if (op.type == MigrationType.setPrimaryKeyConfig) {
+        final oldPk = op.oldPrimaryKeyConfig;
+        final newPk = op.primaryKeyConfig;
+        return oldPk == null ||
+            newPk == null ||
+            _isPrimaryKeyDataRewriteRequired(oldPk, newPk);
+      }
+      return false;
+    });
 
     final triggerChangesRecordShape = triggerTask.operations.any(
       (op) =>
           op.type == MigrationType.removeField ||
-          op.type == MigrationType.renameField,
+          op.type == MigrationType.renameField ||
+          (op.type == MigrationType.setPrimaryKeyConfig &&
+              op.oldPrimaryKeyConfig?.name != op.primaryKeyConfig?.name),
     );
 
     if (!triggerNeedsTableWrite &&
@@ -9827,9 +10516,11 @@ class _TaskStats {
 class _RuntimeMigrationDescriptor {
   final String taskId;
   final TableUid tableUid;
+  final String canonicalTableName;
   final Set<String> tableAliases;
   final TableSchema oldSchema;
   final List<MigrationOperation> operations;
+  final List<MigrationTask> orderedTasks;
   final List<FieldStructure> oldFieldStruct;
   final WalPointer? cutoverPointer;
   final Uint8List? currentSpaceCheckpointKey;
@@ -9837,9 +10528,11 @@ class _RuntimeMigrationDescriptor {
   const _RuntimeMigrationDescriptor({
     required this.taskId,
     required this.tableUid,
+    required this.canonicalTableName,
     required this.tableAliases,
     required this.oldSchema,
     required this.operations,
+    required this.orderedTasks,
     required this.oldFieldStruct,
     required this.cutoverPointer,
     required this.currentSpaceCheckpointKey,

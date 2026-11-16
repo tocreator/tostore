@@ -172,7 +172,7 @@ class BenchmarkConfig {
 
   const BenchmarkConfig({
     this.tier = BenchmarkTier.simple,
-    this.scale = 10000,
+    this.scale = 100000,
     this.iterations = 3,
     this.operations = BenchmarkOperation.defaultScalarOps,
     this.durability = RecoveryDurability.standard,

@@ -89,7 +89,7 @@ Fügen Sie `tostore` zu Ihrem `pubspec.yaml` hinzu:
 
 ```yaml
 dependencies:
-  tostore: ^3.6.1
+  tostore: ^3.6.2
 ```
 
 ### For AI Coding Assistants
