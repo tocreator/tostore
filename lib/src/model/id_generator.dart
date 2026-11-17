@@ -1672,7 +1672,9 @@ class GlobalIdGenerator {
 
   static const int _sequenceMask = (1 << _sequenceBits) - 1;
   static const int _nodeMask = (1 << _nodeBits) - 1;
-  static const int _timestampMask = (1 << _timestampBits) - 1;
+  // BigInt mask prevents 32-bit shift constant overflow (`1 << 36 == 0`) in dart2js.
+  static final BigInt _timestampMaskBig =
+      (BigInt.one << _timestampBits) - BigInt.one;
 
   // Custom Epoch: 2026-01-01 00:00:00 UTC (1767225600 seconds)
   static const int _epochStartSeconds = 1767225600;
@@ -1793,7 +1795,7 @@ class GlobalIdGenerator {
     _lastTimestampSec = timestamp;
 
     // Assemble 72 bits unsigned value using BigInt
-    final BigInt timestampBig = BigInt.from(timestamp & _timestampMask);
+    final BigInt timestampBig = BigInt.from(timestamp) & _timestampMaskBig;
     final BigInt nodeBig = BigInt.from(_nodeId & _nodeMask);
     final BigInt seqBig = BigInt.from(_sequence & _sequenceMask);
 

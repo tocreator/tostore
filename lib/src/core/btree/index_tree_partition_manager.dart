@@ -706,8 +706,8 @@ final class IndexTreePartitionManager {
             stats.oldFileSizeInBytes = local.totalSizeBytes;
             stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
             stats.oldFreePageCount = local.freePageCount;
-            stats.oldFlushBatchKey = local.lastFlushBatchKey;
-            stats.oldMaintBatchKey = local.lastMaintenanceBatchKey;
+            stats.oldFlushBatchKey = local.flushBatchKey;
+            stats.oldMaintBatchKey = local.maintenanceBatchKey;
             stats.freeListHeadPageNo = local.freeListHeadPageNo;
             stats.freePageCount = local.freePageCount;
             if (batchContext != null && batchContext.batchId.isNotEmpty) {
@@ -1474,8 +1474,8 @@ final class IndexTreePartitionManager {
               stats.oldFileSizeInBytes = local.totalSizeBytes;
               stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
               stats.oldFreePageCount = local.freePageCount;
-              stats.oldFlushBatchKey = local.lastFlushBatchKey;
-              stats.oldMaintBatchKey = local.lastMaintenanceBatchKey;
+              stats.oldFlushBatchKey = local.flushBatchKey;
+              stats.oldMaintBatchKey = local.maintenanceBatchKey;
               stats.freeListHeadPageNo = local.freeListHeadPageNo;
               stats.freePageCount = local.freePageCount;
               if (batchContext != null && batchContext.batchId.isNotEmpty) {
@@ -1593,8 +1593,8 @@ final class IndexTreePartitionManager {
               p0Stats.oldFileSizeInBytes = local.totalSizeBytes;
               p0Stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
               p0Stats.oldFreePageCount = local.freePageCount;
-              p0Stats.oldFlushBatchKey = local.lastFlushBatchKey;
-              p0Stats.oldMaintBatchKey = local.lastMaintenanceBatchKey;
+              p0Stats.oldFlushBatchKey = local.flushBatchKey;
+              p0Stats.oldMaintBatchKey = local.maintenanceBatchKey;
               p0Stats.freeListHeadPageNo = local.freeListHeadPageNo;
               p0Stats.freePageCount = local.freePageCount;
               if (batchContext != null && batchContext.batchId.isNotEmpty) {
@@ -1841,8 +1841,8 @@ final class IndexTreePartitionManager {
           if (local != null) {
             s.oldFileSizeInBytes = local.totalSizeBytes;
             s.oldTotalEntries = local.totalEntryCount;
-            s.oldFlushBatchKey = local.lastFlushBatchKey;
-            s.oldMaintBatchKey = local.lastMaintenanceBatchKey;
+            s.oldFlushBatchKey = local.flushBatchKey;
+            s.oldMaintBatchKey = local.maintenanceBatchKey;
             s.freeListHeadPageNo = local.freeListHeadPageNo;
             s.freePageCount = local.freePageCount;
           }
@@ -2747,8 +2747,8 @@ final class _IndexPartitionStats {
   bool headerLoaded = false;
   int oldTotalEntries = 0;
   int oldFileSizeInBytes = 0;
-  int oldFlushBatchKey = 0;
-  int oldMaintBatchKey = 0;
+  BatchKey64 oldFlushBatchKey = BatchKey64.zero;
+  BatchKey64 oldMaintBatchKey = BatchKey64.zero;
   bool alreadyDurableForBatch = false;
 
   // Freelist state (per-partition).

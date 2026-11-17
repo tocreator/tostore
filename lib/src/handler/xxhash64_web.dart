@@ -137,4 +137,15 @@ class XXHash64 {
     out.setUint32(offset, lo, Endian.little);
     out.setUint32(offset + 4, hi, Endian.little);
   }
+
+  /// Verifies the XXH64 digest stored as 8 little-endian bytes at [offset]
+  /// without lossy 53-bit JS Number conversion.
+  static bool verifyHashLE(Uint8List data, ByteData headerBd, int offset,
+      [int seed = 0]) {
+    final h = _digest(data, seed);
+    final lo = (h & _mask32).toInt();
+    final hi = ((h >> 32) & _mask32).toInt();
+    return headerBd.getUint32(offset, Endian.little) == lo &&
+        headerBd.getUint32(offset + 4, Endian.little) == hi;
+  }
 }

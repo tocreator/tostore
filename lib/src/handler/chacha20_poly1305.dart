@@ -1121,11 +1121,12 @@ class ChaCha20Poly1305 {
     return tag;
   }
 
-  /// Reproduces the pre-fix Web JS (`dart2js`) Poly1305 MAC calculation for
+  /// Reproduces the pre-fix Web JS (`dart2js` / DDC) Poly1305 MAC calculation for
   /// decrypt-only backward compatibility across JS, Wasm, and Native VM.
   ///
-  /// Uses IEEE-754 [double] accumulators and explicit low-32-bit shifts (`>>> 26`)
-  /// so VM/Wasm can also decode ciphertexts created by older Web JS builds.
+  /// Uses IEEE-754 [double] accumulators, explicit low-32-bit shifts (`>>> 26`),
+  /// and unpropagated final 32-bit additions (matching `>> 32 == 0` in Dart Web
+  /// JS) so VM, Wasm, and current JS builds can decode legacy Web JS ciphertexts.
   static Uint8List _poly1305MacLegacyJs(
       Uint8List msg, Uint8List aad, Uint8List key) {
     final k = ByteData.sublistView(key);
@@ -1310,16 +1311,13 @@ class ChaCha20Poly1305 {
     final int f2 = ((fh2 >>> 12) | (fh3 << 14)) & 0xFFFFFFFF;
     final int f3 = ((fh3 >>> 18) | (fh4 << 8)) & 0xFFFFFFFF;
 
-    int r_0 = f0 + s_0;
-    int c = (r_0 / 0x100000000).floor();
-    r_0 &= 0xFFFFFFFF;
-    int r_1 = f1 + s_1 + c;
-    c = (r_1 / 0x100000000).floor();
-    r_1 &= 0xFFFFFFFF;
-    int r_2 = f2 + s_2 + c;
-    c = (r_2 / 0x100000000).floor();
-    r_2 &= 0xFFFFFFFF;
-    int r_3 = (f3 + s_3 + c) & 0xFFFFFFFF;
+    // Pre-fix Web JS (`dart2js` / DDC) computed `c = r_i >> 32`, which in
+    // Dart Web JS evaluates to 0 for any shift > 31, never propagating carries
+    // across the four 32-bit limbs.
+    final int r_0 = (f0 + s_0) & 0xFFFFFFFF;
+    final int r_1 = (f1 + s_1) & 0xFFFFFFFF;
+    final int r_2 = (f2 + s_2) & 0xFFFFFFFF;
+    final int r_3 = (f3 + s_3) & 0xFFFFFFFF;
 
     final tag = Uint8List(16);
     final tagBd = tag.buffer.asByteData();

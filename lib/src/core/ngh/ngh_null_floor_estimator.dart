@@ -39,9 +39,35 @@ abstract final class NghNullFloorEstimator {
     return m < 64 ? 64 : m;
   }
 
-  /// Deterministic seed from index identity and corpus size.
+  /// Deterministic 32-bit FNV-1a seed from index identity and corpus size.
+  ///
+  /// Uses 16-bit split multiplication so intermediate products stay well below
+  /// 2^53 and match bit-for-bit across VM, Wasm, and dart2js.
   static int seedFor(String indexUid, int totalVectors) {
-    return indexUid.hashCode ^ totalVectors;
+    int fnvMix(int h, int byteVal) {
+      final x = (h ^ (byteVal & 0xFF)) & 0xFFFFFFFF;
+      final lo = x & 0xFFFF;
+      final hi = (x >>> 16) & 0xFFFF;
+      final loTerm = lo * 16777619;
+      final hiTerm = ((hi * 16777619) & 0xFFFF) * 65536;
+      return (loTerm + hiTerm) & 0xFFFFFFFF;
+    }
+
+    var hash = 2166136261;
+    final units = indexUid.codeUnits;
+    for (int i = 0; i < units.length; i++) {
+      final unit = units[i];
+      if (unit <= 0x7F) {
+        hash = fnvMix(hash, unit);
+      } else {
+        hash = fnvMix(hash, unit & 0xFF);
+        hash = fnvMix(hash, (unit >>> 8) & 0xFF);
+      }
+    }
+    hash = fnvMix(hash, totalVectors & 0xFF);
+    hash = fnvMix(hash, (totalVectors >>> 8) & 0xFF);
+    hash = fnvMix(hash, (totalVectors >>> 16) & 0xFF);
+    return fnvMix(hash, (totalVectors >>> 24) & 0xFF);
   }
 
   /// Fit `(mu, D_eff)` from unit-normalized sample rows.

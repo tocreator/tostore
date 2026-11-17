@@ -883,6 +883,66 @@ final class TreeGlobalMetaBlobCodec {
 /// |  36 |   4 | freePageCount |
 /// |  40 |   8 | lastFlushBatchKey |
 /// |  48 |   8 | lastMaintenanceBatchKey |
+/// Exact 64-bit unsigned little-endian batch key stored as two uint32 halves
+/// so Web JS (`dart2js`) never truncates low bits via 53-bit `double` numbers.
+final class BatchKey64 {
+  final int lo;
+  final int hi;
+
+  const BatchKey64(this.lo, this.hi);
+
+  static const BatchKey64 zero = BatchKey64(0, 0);
+
+  bool get isZero => lo == 0 && hi == 0;
+
+  static final BigInt _fnvOffset = BigInt.parse('cbf29ce484222325', radix: 16);
+  static final BigInt _fnvPrime = BigInt.parse('100000001b3', radix: 16);
+  static final BigInt _fnvMask64 = (BigInt.one << 64) - BigInt.one;
+  static final BigInt _fnvMask32 = BigInt.from(0xFFFFFFFF);
+
+  /// FNV-1a-64 digest split losslessly into uint32 `(lo, hi)`.
+  factory BatchKey64.fromBatchId(String batchId) {
+    if (batchId.isEmpty) return zero;
+    var hash = _fnvOffset;
+    for (final b in batchId.codeUnits) {
+      hash = (hash ^ BigInt.from(b)) & _fnvMask64;
+      hash = (hash * _fnvPrime) & _fnvMask64;
+    }
+    return BatchKey64(
+      (hash & _fnvMask32).toInt(),
+      ((hash >> 32) & _fnvMask32).toInt(),
+    );
+  }
+
+  /// Signed 64-bit integer value matching [PlatformByteData.getInt64].
+  int toSignedInt64() {
+    if (hi >= 0x80000000) {
+      return (hi - 0x100000000) * 0x100000000 + lo;
+    }
+    return hi * 0x100000000 + lo;
+  }
+
+  void writeLE(ByteData bd, int offset) {
+    bd.setUint32(offset, lo, Endian.little);
+    bd.setUint32(offset + 4, hi, Endian.little);
+  }
+
+  static BatchKey64 readLE(ByteData bd, int offset) {
+    return BatchKey64(
+      bd.getUint32(offset, Endian.little),
+      bd.getUint32(offset + 4, Endian.little),
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BatchKey64 && other.lo == lo && other.hi == hi;
+
+  @override
+  int get hashCode => Object.hash(lo, hi);
+}
+
 final class PartitionLocalStats {
   static const int payloadMagic = 0x31534C50; // 'PLS1'
 
@@ -912,11 +972,14 @@ final class PartitionLocalStats {
   /// NGH data category (0=graph, 1=pq, 2=raw, 3=codebook). B+Tree uses 0.
   final int dataCategory;
 
-  /// FNV-1a-64 of the last flush [batchId] that durable-wrote this partition (0 = none).
-  final int lastFlushBatchKey;
+  /// Lossless FNV-1a-64 of the last flush [batchId] (zero = none).
+  final BatchKey64 flushBatchKey;
 
-  /// FNV-1a-64 of the last maintenance [batchId] that durable-wrote this partition (0 = none).
-  final int lastMaintenanceBatchKey;
+  /// Lossless FNV-1a-64 of the last maintenance [batchId] (zero = none).
+  final BatchKey64 maintenanceBatchKey;
+
+  int get lastFlushBatchKey => flushBatchKey.toSignedInt64();
+  int get lastMaintenanceBatchKey => maintenanceBatchKey.toSignedInt64();
 
   const PartitionLocalStats({
     required this.partitionNo,
@@ -925,34 +988,13 @@ final class PartitionLocalStats {
     this.freeListHeadPageNo = -1,
     this.freePageCount = 0,
     this.dataCategory = 0,
-    this.lastFlushBatchKey = 0,
-    this.lastMaintenanceBatchKey = 0,
+    this.flushBatchKey = BatchKey64.zero,
+    this.maintenanceBatchKey = BatchKey64.zero,
   });
 
-  static final BigInt _fnvOffset = BigInt.parse('cbf29ce484222325', radix: 16);
-  static final BigInt _fnvPrime = BigInt.parse('100000001b3', radix: 16);
-  static final BigInt _fnvMask64 = (BigInt.one << 64) - BigInt.one;
-  static final BigInt _fnvMask32 = BigInt.from(0xFFFFFFFF);
-
   /// Stable 64-bit fingerprint of a batch id for partition-local durable markers.
-  ///
-  /// FNV-1a-64. Uses [BigInt] so dart2js never sees non-representable literals;
-  /// result uses the same signed mapping as [PlatformByteData.getInt64].
-  static int batchKeyFromId(String batchId) {
-    if (batchId.isEmpty) return 0;
-    var hash = _fnvOffset;
-    for (final b in batchId.codeUnits) {
-      hash = (hash ^ BigInt.from(b)) & _fnvMask64;
-      hash = (hash * _fnvPrime) & _fnvMask64;
-    }
-    final lo = (hash & _fnvMask32).toInt();
-    final hi = ((hash >> 32) & _fnvMask32).toInt();
-    // Match PlatformByteData.getInt64 mapping on every platform.
-    if (hi >= 0x80000000) {
-      return (hi - 0x100000000) * 0x100000000 + lo;
-    }
-    return hi * 0x100000000 + lo;
-  }
+  static int batchKeyFromId(String batchId) =>
+      BatchKey64.fromBatchId(batchId).toSignedInt64();
 
   PartitionLocalStats copyWith({
     int? partitionNo,
@@ -961,8 +1003,8 @@ final class PartitionLocalStats {
     int? freeListHeadPageNo,
     int? freePageCount,
     int? dataCategory,
-    int? lastFlushBatchKey,
-    int? lastMaintenanceBatchKey,
+    BatchKey64? flushBatchKey,
+    BatchKey64? maintenanceBatchKey,
   }) {
     return PartitionLocalStats(
       partitionNo: partitionNo ?? this.partitionNo,
@@ -971,9 +1013,8 @@ final class PartitionLocalStats {
       freeListHeadPageNo: freeListHeadPageNo ?? this.freeListHeadPageNo,
       freePageCount: freePageCount ?? this.freePageCount,
       dataCategory: dataCategory ?? this.dataCategory,
-      lastFlushBatchKey: lastFlushBatchKey ?? this.lastFlushBatchKey,
-      lastMaintenanceBatchKey:
-          lastMaintenanceBatchKey ?? this.lastMaintenanceBatchKey,
+      flushBatchKey: flushBatchKey ?? this.flushBatchKey,
+      maintenanceBatchKey: maintenanceBatchKey ?? this.maintenanceBatchKey,
     );
   }
 
@@ -981,36 +1022,35 @@ final class PartitionLocalStats {
   PartitionLocalStats withBatchMarkers({
     required bool isMaintenance,
     required String? batchId,
-    required int preservedFlushKey,
-    required int preservedMaintKey,
+    required BatchKey64 preservedFlushKey,
+    required BatchKey64 preservedMaintKey,
   }) {
-    final key =
-        (batchId == null || batchId.isEmpty) ? 0 : batchKeyFromId(batchId);
-    if (key == 0) {
+    final key = (batchId == null || batchId.isEmpty)
+        ? BatchKey64.zero
+        : BatchKey64.fromBatchId(batchId);
+    if (key.isZero) {
       return copyWith(
-        lastFlushBatchKey: preservedFlushKey,
-        lastMaintenanceBatchKey: preservedMaintKey,
+        flushBatchKey: preservedFlushKey,
+        maintenanceBatchKey: preservedMaintKey,
       );
     }
     if (isMaintenance) {
       return copyWith(
-        lastFlushBatchKey: preservedFlushKey,
-        lastMaintenanceBatchKey: key,
+        flushBatchKey: preservedFlushKey,
+        maintenanceBatchKey: key,
       );
     }
     return copyWith(
-      lastFlushBatchKey: key,
-      lastMaintenanceBatchKey: preservedMaintKey,
+      flushBatchKey: key,
+      maintenanceBatchKey: preservedMaintKey,
     );
   }
 
   bool matchesBatchKey({required bool isMaintenance, required String batchId}) {
     if (batchId.isEmpty) return false;
-    final key = batchKeyFromId(batchId);
-    if (key == 0) return false;
-    return isMaintenance
-        ? lastMaintenanceBatchKey == key
-        : lastFlushBatchKey == key;
+    final key = BatchKey64.fromBatchId(batchId);
+    if (key.isZero) return false;
+    return isMaintenance ? maintenanceBatchKey == key : flushBatchKey == key;
   }
 
   Uint8List encode() {
@@ -1026,8 +1066,8 @@ final class PartitionLocalStats {
     PlatformByteData.setInt64(bd, 24, totalSizeBytes, Endian.little);
     bd.setInt32(32, freeListHeadPageNo, Endian.little);
     bd.setInt32(36, freePageCount, Endian.little);
-    PlatformByteData.setInt64(bd, 40, lastFlushBatchKey, Endian.little);
-    PlatformByteData.setInt64(bd, 48, lastMaintenanceBatchKey, Endian.little);
+    flushBatchKey.writeLE(bd, 40);
+    maintenanceBatchKey.writeLE(bd, 48);
     return bd.buffer.asUint8List();
   }
 
@@ -1052,8 +1092,8 @@ final class PartitionLocalStats {
       totalSizeBytes: PlatformByteData.getInt64(bd, 24, Endian.little),
       freeListHeadPageNo: bd.getInt32(32, Endian.little),
       freePageCount: bd.getInt32(36, Endian.little),
-      lastFlushBatchKey: PlatformByteData.getInt64(bd, 40, Endian.little),
-      lastMaintenanceBatchKey: PlatformByteData.getInt64(bd, 48, Endian.little),
+      flushBatchKey: BatchKey64.readLE(bd, 40),
+      maintenanceBatchKey: BatchKey64.readLE(bd, 48),
       // Future append example:
       // newField: (version >= 2 && bytes.length >= encodedSizeForVersion(2))
       //     ? PlatformByteData.getInt64(bd, 56, Endian.little)

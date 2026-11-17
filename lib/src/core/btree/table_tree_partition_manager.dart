@@ -1160,8 +1160,8 @@ final class TableTreePartitionManager {
             stats.oldFileSizeInBytes = local.totalSizeBytes;
             stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
             stats.oldFreePageCount = local.freePageCount;
-            stats.oldFlushBatchKey = local.lastFlushBatchKey;
-            stats.oldMaintBatchKey = local.lastMaintenanceBatchKey;
+            stats.oldFlushBatchKey = local.flushBatchKey;
+            stats.oldMaintBatchKey = local.maintenanceBatchKey;
             stats.freeListHeadPageNo = local.freeListHeadPageNo;
             stats.freePageCount = local.freePageCount;
             if (batchContext != null && batchContext.batchId.isNotEmpty) {
@@ -2062,8 +2062,8 @@ final class TableTreePartitionManager {
               stats.oldFileSizeInBytes = local.totalSizeBytes;
               stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
               stats.oldFreePageCount = local.freePageCount;
-              stats.oldFlushBatchKey = local.lastFlushBatchKey;
-              stats.oldMaintBatchKey = local.lastMaintenanceBatchKey;
+              stats.oldFlushBatchKey = local.flushBatchKey;
+              stats.oldMaintBatchKey = local.maintenanceBatchKey;
               stats.freeListHeadPageNo = local.freeListHeadPageNo;
               stats.freePageCount = local.freePageCount;
               if (batchContext != null && batchContext.batchId.isNotEmpty) {
@@ -2474,8 +2474,8 @@ final class TableTreePartitionManager {
           if (local != null) {
             s.oldFileSizeInBytes = local.totalSizeBytes;
             s.oldTotalEntries = local.totalEntryCount;
-            s.oldFlushBatchKey = local.lastFlushBatchKey;
-            s.oldMaintBatchKey = local.lastMaintenanceBatchKey;
+            s.oldFlushBatchKey = local.flushBatchKey;
+            s.oldMaintBatchKey = local.maintenanceBatchKey;
             s.freeListHeadPageNo = local.freeListHeadPageNo;
             s.freePageCount = local.freePageCount;
           }
@@ -4002,8 +4002,8 @@ final class _PartitionStats {
   bool headerLoaded = false;
   int oldTotalEntries = 0;
   int oldFileSizeInBytes = 0;
-  int oldFlushBatchKey = 0;
-  int oldMaintBatchKey = 0;
+  BatchKey64 oldFlushBatchKey = BatchKey64.zero;
+  BatchKey64 oldMaintBatchKey = BatchKey64.zero;
 
   /// True when on-disk page0 already carries this batch's durable marker.
   bool alreadyDurableForBatch = false;

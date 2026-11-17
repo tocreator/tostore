@@ -666,9 +666,8 @@ class TOBFHeader {
     // Read body payload (Zero-Copy subview)
     final body = reader.readRawBytes(header.bodyLen, maxLimit: maxBodyLimit);
 
-    // Verify xxHash64 checksum
-    final computedHash = XXHash64.hash(body);
-    if (computedHash != header.checksum) {
+    // Verify bit-exact xxHash64 checksum without JS 53-bit int truncation.
+    if (!XXHash64.verifyHashLE(body, ByteData.sublistView(headerBytes), 14)) {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,

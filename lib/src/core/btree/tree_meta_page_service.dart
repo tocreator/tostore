@@ -319,8 +319,8 @@ final class TreeMetaPageService {
     return local.withBatchMarkers(
       isMaintenance: ctx.batchType == BatchType.maintenance,
       batchId: ctx.batchId,
-      preservedFlushKey: local.lastFlushBatchKey,
-      preservedMaintKey: local.lastMaintenanceBatchKey,
+      preservedFlushKey: local.flushBatchKey,
+      preservedMaintKey: local.maintenanceBatchKey,
     );
   }
 

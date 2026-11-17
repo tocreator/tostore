@@ -119,4 +119,10 @@ class XXHash64 {
     final h = hash(data, seed);
     out.setUint64(offset, h, Endian.little);
   }
+
+  /// Verifies the XXH64 digest stored as 8 little-endian bytes at [offset].
+  static bool verifyHashLE(Uint8List data, ByteData headerBd, int offset,
+      [int seed = 0]) {
+    return hash(data, seed) == headerBd.getUint64(offset, Endian.little);
+  }
 }
