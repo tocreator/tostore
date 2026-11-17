@@ -89,7 +89,7 @@ Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca
 
 ```yaml
 dependencies:
-  tostore: ^3.6.2
+  tostore: ^3.6.3
 ```
 
 ### For AI Coding Assistants

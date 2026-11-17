@@ -98,7 +98,7 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
 
 ```yaml
 dependencies:
-  tostore: ^3.6.2
+  tostore: ^3.6.3
 ```
 
 ### For AI Coding Assistants
